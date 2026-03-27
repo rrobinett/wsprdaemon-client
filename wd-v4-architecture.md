@@ -1,4 +1,4 @@
-# wsprdaemon v4 — Service-Oriented Architecture Specification (v0.4, 2026-03-25)
+# wsprdaemon v4 — Service-Oriented Architecture Specification (v0.8, 2026-03-27)
 
 ## 1. Current Architecture Summary
 
@@ -64,9 +64,30 @@ configured, and are running. It does not contain the work itself.
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
+│              PYTHON DEPENDENCIES                            │
+│       (installed into /opt/wsprdaemon/python/)              │
+├─────────────────────────────────────────────────────────────┤
+│  ka9q-python (pip: ka9q-python)                             │
+│    — Pure-Python radiod control API (dynamic channel        │
+│      creation, discovery, RTP recording, GPS/RTP timing).   │
+│    — Source: https://github.com/mijahauan/ka9q-python       │
+│    — Used by: wd-ka9q-record, wd-hftime                    │
+│                                                             │
+│  hf-timestd (pip or source install)                         │
+│    — HF time-standard service: listens to WWV/WWVH via     │
+│      ka9q-python, detects second-tick tones to calibrate    │
+│      wav recording start times to sub-millisecond accuracy. │
+│    — Source: https://github.com/mijahauan/hf-timestd        │
+│    — Used by: wd-hftime.service                             │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
 │              NEW FIRST-CLASS WD SERVICES                    │
 │       (systemd template units, managed by wd-ctl)           │
 ├─────────────────────────────────────────────────────────────┤
+│  TIME CALIBRATION LAYER (KA9Q systems only)                 │
+│  └─ wd-hftime@INSTANCE.service       (one per radiod inst) │
+│                                                             │
 │  RECORDING LAYER                                            │
 │  ├─ wd-kiwi-record@INSTANCE.service   (1:1, one per chan)  │
 │  └─ wd-ka9q-record@INSTANCE.service   (1:N, one per mcast)│
@@ -94,6 +115,7 @@ Template services use `@INSTANCE` where INSTANCE encodes the identity:
 
 | Service | Instance Format | Example |
 |---------|----------------|---------|
+| `wd-hftime@` | `RECEIVER` | `wd-hftime@KA9Q_0.service` |
 | `wd-kiwi-record@` | `RECEIVER-BAND` | `wd-kiwi-record@KIWI_0-80.service` |
 | `wd-ka9q-record@` | `RECEIVER` | `wd-ka9q-record@KA9Q_0.service` |
 | `wd-decode@` | `RECEIVER-BAND` | `wd-decode@KA9Q_0-40.service` |
@@ -105,7 +127,14 @@ Notes:
 - Kiwi recording is per-receiver-per-band because each `kiwi_recorder.py` handles one channel.
 - Decoding and posting are always per-receiver-per-band.
 - `kiwi_recorder.py` is used as-is; it is not modified by wsprdaemon.
-- `wd_record` is used as-is; once started on a multicast stream it runs indefinitely.
+- `wd-hftime` is mandatory for every KA9Q receiver.  It runs the `hf-timestd` daemon,
+  which uses `ka9q-python` to dynamically create a WWV channel on radiod, listens
+  for second-tick tones, and publishes a time-offset calibration file that the
+  recording daemon reads to align wav file start times.
+- `wd-ka9q-record` uses `ka9q-python` to dynamically create all WSPR/FST4W channels
+  on radiod at startup.  The `radiod@.conf` file no longer needs `[channels]` sections
+  for wsprdaemon bands — only `[global]` and `[hardware]` are required.  This makes
+  `wsprdaemon.conf` the single source of truth for which frequencies are recorded.
 
 ### 2.3 Environment / Config Passing
 
@@ -262,11 +291,100 @@ SyslogIdentifier=wd-kiwi-record@%i
 WantedBy=wsprdaemon.target
 ```
 
-### 3.2 wd-ka9q-record@ — KA9Q Recording (1:N)
+### 3.2 wd-hftime@ — HF Time Calibration (KA9Q systems only, mandatory)
 
-This service runs a single `wd_record` process that listens to one multicast
-stream and writes wav files for all bands contained in that stream.  Once started,
-it runs indefinitely — there is no schedule-driven start/stop for KA9Q recording.
+This service runs the `hf-timestd` daemon for each KA9Q receiver instance.  It uses
+`ka9q-python` to dynamically create a WWV (or WWVH) AM channel on radiod, listens for
+the second-tick tones (5 ms bursts of 1200 Hz at the top of each second) and the minute
+markers (800 ms tone at 1000 Hz), and computes the precise offset between the system
+clock and actual RF-received wall-clock time.  The computed offset is written to a
+calibration file that `wd-ka9q-record` reads to align wav recording start times to
+sub-millisecond accuracy.
+
+On any system with an RX-888 (or other wideband SDR), `wd-hftime` is mandatory and
+started automatically by `wd-ctl apply` — it is not optional.  The WWV channel is
+created dynamically via `ka9q-python` at service start and removed on stop; it does
+not require any entry in `radiod@.conf`.
+
+```ini
+# /etc/systemd/system/wd-hftime@.service
+[Unit]
+Description=wsprdaemon HF time calibration for %i
+After=radiod@%i.service
+Requires=radiod@%i.service
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-hftime@%i.env
+ExecStart=/opt/wsprdaemon/python/bin/python3 -m hf_timestd \
+    --radiod-host ${WD_RADIOD_STATUS_ADDRESS} \
+    --calib-file /run/wsprdaemon/%i/hftime.json
+WorkingDirectory=/run/wsprdaemon
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-hftime@%i
+
+[Install]
+WantedBy=wsprdaemon.target
+```
+
+The calibration file (`/run/wsprdaemon/KA9Q_0/hftime.json`) is written to tmpfs and
+contains at minimum:
+
+```json
+{
+  "wwv_freq_hz": 10000000,
+  "offset_ns": -1423,
+  "uncertainty_ns": 250,
+  "last_update": "2026-03-27T14:02:01.003Z"
+}
+```
+
+The recorder reads `offset_ns` to shift its recording window start time so that the
+wav file boundaries align with the true second edge as received at the antenna.
+
+### 3.3 wd-ka9q-record@ — KA9Q Recording (1:N, dynamic channels)
+
+This service replaces the old static-channel `wd_record` approach.  Instead of
+depending on pre-configured `[channels]` sections in `radiod@.conf`, it uses
+`ka9q-python` (`RadiodControl`) to dynamically create all needed WSPR/FST4W
+channels on radiod at startup.  Channels are created based on the band list in
+`wsprdaemon.conf` — making `wsprdaemon.conf` the single source of truth.
+
+At startup the service:
+
+1. Waits for `wd-hftime@INSTANCE` to publish its first calibration (via a
+   `Wants=` on the hftime service and a brief poll of the calib file).
+2. Reads the band/mode configuration from its environment file.
+3. Uses `RadiodControl.create_channel()` to create one radiod channel per band
+   (frequency, preset=usb, sample_rate=12000 for WSPR; preset=iq for WWV-IQ, etc.).
+4. Uses `RTPRecorder` to receive the RTP streams and write 1-minute wav files into
+   the spool directory, using the hftime calibration offset to align start times.
+5. On `SIGTERM` (service stop), calls `RadiodControl.remove_channel()` for each
+   channel it created, cleaning up radiod state.
+
+Because channels are created dynamically, `radiod@.conf` only needs:
+
+```ini
+[global]
+; ... hardware-independent defaults ...
+mode = usb              ; default mode for dynamic channel creation
+status = KA9Q_0-status.local
+
+[rx888]
+; ... hardware-specific settings ...
+device = rx888
+```
+
+No `[WSPR]`, `[FT4]`, `[FT8]`, or `[WWV]` channel sections are needed.  These are
+all created at runtime by the wsprdaemon recording service and by the FT4/FT8
+decoder services.
 
 ```ini
 # /etc/systemd/system/wd-ka9q-record@.service
@@ -275,6 +393,8 @@ Description=wsprdaemon KA9Q recorder for %i
 After=network-online.target
 Requires=radiod@%i.service
 After=radiod@%i.service
+Wants=wd-hftime@%i.service
+After=wd-hftime@%i.service
 
 [Service]
 Type=simple
@@ -300,7 +420,13 @@ SyslogIdentifier=wd-ka9q-record@%i
 WantedBy=wsprdaemon.target
 ```
 
-### 3.3 wd-decode@ — Decoding (per receiver+band)
+The `wd-ka9q-record` wrapper script (bash) calls a Python helper that uses
+`ka9q-python` for channel management and RTP recording, then writes wav files
+to the spool directory.  The bash wrapper handles signal trapping and cleanup.
+
+**Stale wav file protection** (see section 5.5).
+
+### 3.4 wd-decode@ — Decoding (per receiver+band)
 
 ```ini
 # /etc/systemd/system/wd-decode@.service
@@ -334,7 +460,7 @@ SyslogIdentifier=wd-decode@%i
 WantedBy=wsprdaemon.target
 ```
 
-### 3.4 wd-post@ — Posting (per logical receiver+band)
+### 3.5 wd-post@ — Posting (per logical receiver+band)
 
 ```ini
 # /etc/systemd/system/wd-post@.service
@@ -360,7 +486,7 @@ SyslogIdentifier=wd-post@%i
 WantedBy=wsprdaemon.target
 ```
 
-### 3.5 Upload Services (singletons)
+### 3.6 Upload Services (singletons)
 
 ```ini
 # /etc/systemd/system/wd-upload-wsprnet.service
@@ -387,7 +513,7 @@ SyslogIdentifier=wd-upload-wsprnet
 WantedBy=wsprdaemon.target
 ```
 
-### 3.6 The Orchestrator
+### 3.7 The Orchestrator
 
 ```ini
 # /etc/systemd/system/wsprdaemon.service
@@ -559,7 +685,7 @@ becomes a contract between services:
 │   └── grape/                                # wd-upload-grape reads here
 
 /run/wsprdaemon/                              # WD_RUN_DIR (tmpfs, runtime state)
-└── (runtime pidfiles, lock files if needed — mostly replaced by systemd)
+└── (runtime state files — mostly replaced by systemd)
 
 /var/log/wsprdaemon/                          # WD_LOG_DIR (per-daemon log files)
 ├── wd-kiwi-record@KIWI_0-80.log
@@ -573,7 +699,101 @@ following the FHS convention for application spool data.  The recording subtree 
 mounted as tmpfs for performance.  The installer calculates the required size automatically
 from the configuration.
 
-### 5.3 tmpfs Sizing (Auto-Calculated by Installer)
+### 5.1 Logging
+
+Each daemon writes its own log file via `wd-logger`, following the current convention:
+
+- Log files live in `/var/log/wsprdaemon/`, one per daemon instance.
+- `wd-logger` caps each file at 1 MB by default.  When a file hits the limit,
+  `wd-logger` truncates it by keeping the first 25% of lines and discarding the rest,
+  preventing unbounded growth.
+- Services also log to journald via `StandardOutput=journal` so that
+  `journalctl -u wd-decode@KA9Q_0-40` works as expected for interactive debugging.
+
+### 5.2 Dynamic Verbosity (Signal-Based, No Restart)
+
+Every `wd-*` daemon process traps `SIGUSR1` and `SIGUSR2` to adjust log verbosity
+at runtime without restarting the service.  This is essential for debugging
+production systems where hundreds of recording, decoding, and posting jobs may
+be running — restarting a service to increase verbosity would lose the error
+context that the operator is trying to capture.
+
+**Signal convention**:
+
+| Signal | Effect |
+|--------|--------|
+| `USR1` | Increment verbosity (e.g., `WARN` → `INFO` → `DEBUG` → `TRACE`) |
+| `USR2` | Decrement verbosity (e.g., `TRACE` → `DEBUG` → `INFO` → `WARN`) |
+
+Verbosity levels saturate at the boundaries — `USR1` at `TRACE` is a no-op,
+`USR2` at `WARN` (the default) is a no-op.
+
+**Implementation in each daemon** (bash):
+
+```bash
+declare -i WD_VERBOSITY=0    # 0=WARN (default), 1=INFO, 2=DEBUG, 3=TRACE
+
+trap 'wd_verbosity_up'   USR1
+trap 'wd_verbosity_down' USR2
+
+wd_verbosity_up() {
+    (( WD_VERBOSITY < 3 )) && (( WD_VERBOSITY++ ))
+    wd_logger 0 "Verbosity increased to level ${WD_VERBOSITY}"
+}
+
+wd_verbosity_down() {
+    (( WD_VERBOSITY > 0 )) && (( WD_VERBOSITY-- ))
+    wd_logger 0 "Verbosity decreased to level ${WD_VERBOSITY}"
+}
+```
+
+The `wd-logger` function checks `WD_VERBOSITY` against the message level and
+suppresses messages above the current threshold.
+
+**Finding the PID — no `.pid` files needed**: systemd tracks the main PID of
+every service.  The PID is retrieved via `systemctl show`:
+
+```bash
+kill -USR1 $(systemctl show -p MainPID --value wd-decode@KA9Q_0-40.service)
+```
+
+**The `wd-ctl verbosity` helper** wraps this for convenience:
+
+```bash
+# Increment verbosity for one service
+wd-ctl verbosity up wd-decode@KA9Q_0-40
+
+# Decrement verbosity for one service
+wd-ctl verbosity down wd-decode@KA9Q_0-40
+
+# Increment verbosity for ALL wd-* services at once
+wd-ctl verbosity up all
+
+# Show current verbosity (queries each daemon via a status mechanism)
+wd-ctl verbosity show
+```
+
+The `up` and `down` subcommands resolve the service name to a `MainPID` via
+`systemctl show` and send the appropriate signal.  The `all` target iterates
+over every running `wd-*` service.
+
+**Why not `.pid` files?**  In the v3 architecture, `.pid` files were necessary
+because wsprdaemon managed its own process tree.  In v4, systemd tracks all
+PIDs authoritatively via `MainPID`.  Using `systemctl show` to retrieve the PID
+eliminates the failure modes of stale `.pid` files (process died without cleanup,
+PID reuse, etc.) while preserving the exact same USR1/USR2 trap mechanism in the
+daemons themselves.
+
+### 5.3 File-Watch Mechanisms
+
+| Source | Watch method | Rationale |
+|--------|-------------|-----------|
+| KA9Q wav files (`wd_record` output) | `inotifywait` | `wd_record` writes and closes each wav file cleanly; `inotifywait -e close_write` reliably detects completed files. |
+| Kiwi wav files (`kiwi_recorder.py` output) | Polling (sleep + check) | `kiwi_recorder.py` opens and closes files continuously during the 1-minute write cycle, making `inotifywait` unreliable. Polling remains the correct approach. |
+| Spot files (decoding→posting) | `inotifywait` | Spot files are written atomically. |
+| Upload queue files (posting→upload) | `inotifywait` | Same — atomic writes. |
+
+### 5.4 tmpfs Sizing (Auto-Calculated by Installer)
 
 The tmpfs mount for `/var/spool/wsprdaemon/recording/` must be large enough to hold all
 retained wav files at peak usage.  The required size is derived directly from the config:
@@ -628,31 +848,51 @@ tmpfs  /var/spool/wsprdaemon/recording  tmpfs  defaults,size=120M,mode=0750,uid=
 `wd-ctl apply` also validates at startup that the mounted tmpfs has sufficient free space
 for the current configuration and logs a warning if it does not.
 
-### 5.1 Logging
+### 5.5 Stale Wav File Cleanup (tmpfs Overflow Protection)
 
-Each daemon writes its own log file via `wd-logger`, following the current convention:
+If the decoding daemon (`wd-decode@`) is not running — due to a crash, a stopped
+service, or a misconfiguration — wav files will accumulate in the recording spool
+directory without being consumed and deleted.  Because the spool lives on a
+size-limited tmpfs, this will eventually fill the filesystem and cause the recorder
+to fail as well, cascading a total system outage.
 
-- Log files live in `/var/log/wsprdaemon/`, one per daemon instance.
-- `wd-logger` caps each file at 1 MB by default.  When a file hits the limit,
-  `wd-logger` truncates it by keeping the first 25% of lines and discarding the rest,
-  preventing unbounded growth.
-- Services also log to journald via `StandardOutput=journal` so that
-  `journalctl -u wd-decode@KA9Q_0-40` works as expected for interactive debugging.
+To prevent this, the recording daemons (`wd-ka9q-record` and `wd-kiwi-record`)
+include a **stale wav reaper** that runs as part of their main loop:
 
-### 5.2 File-Watch Mechanisms
+**Rule**: After writing each new wav file, the recorder checks for wav files in
+the band's spool directory that are older than the maximum useful age for any
+configured decode mode.  Any wav file older than this threshold is deleted.
 
-| Source | Watch method | Rationale |
-|--------|-------------|-----------|
-| KA9Q wav files (`wd_record` output) | `inotifywait` | `wd_record` writes and closes each wav file cleanly; `inotifywait -e close_write` reliably detects completed files. |
-| Kiwi wav files (`kiwi_recorder.py` output) | Polling (sleep + check) | `kiwi_recorder.py` opens and closes files continuously during the 1-minute write cycle, making `inotifywait` unreliable. Polling remains the correct approach. |
-| Spot files (decoding→posting) | `inotifywait` | Spot files are written atomically. |
-| Upload queue files (posting→upload) | `inotifywait` | Same — atomic writes. |
+**Maximum useful age** is derived from the longest decode mode configured for
+that band, plus a safety margin:
 
-### What changes
+```
+max_age = max(duration_minutes(mode) for mode in band.modes) + 2 minutes
+```
+
+For example, if a band has `modes = W2 F2 F5`, the longest mode is F5 (5 min).
+The max useful age is 5 + 2 = 7 minutes.  Any wav file older than 7 minutes is
+deleted by the recorder, because it could never be part of a valid decode window.
+
+**Implementation**: The check is a simple `find` in bash:
+
+```bash
+find "${WD_SPOOL_BAND_DIR}" -name '*.wav' -mmin +${MAX_AGE_MIN} -delete
+```
+
+This runs in the recorder's main loop (not in a separate timer), so it is
+always active whenever the recorder is producing files.  The cost is negligible.
+
+**Effect**: If the decoder stops, wav files accumulate for at most `max_age`
+minutes before the recorder starts deleting them.  The tmpfs never overflows.
+When the decoder is restarted, it picks up from the current window — there is
+no attempt to process historical files.
+
+### 5.6 What Changes
 
 | Current | v4 |
 |---------|-----|
-| `.pid` files everywhere | systemd manages all lifecycle |
+| `.pid` files everywhere | systemd `MainPID` tracking; `wd-ctl verbosity` for USR1/USR2 |
 | Parent polls `ps` for child liveness | systemd `BindsTo=` / `Restart=always` |
 | `check_for_zombies()` | Gone — systemd's `MainPID` tracking handles this |
 | `wd_kill` / `wd_kill_and_wait_for_death` | `systemctl stop` with `TimeoutStopSec` |
@@ -661,9 +901,16 @@ Each daemon writes its own log file via `wd-logger`, following the current conve
 | `RUNNING_JOBS_FILE` / `EXPECTED_JOBS_FILE` | systemd is the source of truth |
 | Bash-array config (RECEIVER_LIST[], WSPR_SCHEDULE[]) | INI config file |
 | `/dev/shm/wsprdaemon/recording.d/` | `/var/spool/wsprdaemon/recording/` (tmpfs-mountable) |
+| `kill -USR1 $(cat pidfile)` for verbosity | `wd-ctl verbosity up SERVICE` (uses systemd MainPID) |
 | Per-daemon `.pid` and ad-hoc log files | `wd-logger` managed files in `/var/log/wsprdaemon/` |
+| Static channel sections in `radiod@.conf` | Dynamic channels via `ka9q-python` at runtime |
+| Dual config (wsprdaemon.conf + radiod@.conf channels) | `wsprdaemon.conf` is single source of truth |
+| NTP-only recording start alignment | `hf-timestd` WWV calibration for sub-ms accuracy |
+| No protection against tmpfs overflow | Stale wav reaper in recorder (section 5.5) |
+| No dependency version tracking | Pinned commit hashes in `components.ini` (section 10) |
+| No formal versioning scheme | `MAJOR.MINOR-COMMITINDEX` version scheme (section 11) |
 
-### What stays the same
+### 5.7 What Stays the Same
 
 - Wav files as the recording→decoding interface
 - `*_spots.txt` files in `posting/` subdirs as the decoding→posting interface
@@ -706,11 +953,23 @@ process, a schedule transition can stop and replace a single channel without
 disturbing the others.  If `kiwi_recorder.py` were handling multiple bands in
 one process, stopping it for a schedule change would take down all bands.
 
-### 6.3 `wd_record` (KA9Q) Lifecycle
+### 6.3 `wd-ka9q-record` (KA9Q) Lifecycle
 
-`wd_record` is never restarted by the scheduler.  Once started, it runs
+`wd-ka9q-record` is never restarted by the scheduler.  Once started, it runs
 indefinitely unless there is an error or the system is shut down.  If the
 process exits unexpectedly, systemd's `Restart=always` brings it back.
+
+**Dynamic channel management**: On startup, `wd-ka9q-record` uses `ka9q-python`
+(`RadiodControl.create_channel()`) to create all WSPR/FST4W channels on radiod.
+On clean shutdown (`SIGTERM`), it calls `RadiodControl.remove_channel()` for each
+channel, setting their frequency to 0 so radiod's poller garbage-collects them.
+If the recorder crashes without cleanup, `ka9q-python`'s `ChannelMonitor` (or a
+subsequent restart) handles re-creation.  Stale channels with frequency=0 are
+cleaned up automatically by radiod's internal poller.
+
+**Stale wav file reaper**: As described in section 5.5, the recorder deletes wav
+files older than the maximum useful decode age, preventing tmpfs overflow if the
+downstream decoder is not running.
 
 ---
 
@@ -720,7 +979,7 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
 /usr/local/sbin/                              # Daemon executables and wd-ctl
 ├── wd-ctl                                    # Orchestrator / control command
 ├── wd-kiwi-record                            # Kiwi recording wrapper
-├── wd-ka9q-record                            # KA9Q recording wrapper
+├── wd-ka9q-record                            # KA9Q recording wrapper (uses ka9q-python)
 ├── wd-decode                                 # Decoding wrapper
 ├── wd-post                                   # Posting wrapper
 ├── wd-upload-wsprnet                         # Wsprnet uploader
@@ -729,7 +988,9 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
 
 /etc/wsprdaemon/                              # Configuration
 ├── wsprdaemon.conf                           # Main config (INI format)
+├── components.ini                            # Pinned external dependency commits (see §10)
 └── env/                                      # Generated per-service env files
+    ├── wd-hftime@KA9Q_0.env
     ├── wd-kiwi-record@KIWI_0-80.env
     ├── wd-ka9q-record@KA9Q_0.env
     ├── wd-decode@KA9Q_0-40.env
@@ -739,6 +1000,7 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
 ├── wsprdaemon.service
 ├── wsprdaemon.timer
 ├── wsprdaemon.target
+├── wd-hftime@.service
 ├── wd-kiwi-record@.service
 ├── wd-ka9q-record@.service
 ├── wd-decode@.service
@@ -756,11 +1018,26 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
 /var/log/wsprdaemon/                          # Per-daemon log files (managed by wd-logger)
 
 /run/wsprdaemon/                              # Runtime state (tmpfs)
+├── KA9Q_0/
+│   └── hftime.json                           # Time calibration from wd-hftime
 
 /opt/wsprdaemon/                              # Installer and supporting files
 ├── install.sh                                # Installer script
+├── VERSION                                   # MAJOR.MINOR version (e.g., "4.0")
 ├── lib/                                      # Shared bash libraries (wd-logger, etc.)
-└── share/                                    # Data files, templates, etc.
+├── share/                                    # Data files, templates, etc.
+│   └── components.ini                        # Default component pins (copied to /etc/)
+├── src/                                      # Cloned component source trees
+│   ├── ka9q-radio/
+│   ├── ka9q-python/
+│   ├── hf-timestd/
+│   ├── wsjtx/                                # wsprd and jt9 source
+│   └── kiwiclient/                           # kiwi_recorder.py source
+└── python/                                   # Python virtual environment
+    ├── bin/python3                            # venv interpreter
+    └── lib/python3.x/site-packages/
+        ├── ka9q/                              # ka9q-python library
+        └── hf_timestd/                        # hf-timestd library
 ```
 
 **Key principles**:
@@ -771,6 +1048,11 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
 - Shared libraries and helper functions (like `wd-logger`) live in `/opt/wsprdaemon/lib/`
   and are sourced by the executables at runtime.
 - Unit files go in `/etc/systemd/system/` (the standard location for admin-installed units).
+- Python dependencies (`ka9q-python`, `hf-timestd`) are installed into an isolated
+  virtual environment at `/opt/wsprdaemon/python/`.  The installer creates this venv
+  and runs `pip install ka9q-python hf-timestd` into it.  Bash wrapper scripts invoke
+  the venv's interpreter directly (e.g., `/opt/wsprdaemon/python/bin/python3 -m ...`)
+  so there is no dependency on the system Python path.
 
 ---
 
@@ -778,11 +1060,25 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
 
 ### Phase 1: Extract recording services (lowest risk)
 
-1. Create `wd-kiwi-record` wrapper script that runs `kiwirecorder_manager_daemon()` logic
-2. Create `wd-ka9q-record` wrapper script that runs `ka9q_recording_daemon()` logic
-3. Create template unit files
-4. Test: start recording services manually, verify wav files appear in the expected dirs
-5. The rest of wsprdaemon continues running unchanged — it just skips
+1. Create `/etc/wsprdaemon/components.ini` with pinned commit hashes for all
+   external dependencies.  Verify each component can be cloned and checked out
+   at the pinned commit.
+2. Install Python dependencies: create `/opt/wsprdaemon/python/` venv, install
+   `ka9q-python` and `hf-timestd` at their pinned commits via pip.
+3. Create `wd-hftime` unit file and wrapper — verify it creates a WWV channel on
+   radiod dynamically and publishes a calibration file to `/run/wsprdaemon/`.
+4. Create `wd-ka9q-record` wrapper that uses `ka9q-python` to create channels
+   dynamically (replacing static `[channels]` in `radiod@.conf`) and records RTP
+   streams to wav files in the spool directory with hftime-calibrated start times.
+5. Create `wd-kiwi-record` wrapper script that runs `kiwirecorder_manager_daemon()` logic.
+6. Create template unit files for all three services.
+7. Test: start recording services manually, verify wav files appear in the expected dirs
+   and that the stale wav reaper deletes old files when the decoder is not running.
+8. Strip `[WSPR]`, `[FT4]`, `[FT8]`, `[WWV]` channel sections from `radiod@.conf` —
+   verify radiod starts cleanly with only `[global]` + `[hardware]`.
+9. Implement `wd-ctl apply` component version verification — confirm it reads
+   `components.ini` and logs warnings for mismatched commits.
+10. The rest of wsprdaemon continues running unchanged — it just skips
    `spawn_wav_recording_daemon()` if it detects the systemd service is already running
 
 ### Phase 2: Extract decoding services
@@ -824,7 +1120,7 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
    restarted when it comes back (via `Restart=always` on the recorder).
 
 2. **tmpfs mount strategy** (was Q2): The installer auto-calculates the required tmpfs
-   size from the configuration (see section 5.3) and writes the fstab entry automatically.
+   size from the configuration (see section 5.4) and writes the fstab entry automatically.
    `wd-ctl apply` validates at startup that sufficient space is available.
 
 3. **Config migration tool** (was Q3): Yes — `wd-ctl migrate-config` reads the old
@@ -851,3 +1147,287 @@ process exits unexpectedly, systemd's `Restart=always` brings it back.
    how many 1-minute wav files must be retained and when the decoder is triggered
    (e.g., W2 triggers after every even-odd minute pair; F5 triggers after 5
    consecutive 1-minute files are available).
+
+6. **Dynamic channel creation via ka9q-python** (v0.5): The KA9Q recording service
+   no longer depends on pre-configured `[channels]` sections in `radiod@.conf`.
+   Instead, `wd-ka9q-record` uses the `ka9q-python` library (`RadiodControl`) to
+   dynamically create and remove radiod channels at runtime.  This eliminates the
+   requirement to keep `radiod@.conf` and `wsprdaemon.conf` in sync — wsprdaemon's
+   INI config is now the single source of truth for which frequencies are recorded.
+   The `radiod@.conf` file only needs `[global]` (with a default `mode` set to
+   enable dynamic channel creation) and the `[hardware]` section.  Channels are
+   created on recorder start and removed (frequency set to 0) on clean shutdown.
+   Source: `ka9q-python` v3.4+ (https://github.com/mijahauan/ka9q-python, MIT license).
+
+7. **HF time calibration via hf-timestd** (v0.5): Every KA9Q receiver instance
+   runs a mandatory `wd-hftime@` service that uses `hf-timestd` to listen to
+   WWV/WWVH second-tick tones (received via a dynamically created AM channel on
+   radiod) and compute the precise offset between the system clock and actual
+   RF-received wall-clock time.  This offset is published to a JSON calibration
+   file in `/run/wsprdaemon/` that the recording daemon reads to align wav file
+   start times to sub-millisecond accuracy.  The service is mandatory (not
+   optional) for any system with an RX-888 or other wideband SDR, because these
+   systems always have WWV within their receive bandwidth.  The WWV channel is
+   created and torn down dynamically via `ka9q-python` — no radiod config needed.
+   Source: `hf-timestd` (https://github.com/mijahauan/hf-timestd).
+
+8. **Stale wav file protection** (v0.5): Recording daemons (`wd-ka9q-record` and
+   `wd-kiwi-record`) include a stale wav reaper that deletes wav files older than
+   the maximum useful decode age plus a 2-minute safety margin.  This prevents
+   tmpfs overflow if the downstream decoder is not running.  See section 5.5 for
+   the full specification.  The reaper runs in the recorder's main loop with
+   negligible overhead.
+
+9. **External dependency version pinning** (v0.6, updated v0.7): All external
+   component projects that wsprdaemon depends on are pinned to specific commit
+   hashes in `/etc/wsprdaemon/components.ini`.  The installer checks out each
+   component at the pinned commit, and `wd-ctl apply` verifies at startup that
+   installed versions match.  If a component's commit field is empty or missing,
+   the installer fetches HEAD and writes the resolved hash back into the file —
+   enabling both reproducible production deploys and developer workflows where
+   latest HEAD is desired.  See section 10 for the full specification.
+
+10. **wsprdaemon version scheme** (v0.7): wsprdaemon uses a `MAJOR.MINOR-COMMITINDEX`
+    version scheme (e.g., `4.0-4837`).  `MAJOR.MINOR` is explicitly managed in a
+    `VERSION` file; `COMMITINDEX` is auto-computed from `git rev-list --count HEAD`.
+    This replaces the previous four-field `3.3.2-N` scheme.  See section 11.
+
+11. **Dynamic verbosity via signals** (v0.8): Every `wd-*` daemon traps `SIGUSR1`
+    (increment verbosity) and `SIGUSR2` (decrement verbosity), preserving the v3
+    mechanism for live debugging without restarting services.  PID lookup uses
+    systemd's `MainPID` instead of `.pid` files, wrapped in `wd-ctl verbosity`
+    for convenience.  See section 5.2.
+
+---
+
+## 10. External Dependency Version Pinning
+
+wsprdaemon depends on several external projects that are developed independently.
+To ensure reproducible, well-tested deployments, every external dependency is
+pinned to a specific git commit hash in a configuration file.
+
+### 10.1 The Components File: `/etc/wsprdaemon/components.ini`
+
+This INI-format file lists each external dependency with its source URL and the
+full 40-character commit hash that has been tested with the current wsprdaemon
+release.  The installer ships a default version of this file; operators may
+override individual entries if they need to track a different branch or commit
+(e.g., for testing), but the defaults represent the tested baseline.
+
+```ini
+# /etc/wsprdaemon/components.ini
+#
+# External dependency version pins for wsprdaemon.
+# Each section names a component project.  The 'url' is the git clone URL.
+# The 'commit' is the full 40-character SHA that wsprdaemon has been tested with.
+#
+# The installer checks out each component at the pinned commit.
+# wd-ctl apply verifies installed versions match at startup.
+#
+# WARNING: Changing a commit hash to an untested version may cause failures.
+# Only modify these values if you understand the implications.
+
+[ka9q-radio]
+url    = https://github.com/ka9q/ka9q-radio.git
+commit = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+[ka9q-python]
+url    = https://github.com/mijahauan/ka9q-python.git
+commit = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+[hf-timestd]
+url    = https://github.com/mijahauan/hf-timestd.git
+commit = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+[wsprd]
+# wsprd is built from the WSJT-X source tree.
+url    = https://sourceforge.net/p/wsjt/wsjtx/ci/master/tree/
+commit = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+[jt9]
+# jt9 is built from the same WSJT-X source tree as wsprd.
+url    = https://sourceforge.net/p/wsjt/wsjtx/ci/master/tree/
+commit = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+[kiwi_recorder]
+# kiwi_recorder.py — used as-is, never modified by wsprdaemon.
+url    = https://github.com/jks-prv/kiwiclient.git
+commit = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+**Notes**:
+- Commit hashes shown as `xxxx...` are placeholders.  The actual file shipped
+  with each wsprdaemon release contains real, tested commit hashes.
+- `wsprd` and `jt9` share the same WSJT-X source tree and will normally have
+  the same commit hash, but they are listed separately so they can be pinned
+  independently if needed (e.g., if wsprdaemon patches one but not the other).
+- Additional components may be added to this file as the project evolves.
+
+### 10.2 Installer Behavior
+
+The wsprdaemon installer (`/opt/wsprdaemon/install.sh`) reads `components.ini`
+and performs the following for each entry:
+
+1. If the component source directory does not exist, clone the repository.
+2. Fetch the latest refs from the remote.
+3. Check out the pinned commit hash (`git checkout <commit>`).
+4. Build/install the component as appropriate (e.g., `make` for `ka9q-radio`,
+   `pip install` for Python packages, `cmake && make` for WSJT-X binaries).
+
+**If a component's `commit` field is empty or the entire section is missing**,
+the installer fetches HEAD of the component's default branch, installs it, and
+writes the resolved commit hash back into `components.ini`:
+
+```
+For each [component] in components.ini:
+    if commit is empty or missing:
+        (cd /opt/wsprdaemon/src/<component> && git pull)
+        resolved_hash = (cd /opt/wsprdaemon/src/<component> && git rev-parse HEAD)
+        write resolved_hash back to components.ini[component].commit
+        log INFO: "<component>: no pinned commit — installed HEAD (<resolved_hash>)"
+```
+
+This auto-populate behavior serves two purposes:
+
+- **Fresh installs**: A first-time install with no `components.ini` (or an empty
+  one) will fetch HEAD of every component and record what was installed.  The
+  resulting file becomes the baseline for future verification.
+- **Developer workflow**: A developer can `git pull` wsprdaemon, delete some or
+  all `commit` values from `components.ini`, and run `wd-ctl update-components`
+  to get the latest HEAD of those components.  The resolved hashes are written
+  back, so the developer knows exactly what is installed and can commit the
+  updated `components.ini` when satisfied.
+
+When all `commit` fields are populated (the normal shipped state), the installer
+uses only the explicit hashes — it never contacts the remote for those entries.
+This ensures reproducible installs from a fully-pinned file.
+
+### 10.3 Startup Verification
+
+When `wd-ctl apply` runs (either at boot via `wsprdaemon.service` or on the
+2-minute timer), it reads `components.ini` and verifies each installed component:
+
+```
+For each [component] in components.ini:
+    installed_commit = (cd /opt/wsprdaemon/src/<component> && git rev-parse HEAD)
+    expected_commit  = components.ini[component].commit
+    if expected_commit is empty:
+        log INFO: "<component>: no pinned commit (running HEAD)"
+    elif installed_commit != expected_commit:
+        log WARNING: "<component> version mismatch:
+            installed=<installed_commit>
+            expected=<expected_commit>"
+```
+
+**The verification is warn-only** — wsprdaemon does not refuse to start if a
+component is at the wrong commit.  This is intentional: an operator may be
+testing a newer version of a component, or a component may have been updated
+outside of wsprdaemon's installer.  The warning ensures the mismatch is logged
+and visible in `wd-ctl status` output.
+
+### 10.4 Updating Components
+
+To update a component to a new tested commit:
+
+1. Edit `/etc/wsprdaemon/components.ini` — change the `commit` value
+   (or clear it to get HEAD on next update).
+2. Run `wd-ctl update-components` — this reads the file, checks out
+   each component to its pinned commit (or fetches HEAD if empty),
+   writes resolved hashes back for any empty entries, and rebuilds as needed.
+
+When a new wsprdaemon release ships, it includes an updated `components.ini`
+with commit hashes that have been tested together.  The migration path is:
+
+```bash
+cd /opt/wsprdaemon && git pull          # update wsprdaemon itself
+cp share/components.ini /etc/wsprdaemon/components.ini   # update pins
+wd-ctl update-components                # checkout + rebuild
+sudo systemctl restart wsprdaemon       # restart with verified versions
+```
+
+---
+
+## 11. wsprdaemon Version Scheme
+
+wsprdaemon uses a three-field version scheme: **`MAJOR.MINOR-COMMITINDEX`**.
+
+### 11.1 Version Fields
+
+| Field | Meaning | Who sets it |
+|-------|---------|-------------|
+| `MAJOR` | Architecture generation.  Currently `4` (this document describes v4). | Changed when a fundamental redesign occurs. |
+| `MINOR` | Feature milestone within a generation (e.g., `0`, `1`, `2`). | Explicitly incremented by the developer when a meaningful milestone is reached. |
+| `COMMITINDEX` | Sequential commit count from `git rev-list --count HEAD`. | Auto-computed from git — never manually edited. |
+
+**Examples**: `4.0-4837`, `4.1-4902`, `4.2-5011`.
+
+This replaces the previous four-field `3.3.2-N` scheme.  Two explicitly managed
+fields (`MAJOR.MINOR`) plus one auto-computed field (`COMMITINDEX`) is cleaner
+and avoids the unused middle digits.
+
+### 11.2 Where the MAJOR.MINOR Is Stored
+
+The `MAJOR.MINOR` value is stored in a file at the root of the repository:
+
+```
+/opt/wsprdaemon/VERSION
+```
+
+Contents (plain text, single line):
+
+```
+4.0
+```
+
+The developer edits this file and commits it when bumping the minor version.
+The commit index is never stored — it is always computed at runtime.
+
+### 11.3 Computing the Full Version String
+
+```bash
+wd_version() {
+    local version_file="/opt/wsprdaemon/VERSION"
+    local major_minor
+    major_minor=$(<"${version_file}")
+    local commit_index
+    commit_index=$(cd /opt/wsprdaemon && git rev-list --count HEAD)
+    local short_sha
+    short_sha=$(cd /opt/wsprdaemon && git rev-parse --short HEAD)
+    echo "${major_minor}-${commit_index} (${short_sha})"
+}
+```
+
+### 11.4 Displaying the Version
+
+`wd-ctl --version` displays the full version string:
+
+```
+wsprdaemon 4.0-4837 (a1b2c3d4)
+```
+
+The version is also included in:
+- Log messages (the `wd-logger` prefix includes `wd/4.0-4837`)
+- Spot reports uploaded to wsprdaemon.org (as a metadata field)
+- `wd-ctl status` output
+
+### 11.5 Checking Out a Specific Commit Index
+
+If a user is told "use version 4.0-4837", they can check it out with:
+
+```bash
+cd /opt/wsprdaemon
+git checkout $(git rev-list --reverse HEAD | sed -n '4837p')
+```
+
+Or equivalently, using the `wd-ctl` helper:
+
+```bash
+wd-ctl checkout-version 4837
+```
+
+This resolves the commit index to the corresponding SHA and runs `git checkout`.
+
+**Important**: The commit index is only meaningful on a single branch (typically
+`main`).  If the repository has been rebased or the user is on a different branch,
+the index-to-SHA mapping may differ.  `wd-ctl checkout-version` validates that
+the current branch is `main` before proceeding and warns if it is not.
