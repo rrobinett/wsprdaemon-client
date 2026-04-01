@@ -1,0 +1,55 @@
+#!/bin/bash
+# /usr/local/sbin/wd-post
+# Posting daemon — collects decoded spot files from the posting directory,
+# performs best-SNR merging across receivers (for merge sources),
+# and queues spots for upload:
+#   - wsprnet.org: merged best-SNR union per transmitter (by reporter call+grid)
+#   - wsprdaemon.org: per-receiver spot sets (by reporter+receiver name)
+
+set -euo pipefail
+
+: "${WD_RECEIVER_NAME:?}"
+: "${WD_RECEIVER_BAND:?}"
+: "${WD_POSTING_DIR:?}"
+: "${WD_RECEIVER_CALL:?}"
+: "${WD_RECEIVER_GRID:?}"
+
+echo "wd-post: ${WD_RECEIVER_NAME} band ${WD_RECEIVER_BAND}"
+echo "  posting dir: ${WD_POSTING_DIR}"
+
+# Upload directories
+WSPRNET_DIR="${WD_UPLOAD_WSPRNET_DIR:-}"
+WSPRDAEMON_DIR="${WD_UPLOAD_WSPRDAEMON_DIR:-}"
+
+[[ -n "${WSPRNET_DIR}" ]] && mkdir -p "${WSPRNET_DIR}"
+[[ -n "${WSPRDAEMON_DIR}" ]] && mkdir -p "${WSPRDAEMON_DIR}"
+
+while true; do
+    # Watch for spot files using inotifywait
+    inotifywait -q -e close_write -t 120 "${WD_POSTING_DIR}" --include '_spots\.txt$' >/dev/null 2>&1 || true
+
+    # Process any spot files in the posting directory
+    shopt -s nullglob
+    spot_files=("${WD_POSTING_DIR}"/*_spots.txt)
+    shopt -u nullglob
+
+    for spot_file in "${spot_files[@]}"; do
+        if [[ ! -s "${spot_file}" ]]; then
+            rm -f "${spot_file}"
+            continue
+        fi
+
+        # Queue for wsprdaemon.org upload (per-receiver, unmerged)
+        if [[ -n "${WSPRDAEMON_DIR}" ]]; then
+            cp "${spot_file}" "${WSPRDAEMON_DIR}/"
+        fi
+
+        # Queue for wsprnet.org upload (will be merged by upload daemon)
+        if [[ -n "${WSPRNET_DIR}" ]]; then
+            cp "${spot_file}" "${WSPRNET_DIR}/"
+        fi
+
+        # Remove processed spot file
+        rm -f "${spot_file}"
+    done
+done

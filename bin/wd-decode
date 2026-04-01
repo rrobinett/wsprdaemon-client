@@ -1,0 +1,125 @@
+#!/bin/bash
+# /usr/local/sbin/wd-decode
+# Decoder daemon — watches recording directory for wav files,
+# concatenates with sox, runs wsprd (W-modes) or jt9 (F-modes).
+#
+# For KA9Q sources: uses inotifywait (clean open/close on wav files).
+# For Kiwi sources: uses polling (kiwi_recorder opens/closes continuously).
+
+set -euo pipefail
+
+: "${WD_RECEIVER_NAME:?}"
+: "${WD_RECEIVER_TYPE:?}"
+: "${WD_RECEIVER_BAND:?}"
+: "${WD_RECEIVER_MODES:?}"
+: "${WD_RECEIVER_FREQ_HZ:?}"
+: "${WD_RECORDING_DIR:?}"
+: "${WD_POSTING_DIR:?}"
+
+mkdir -p "${WD_POSTING_DIR}"
+
+# Parse mode list (colon-separated: W2:F2:F5)
+IFS=':' read -ra MODES <<< "${WD_RECEIVER_MODES}"
+
+echo "wd-decode: ${WD_RECEIVER_NAME} band ${WD_RECEIVER_BAND}"
+echo "  modes: ${WD_RECEIVER_MODES}"
+echo "  recording dir: ${WD_RECORDING_DIR}"
+echo "  posting dir: ${WD_POSTING_DIR}"
+
+# Determine file watching method based on receiver type
+use_inotify=false
+if [[ "${WD_RECEIVER_TYPE}" == "ka9q" || "${WD_RECEIVER_TYPE}" == "ka9q_wwv" ]]; then
+    use_inotify=true
+fi
+
+decode_window() {
+    # $1 = mode string (e.g., W2, F2, F5)
+    local mode="$1"
+    local prefix="${mode:0:1}"
+    local window="${mode:1}"
+    local freq_hz="${WD_RECEIVER_FREQ_HZ}"
+
+    # Collect the N most recent wav files for this window duration
+    local wav_files
+    wav_files=$(find "${WD_RECORDING_DIR}" -maxdepth 1 -name '*.wav' \
+                -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -"${window}" | \
+                sort -n | cut -f2)
+
+    local file_count
+    file_count=$(echo "${wav_files}" | grep -c . 2>/dev/null || echo 0)
+
+    if (( file_count < window )); then
+        return 0  # Not enough files yet for this window
+    fi
+
+    # Create temp directory for decode work
+    local work_dir
+    work_dir=$(mktemp -d "/tmp/wd-decode-${WD_RECEIVER_NAME}-${WD_RECEIVER_BAND}-XXXXXX")
+    trap "rm -rf '${work_dir}'" RETURN
+
+    # Concatenate wav files with sox → 16-bit PCM
+    local concat_wav="${work_dir}/decode_input.wav"
+    # shellcheck disable=SC2086
+    sox ${wav_files} -b 16 -e signed-integer "${concat_wav}" 2>/dev/null
+
+    if [[ ! -s "${concat_wav}" ]]; then
+        echo "wd-decode: sox concatenation failed for mode ${mode}"
+        return 1
+    fi
+
+    # Run decoder based on prefix
+    local spots_file="${work_dir}/spots.txt"
+    local freq_mhz
+    freq_mhz=$(echo "scale=6; ${freq_hz}/1000000" | bc)
+
+    case "${prefix}" in
+        W)
+            # wsprd — WSPR-2 decoder
+            wsprd -f "${freq_mhz}" "${concat_wav}" > "${spots_file}" 2>/dev/null
+            ;;
+        F)
+            # jt9 — FST4W decoder with period flag
+            local period_sec=$(( window * 60 ))
+            jt9 -p "${period_sec}" -f "${freq_mhz}" "${concat_wav}" > "${spots_file}" 2>/dev/null
+            ;;
+        I)
+            # IQ recording — no decode, just archive
+            return 0
+            ;;
+        *)
+            echo "wd-decode: unknown mode prefix: ${prefix}"
+            return 1
+            ;;
+    esac
+
+    # Move spots to posting directory if we got any
+    if [[ -s "${spots_file}" ]]; then
+        local timestamp
+        timestamp=$(date -u +%Y%m%d_%H%M%S)
+        local dest="${WD_POSTING_DIR}/${WD_RECEIVER_NAME}_${WD_RECEIVER_BAND}_${mode}_${timestamp}_spots.txt"
+        mv "${spots_file}" "${dest}"
+        echo "wd-decode: ${mode} → $(wc -l < "${dest}") spots → ${dest}"
+    fi
+}
+
+run_decode_cycle() {
+    for mode in "${MODES[@]}"; do
+        decode_window "${mode}" || true
+    done
+}
+
+# Main loop
+if ${use_inotify}; then
+    echo "wd-decode: using inotifywait for ${WD_RECEIVER_TYPE} source"
+    while true; do
+        # Wait for a new wav file to be closed
+        inotifywait -q -e close_write -t 120 "${WD_RECORDING_DIR}" --include '\.wav$' >/dev/null 2>&1 || true
+        run_decode_cycle
+    done
+else
+    echo "wd-decode: using polling for ${WD_RECEIVER_TYPE} source"
+    while true; do
+        sleep 60  # Poll every minute (matches kiwi_recorder 1-min wav cycle)
+        run_decode_cycle
+    done
+fi

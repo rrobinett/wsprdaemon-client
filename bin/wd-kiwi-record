@@ -1,0 +1,43 @@
+#!/bin/bash
+# /usr/local/sbin/wd-kiwi-record
+# Thin wrapper for kiwi_recorder.py — one instance per receiver+band.
+# kiwi_recorder.py is used as-is and is NOT modified by wsprdaemon.
+#
+# On SIGTERM, kiwi_recorder.py truncates the current wav file.
+# The ExecStopPost script (wd-kiwi-cleanup) deletes the truncated file.
+
+set -euo pipefail
+
+: "${WD_RECEIVER_NAME:?WD_RECEIVER_NAME not set}"
+: "${WD_KIWI_ADDRESS:?WD_KIWI_ADDRESS not set}"
+: "${WD_RECEIVER_BAND:?WD_RECEIVER_BAND not set}"
+: "${WD_RECEIVER_FREQ_HZ:?WD_RECEIVER_FREQ_HZ not set}"
+: "${WD_RECORDING_DIR:?WD_RECORDING_DIR not set}"
+
+mkdir -p "${WD_RECORDING_DIR}"
+
+# Parse host:port from address
+KIWI_HOST="${WD_KIWI_ADDRESS%%:*}"
+KIWI_PORT="${WD_KIWI_ADDRESS##*:}"
+
+echo "wd-kiwi-record: starting kiwi_recorder.py for ${WD_RECEIVER_NAME} band ${WD_RECEIVER_BAND}"
+echo "  kiwi: ${KIWI_HOST}:${KIWI_PORT}"
+echo "  freq: ${WD_RECEIVER_FREQ_HZ} Hz"
+echo "  recording dir: ${WD_RECORDING_DIR}"
+
+# Build kiwi_recorder.py args
+KIWI_ARGS=(
+    --server-host "${KIWI_HOST}"
+    --server-port "${KIWI_PORT}"
+    --frequency "$(echo "scale=3; ${WD_RECEIVER_FREQ_HZ}/1000" | bc)"
+    --dir "${WD_RECORDING_DIR}"
+    --tlimit 60
+    --dt-sec 60
+)
+
+# Add password if set
+if [[ -n "${WD_KIWI_PASSWORD:-}" ]]; then
+    KIWI_ARGS+=(--password "${WD_KIWI_PASSWORD}")
+fi
+
+exec python3 -u /opt/wsprdaemon/bin/kiwi_recorder.py "${KIWI_ARGS[@]}"

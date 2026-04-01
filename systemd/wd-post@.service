@@ -1,0 +1,29 @@
+# /etc/systemd/system/wd-post@.service
+# Posting daemon — one instance per receiver+band.
+# Collects decoded spots, queues them for upload to wsprnet.org
+# (merged best-SNR per transmitter) and wsprdaemon.org (per-receiver).
+#
+# Instance name = RECEIVER-BAND, e.g.: wd-post@KA9Q_0-80.service
+
+[Unit]
+Description=wsprdaemon spot poster for %i
+After=network-online.target
+PartOf=wsprdaemon.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-post@%i.env
+ExecStart=/usr/local/sbin/wd-post
+WorkingDirectory=/var/spool/wsprdaemon/posting
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-post@%i
+
+[Install]
+WantedBy=wsprdaemon.target

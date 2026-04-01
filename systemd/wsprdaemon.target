@@ -1,0 +1,11 @@
+# /etc/systemd/system/wsprdaemon.target
+# Master target for all wsprdaemon services.
+# systemctl start wsprdaemon.target  — start everything
+# systemctl stop wsprdaemon.target   — stop everything
+
+[Unit]
+Description=wsprdaemon v4 service group
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

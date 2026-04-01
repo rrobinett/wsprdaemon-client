@@ -1,0 +1,26 @@
+#!/bin/bash
+# /usr/local/sbin/wd-kiwi-cleanup
+# Called by ExecStopPost after kiwi_recorder.py is stopped.
+# kiwi_recorder.py truncates the current wav file on SIGTERM,
+# so we delete the most recent (truncated) file to prevent the
+# decoder from being called on an incomplete window.
+
+set -euo pipefail
+
+INSTANCE="${1:?Usage: wd-kiwi-cleanup INSTANCE}"
+
+# Parse receiver-band from instance name
+RECEIVER="${INSTANCE%-*}"
+BAND="${INSTANCE##*-}"
+
+RECORDING_DIR="/var/spool/wsprdaemon/recording/${RECEIVER}/${BAND}"
+
+if [[ -d "${RECORDING_DIR}" ]]; then
+    # Find the most recently modified wav file and remove it
+    LATEST=$(find "${RECORDING_DIR}" -maxdepth 1 -name '*.wav' -printf '%T@\t%p\n' \
+             2>/dev/null | sort -rn | head -1 | cut -f2)
+    if [[ -n "${LATEST}" ]]; then
+        echo "wd-kiwi-cleanup: removing truncated file: ${LATEST}"
+        rm -f "${LATEST}"
+    fi
+fi

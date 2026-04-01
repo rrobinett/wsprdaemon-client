@@ -1,0 +1,33 @@
+# /etc/systemd/system/wd-kiwi-record@.service
+# KiwiSDR recorder — one instance per receiver+band (1:1).
+# Subject to schedule transitions (start/stop based on time).
+# kiwi_recorder.py truncates the current wav file on SIGTERM;
+# the wrapper deletes the truncated file and the decoder is
+# never called on an incomplete window.
+#
+# Instance name = RECEIVER-BAND, e.g.: wd-kiwi-record@KIWI_0-80.service
+
+[Unit]
+Description=wsprdaemon Kiwi recorder for %i
+After=network-online.target
+Wants=network-online.target
+PartOf=wsprdaemon.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-kiwi-record@%i.env
+ExecStart=/usr/local/sbin/wd-kiwi-record
+ExecStopPost=/usr/local/sbin/wd-kiwi-cleanup %i
+WorkingDirectory=/var/spool/wsprdaemon/recording
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-kiwi-record@%i
+
+[Install]
+WantedBy=wsprdaemon.target

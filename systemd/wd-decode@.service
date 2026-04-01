@@ -1,0 +1,32 @@
+# /etc/systemd/system/wd-decode@.service
+# Decoder service — one instance per receiver+band.
+# Watches for wav files, runs wsprd (W-modes) or jt9 (F-modes).
+# sox concatenates 1-min float wav files → multi-min 16-bit PCM for wsprd.
+#
+# For KA9Q sources, BindsTo= is set via drop-in to restart the decoder
+# when the KA9Q recorder fails (decoders produce nothing without wav files).
+#
+# Instance name = RECEIVER-BAND, e.g.: wd-decode@KA9Q_0-80.service
+
+[Unit]
+Description=wsprdaemon decoder for %i
+After=network-online.target
+PartOf=wsprdaemon.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-decode@%i.env
+ExecStart=/usr/local/sbin/wd-decode
+WorkingDirectory=/var/spool/wsprdaemon/recording
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-decode@%i
+
+[Install]
+WantedBy=wsprdaemon.target

@@ -1,0 +1,31 @@
+# /etc/systemd/system/wd-ka9q-record@.service
+# KA9Q multicast recorder — one instance per receiver.
+# Listens to one multicast stream, produces wav files for all component bands.
+# Runs continuously — NEVER schedule-toggled.
+#
+# Instance name = receiver name, e.g.: wd-ka9q-record@KA9Q_0.service
+
+[Unit]
+Description=wsprdaemon KA9Q recorder for %i
+After=network-online.target
+Wants=network-online.target
+PartOf=wsprdaemon.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-ka9q-record@%i.env
+ExecStart=/usr/local/sbin/wd-ka9q-record
+WorkingDirectory=/var/spool/wsprdaemon/recording/%i
+
+Restart=always
+RestartSec=5
+WatchdogSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-ka9q-record@%i
+
+[Install]
+WantedBy=wsprdaemon.target

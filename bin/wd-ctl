@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""wd-ctl — wsprdaemon v4 orchestrator.
+
+Subcommands:
+    migrate-config  Convert v3 bash-array config to v4 INI + env files
+    apply           Generate env files from current config and ensure services match
+    teardown        Stop and disable all wsprdaemon services
+    status          Show status of all wsprdaemon services
+    validate        Check config for errors without applying
+    verbosity       Change log verbosity: up|down SERVICE|all
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Add the lib directory to the path so wdlib is importable
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_LIB_DIR = _SCRIPT_DIR.parent / 'lib'
+if _LIB_DIR.exists():
+    sys.path.insert(0, str(_LIB_DIR))
+# Also check /opt/wsprdaemon/lib for installed location
+elif Path('/opt/wsprdaemon/lib').exists():
+    sys.path.insert(0, '/opt/wsprdaemon/lib')
+
+from wdlib import paths
+from wdlib.v3_parser import parse_v3_config
+from wdlib.ini_writer import v3_to_ini
+from wdlib.envgen import generate_all_env_files
+
+
+def cmd_migrate_config(args):
+    """Convert a v3 wsprdaemon.conf to v4 INI format + env files."""
+    v3_path = args.input
+    if not Path(v3_path).exists():
+        print(f'Error: v3 config not found: {v3_path}', file=sys.stderr)
+        return 1
+
+    print(f'Parsing v3 config: {v3_path}')
+    config = parse_v3_config(v3_path)
+
+    # Report what we found
+    rx_types = {}
+    for rx in config.receivers.values():
+        t = rx.receiver_type
+        rx_types[t] = rx_types.get(t, 0) + 1
+    print(f'  Receivers: {len(config.receivers)}', end='')
+    for t, n in sorted(rx_types.items()):
+        print(f'  ({n} {t})', end='')
+    print()
+    print(f'  Schedule slots: {len(config.schedule_slots)}')
+
+    total_entries = sum(len(s.entries) for s in config.schedule_slots)
+    print(f'  Schedule entries: {total_entries}')
+
+    # Generate INI config
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ini_text = v3_to_ini(config)
+    ini_path = output_dir / 'wsprdaemon.conf'
+    ini_path.write_text(ini_text)
+    print(f'\n  INI config written: {ini_path}')
+
+    # Generate env files
+    env_dir = output_dir / 'env'
+    written = generate_all_env_files(config, env_dir)
+    print(f'  Environment files: {len(written)} files in {env_dir}/')
+
+    # List them grouped by service type
+    by_type = {}
+    for fp in sorted(written):
+        fname = Path(fp).name
+        svc_type = fname.split('@')[0] if '@' in fname else 'other'
+        by_type.setdefault(svc_type, []).append(fname)
+
+    for svc_type, files in sorted(by_type.items()):
+        print(f'\n    {svc_type}:')
+        for f in files:
+            print(f'      {f}')
+
+    print(f'\nMigration complete. Review {ini_path} and the env files.')
+    print('Then run: wd-ctl apply')
+    return 0
+
+
+def cmd_apply(args):
+    """Generate env files from config and reconcile running services."""
+    print('apply: not yet implemented (coming in next iteration)')
+    print('This will:')
+    print('  1. Parse /etc/wsprdaemon/wsprdaemon.conf')
+    print('  2. Generate env files in /etc/wsprdaemon/env/')
+    print('  3. Compute desired service set')
+    print('  4. Start missing services, stop extra services')
+    return 0
+
+
+def cmd_teardown(args):
+    """Stop and disable all wsprdaemon services."""
+    print('teardown: not yet implemented')
+    return 0
+
+
+def cmd_status(args):
+    """Show status of all wsprdaemon services."""
+    # Try to import systemd module
+    try:
+        from wdlib import systemd as sd
+    except ImportError:
+        print('Error: wdlib not found', file=sys.stderr)
+        return 1
+
+    print('wsprdaemon v4 service status')
+    print('=' * 60)
+
+    patterns = [
+        'wd-ka9q-record@*',
+        'wd-kiwi-record@*',
+        'wd-decode@*',
+        'wd-post@*',
+        'wd-upload-*',
+    ]
+
+    found_any = False
+    for pattern in patterns:
+        units = sd.list_units(pattern)
+        if units:
+            found_any = True
+            for unit in units:
+                active = 'active' if sd.is_active(unit) else 'inactive'
+                print(f'  {unit:50s}  [{active}]')
+
+    if not found_any:
+        print('  No wsprdaemon services found.')
+        print('  Run "wd-ctl apply" to start services from config.')
+
+    return 0
+
+
+def cmd_validate(args):
+    """Validate config without applying."""
+    conf_path = args.config or str(paths.CONF_FILE)
+    if not Path(conf_path).exists():
+        print(f'Error: config not found: {conf_path}', file=sys.stderr)
+        return 1
+
+    # For now, try parsing as v3 to validate
+    print(f'Validating: {conf_path}')
+    try:
+        config = parse_v3_config(conf_path)
+        print(f'  Receivers: {len(config.receivers)}')
+        print(f'  Schedule slots: {len(config.schedule_slots)}')
+
+        # Check for schedule errors
+        errors = []
+        for slot in config.schedule_slots:
+            for entry in slot.entries:
+                rx = config.receivers.get(entry.receiver)
+                if not rx:
+                    errors.append(f'Schedule references unknown receiver: {entry.receiver}')
+                    continue
+                # KA9Q receivers must not appear in schedule transitions
+                if rx.receiver_type == 'ka9q' and slot.time != '00:00':
+                    errors.append(
+                        f'KA9Q receiver {entry.receiver} in time-based schedule '
+                        f'at {slot.time} — KA9Q recorders run continuously and '
+                        f'must not be schedule-toggled'
+                    )
+
+        if errors:
+            print(f'\n  ERRORS ({len(errors)}):')
+            for e in errors:
+                print(f'    ! {e}')
+            return 1
+        else:
+            print('  Config is valid.')
+            return 0
+    except Exception as e:
+        print(f'  Parse error: {e}', file=sys.stderr)
+        return 1
+
+
+def cmd_verbosity(args):
+    """Change log verbosity for a service."""
+    print(f'verbosity {args.direction} {args.target}: not yet implemented')
+    print('This will send USR1 (up) or USR2 (down) to the service MainPID.')
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='wd-ctl',
+        description='wsprdaemon v4 orchestrator'
+    )
+    sub = parser.add_subparsers(dest='command', help='Subcommand')
+
+    # migrate-config
+    p_migrate = sub.add_parser('migrate-config',
+                               help='Convert v3 config to v4 format')
+    p_migrate.add_argument('input',
+                          help='Path to v3 wsprdaemon.conf')
+    p_migrate.add_argument('-o', '--output-dir',
+                          default='/etc/wsprdaemon',
+                          help='Output directory (default: /etc/wsprdaemon)')
+
+    # apply
+    sub.add_parser('apply', help='Apply config: generate env, reconcile services')
+
+    # teardown
+    sub.add_parser('teardown', help='Stop and disable all services')
+
+    # status
+    sub.add_parser('status', help='Show service status')
+
+    # validate
+    p_val = sub.add_parser('validate', help='Validate config')
+    p_val.add_argument('-c', '--config', help='Config file path')
+
+    # verbosity
+    p_verb = sub.add_parser('verbosity', help='Change log verbosity')
+    p_verb.add_argument('direction', choices=['up', 'down'])
+    p_verb.add_argument('target', help='Service name or "all"')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    dispatch = {
+        'migrate-config': cmd_migrate_config,
+        'apply': cmd_apply,
+        'teardown': cmd_teardown,
+        'status': cmd_status,
+        'validate': cmd_validate,
+        'verbosity': cmd_verbosity,
+    }
+
+    return dispatch[args.command](args)
+
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)
