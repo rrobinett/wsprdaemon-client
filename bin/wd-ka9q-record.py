@@ -1,38 +1,31 @@
 #!/usr/bin/env python3
-"""wd-ka9q-record — KA9Q recording daemon for wsprdaemon v4.
+"""wd-ka9q-record — KA9Q WSPR recording daemon for wsprdaemon v4.
 
-For WSPR/FST4W bands (WD_RECEIVER_TYPE=ka9q):
-  Builds a wspr-recorder config from env vars and execs
-  /opt/wsprdaemon/venv/bin/wspr-recorder.  The child process handles
-  channel lifecycle, RTP reception, minute-file writing, and health
-  monitoring (github.com/mijahauan/wspr-recorder by AC0G).
+Generates a wspr-recorder config from env vars and execs
+/opt/wsprdaemon/venv/bin/wspr-recorder (github.com/mijahauan/wspr-recorder
+by AC0G).  wspr-recorder handles channel lifecycle via RadiodControl,
+RTP multicast reception, minute-aligned WAV writing, gap detection,
+quality JSON sidecars, and health monitoring.
 
-For WWV IQ bands (WD_RECEIVER_TYPE=ka9q_wwv):
-  Custom single-thread select() receiver that writes IEEE_FLOAT wav files.
-  wspr-recorder is USB-mode only; IQ recording stays here.
+WWV/CHU IQ recording is handled by the hf-timestd peer service
+(github.com/mijahauan/hf-timestd).  No ka9q_wwv receivers appear in
+wsprdaemon.conf.
 
 Environment variables (set by systemd EnvironmentFile):
     WD_RADIOD_STATUS    Radiod status/control DNS  (e.g. k3lr-rx888-status.local)
     WD_RECEIVER_NAME    Receiver name              (e.g. KA9Q_0)
-    WD_RECEIVER_TYPE    ka9q | ka9q_wwv
     WD_BANDS            Space-separated band list  (e.g. "630 80 40 20")
     WD_RECORDING_DIR    Spool root for this receiver
     WD_GAIN_DB          RF output gain in dB       (default: 60)
+
+WAV output: YYYYMMDDTHHMMSSz_{freq_hz}_usb.wav  (matches kiwi format)
 """
 
 import os
-import select as _select
-import signal
-import socket
-import struct
 import sys
-import threading
-import time
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List
 
 # wdlib is in /opt/wsprdaemon/lib (installed) or relative to this script
 _HERE = Path(__file__).resolve().parent
@@ -44,18 +37,11 @@ from wdlib.envgen import BAND_FREQ_HZ  # noqa: E402
 
 log = logging.getLogger('wd-ka9q-record')
 
-# ── Configuration from environment ──────────────────────────────────────────
 RADIOD_STATUS = os.environ['WD_RADIOD_STATUS']
 RX_NAME       = os.environ['WD_RECEIVER_NAME']
-RX_TYPE       = os.environ.get('WD_RECEIVER_TYPE', 'ka9q')
 BANDS         = os.environ['WD_BANDS'].split()
 RECORDING_DIR = Path(os.environ['WD_RECORDING_DIR'])
 GAIN_DB       = float(os.environ.get('WD_GAIN_DB', '60'))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# WSPR/FST4W path — delegate to wspr-recorder
-# ═══════════════════════════════════════════════════════════════════════════════
 
 WSPR_RECORDER = '/opt/wsprdaemon/venv/bin/wspr-recorder'
 
@@ -95,8 +81,7 @@ high        = 1700
 """
 
 
-def run_wspr_recorder() -> int:
-    """Generate config and exec wspr-recorder (replaces this process)."""
+def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)sZ %(name)s %(levelname)s %(message)s',
@@ -113,269 +98,14 @@ def run_wspr_recorder() -> int:
 
     RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Write config to the recording dir so it's readable by the operator
     cfg_path = RECORDING_DIR / 'wspr-recorder.toml'
     cfg_path.write_text(_build_toml(freq_list))
     log.info('exec wspr-recorder -c %s  (bands: %s)', cfg_path, BANDS)
 
     os.execv(WSPR_RECORDER, [WSPR_RECORDER, '-c', str(cfg_path)])
-    # execv never returns on success; if we get here it failed
     log.error('execv failed — wspr-recorder not found at %s', WSPR_RECORDER)
     return 1
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# WWV IQ path — custom select() multiplexed receiver
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# WWV IQ: stereo 32-bit float at 24 kHz; interleaved I/Q
-SAMPLE_RATE    = 24000
-CHANNELS       = 2
-FILE_SUFFIX    = '_IQ'
-WINDOW_SEC     = 60
-EXPECTED_BYTES = SAMPLE_RATE * WINDOW_SEC * CHANNELS * 4   # float32 = 4 bytes
-DROP_TIMEOUT   = 10.0   # seconds without packets before channel recreation
-GAIN_IQ        = 0.0
-
-PRESET_IQ = 'iq'
-
-
-def _write_wav(path: Path, raw: bytes, sample_rate: int, channels: int) -> None:
-    """Write an IEEE_FLOAT (AudioFormat=3) wav file from raw float32 bytes."""
-    data_size = len(raw)
-    with open(str(path), 'wb') as f:
-        f.write(b'RIFF')
-        f.write(struct.pack('<I', 36 + data_size))
-        f.write(b'WAVE')
-        f.write(b'fmt ')
-        f.write(struct.pack('<I', 16))
-        f.write(struct.pack('<H', 3))                            # IEEE_FLOAT
-        f.write(struct.pack('<H', channels))
-        f.write(struct.pack('<I', sample_rate))
-        f.write(struct.pack('<I', sample_rate * channels * 4))   # ByteRate
-        f.write(struct.pack('<H', channels * 4))                 # BlockAlign
-        f.write(struct.pack('<H', 32))                           # BitsPerSample
-        f.write(b'data')
-        f.write(struct.pack('<I', data_size))
-        f.write(raw)
-
-
-@dataclass
-class BandState:
-    band:       str
-    freq_hz:    int
-    channel:    object          # ChannelInfo from ka9q
-    sock:       socket.socket
-    out_dir:    Path
-    buf:        bytearray = field(default_factory=bytearray)
-    win_start:  Optional[float] = None
-    last_pkt_t: float = 0.0
-
-
-def _open_socket(channel) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, 'SO_REUSEPORT'):
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except OSError:
-            pass
-    sock.bind(('0.0.0.0', channel.port))
-    mreq = struct.pack('=4s4s',
-                       socket.inet_aton(channel.multicast_address),
-                       socket.inet_aton('0.0.0.0'))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    sock.setblocking(False)
-    return sock
-
-
-def _flush(bs: BandState, start_utc: float) -> None:
-    raw = bytes(bs.buf)
-    bs.buf = bytearray()
-    if not raw:
-        return
-    if len(raw) < EXPECTED_BYTES:
-        deficit = EXPECTED_BYTES - len(raw)
-        log.warning('[%s] short window: %d/%d bytes, zero-padding front',
-                    bs.band, len(raw), EXPECTED_BYTES)
-        raw = bytes(deficit) + raw
-    elif len(raw) > EXPECTED_BYTES:
-        log.warning('[%s] long window: %d/%d bytes, truncating',
-                    bs.band, len(raw), EXPECTED_BYTES)
-        raw = raw[:EXPECTED_BYTES]
-    dt   = datetime.fromtimestamp(start_utc, tz=timezone.utc)
-    name = dt.strftime(f'%Y%m%dT%H%M%SZ_{bs.freq_hz}{FILE_SUFFIX}.wav')
-    path = bs.out_dir / name
-    _write_wav(path, raw, SAMPLE_RATE, CHANNELS)
-    log.info('[%s] wrote %s (%d samples)',
-             bs.band, name, len(raw) // (CHANNELS * 4))
-
-
-def _receive_loop(states: List[BandState], states_lock: threading.Lock,
-                  running: threading.Event) -> None:
-    while running.is_set():
-        with states_lock:
-            sock_map: Dict[socket.socket, BandState] = {bs.sock: bs for bs in states}
-        if not sock_map:
-            time.sleep(0.1)
-            continue
-        try:
-            readable, _, _ = _select.select(list(sock_map.keys()), [], [], 1.0)
-        except (ValueError, OSError):
-            continue
-        now = time.time()
-        win = (int(now) // WINDOW_SEC) * WINDOW_SEC
-        for sock in readable:
-            try:
-                data = sock.recv(65536)
-            except OSError:
-                continue
-            if len(data) < 12:
-                continue
-            if (data[0] >> 6) & 0x03 != 2:
-                continue
-            hdr_len = 12 + (data[0] & 0x0F) * 4
-            payload = data[hdr_len:]
-            if not payload:
-                continue
-            bs = sock_map.get(sock)
-            if bs is None:
-                continue
-            bs.last_pkt_t = now
-            if bs.win_start is None:
-                bs.win_start = win + WINDOW_SEC
-                continue
-            if now < bs.win_start:
-                continue
-            if win > bs.win_start:
-                _flush(bs, bs.win_start)
-                bs.win_start = win
-            bs.buf.extend(payload)
-
-
-def _health_monitor(states: List[BandState], states_lock: threading.Lock,
-                    control, running: threading.Event) -> None:
-    while running.is_set():
-        time.sleep(2.0)
-        now = time.time()
-        with states_lock:
-            for bs in states:
-                if bs.last_pkt_t == 0.0 or now - bs.last_pkt_t < DROP_TIMEOUT:
-                    continue
-                log.warning('[%s] no packets for %.0fs — recreating channel',
-                            bs.band, now - bs.last_pkt_t)
-                try:
-                    try:
-                        bs.sock.close()
-                    except OSError:
-                        pass
-                    channel = control.ensure_channel(
-                        frequency_hz=bs.freq_hz,
-                        preset=PRESET_IQ,
-                        sample_rate=SAMPLE_RATE,
-                        agc_enable=0,
-                        gain=GAIN_IQ,
-                    )
-                    bs.channel   = channel
-                    bs.sock      = _open_socket(channel)
-                    bs.last_pkt_t = now
-                    log.info('[%s] channel restored at %s:%d',
-                             bs.band, channel.multicast_address, channel.port)
-                except Exception as exc:
-                    log.error('[%s] channel restore failed: %s', bs.band, exc)
-                    bs.last_pkt_t = now
-
-
-def run_iq_recorder() -> int:
-    """WWV IQ recording via direct RTP select() loop."""
-    from ka9q import RadiodControl
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)sZ %(name)s %(levelname)s %(message)s',
-        datefmt='%Y-%m-%dT%H:%M:%S',
-    )
-    log.info('starting IQ recorder: rx=%s status=%s bands=%s',
-             RX_NAME, RADIOD_STATUS, BANDS)
-
-    RECORDING_DIR.mkdir(parents=True, exist_ok=True)
-
-    running     = threading.Event()
-    states_lock = threading.Lock()
-    states: List[BandState] = []
-
-    def _stop(sig, _frame):
-        log.info('received signal %d, shutting down', sig)
-        running.clear()
-
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT,  _stop)
-    running.set()
-
-    with RadiodControl(RADIOD_STATUS) as control:
-        for band in BANDS:
-            freq_hz = BAND_FREQ_HZ.get(band)
-            if freq_hz is None:
-                log.warning('unknown band %r — skipping', band)
-                continue
-            try:
-                channel = control.ensure_channel(
-                    frequency_hz=freq_hz,
-                    preset=PRESET_IQ,
-                    sample_rate=SAMPLE_RATE,
-                    agc_enable=0,
-                    gain=GAIN_IQ,
-                )
-            except Exception as exc:
-                log.error('[%s] ensure_channel failed: %s — skipping', band, exc)
-                continue
-            out_dir = RECORDING_DIR / band
-            out_dir.mkdir(parents=True, exist_ok=True)
-            sock = _open_socket(channel)
-            states.append(BandState(band=band, freq_hz=freq_hz,
-                                    channel=channel, sock=sock, out_dir=out_dir))
-            log.info('[%s] IQ channel ready: %s:%d (SSRC %d)',
-                     band, channel.multicast_address, channel.port, channel.ssrc)
-
-        if not states:
-            log.error('no IQ bands configured, exiting')
-            return 1
-
-        rx_thread = threading.Thread(
-            target=_receive_loop, args=(states, states_lock, running),
-            daemon=True, name='rx-loop')
-        hm_thread = threading.Thread(
-            target=_health_monitor, args=(states, states_lock, control, running),
-            daemon=True, name='health-monitor')
-        rx_thread.start()
-        hm_thread.start()
-
-        while running.is_set():
-            time.sleep(0.5)
-
-        log.info('stopping — flushing %d IQ band(s)', len(states))
-        rx_thread.join(timeout=3.0)
-        hm_thread.join(timeout=3.0)
-
-        with states_lock:
-            for bs in states:
-                if bs.win_start is not None and bs.buf:
-                    _flush(bs, bs.win_start)
-                try:
-                    bs.sock.close()
-                except OSError:
-                    pass
-
-    log.info('exiting')
-    return 0
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ═══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == '__main__':
-    if RX_TYPE == 'ka9q_wwv':
-        sys.exit(run_iq_recorder())
-    else:
-        sys.exit(run_wspr_recorder())
+    sys.exit(main())
