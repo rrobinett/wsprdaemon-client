@@ -27,6 +27,7 @@ elif Path('/opt/wsprdaemon/lib').exists():
 
 from wdlib import paths
 from wdlib.v3_parser import parse_v3_config
+from wdlib.v4_parser import parse_v4_config
 from wdlib.ini_writer import v3_to_ini
 from wdlib.envgen import generate_all_env_files
 
@@ -281,9 +282,14 @@ def cmd_apply(args):
               file=sys.stderr)
         return 1
 
-    # --- Parse and generate config + env files ---
-    print(f'Parsing config: {v3_path}')
-    config = parse_v3_config(v3_path)
+    # --- Parse config: prefer v4 INI if it exists, fall back to v3 ---
+    v4_ini = Path('/etc/wsprdaemon/wsprdaemon.conf')
+    if v4_ini.exists():
+        print(f'Parsing config: {v4_ini}  (v4 INI)')
+        config = parse_v4_config(str(v4_ini))
+    else:
+        print(f'Parsing config: {v3_path}  (v3 bash)')
+        config = parse_v3_config(v3_path)
 
     conf_dir = Path('/etc/wsprdaemon')
     env_dir  = conf_dir / 'env'
