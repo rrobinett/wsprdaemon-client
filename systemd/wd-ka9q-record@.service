@@ -7,8 +7,9 @@
 
 [Unit]
 Description=wsprdaemon KA9Q recorder for %i
-After=network-online.target
+After=network-online.target var-spool-wsprdaemon.mount
 Wants=network-online.target
+Requires=var-spool-wsprdaemon.mount
 PartOf=wsprdaemon.target
 
 [Service]
@@ -21,7 +22,6 @@ WorkingDirectory=/var/spool/wsprdaemon/recording/%i
 
 Restart=always
 RestartSec=5
-WatchdogSec=120
 
 StandardOutput=journal
 StandardError=journal

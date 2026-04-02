@@ -340,7 +340,8 @@ class TestEnvGeneration(unittest.TestCase):
         content = env_path.read_text()
         self.assertIn('WD_RECEIVER_NAME=KA9Q_0', content)
         self.assertIn('WD_RECEIVER_TYPE=ka9q', content)
-        self.assertIn('WD_MULTICAST_DNS=k3lr-wspr-pcm.local', content)
+        self.assertIn('WD_RADIOD_STATUS=', content)
+        self.assertNotIn('WD_MULTICAST_DNS', content)
 
     def test_decode_env_has_modes(self):
         if not self.config:
@@ -447,6 +448,20 @@ class TestINIWriter(unittest.TestCase):
             self.skipTest("No config")
         # NULL passwords should not appear in the INI
         self.assertNotIn('password = NULL', self.ini_text)
+
+    def test_modes_canonical_order(self):
+        if not self.config:
+            self.skipTest("No config")
+        # All modes = lines must be in canonical order: W2 F2 F5 F15 F30 I1
+        import re
+        canonical = ['W2', 'F2', 'F5', 'F15', 'F30', 'I1']
+        for line in self.ini_text.splitlines():
+            if not line.startswith('modes = '):
+                continue
+            tokens = line[len('modes = '):].split()
+            positions = [canonical.index(t) for t in tokens if t in canonical]
+            self.assertEqual(positions, sorted(positions),
+                             f"Modes not in canonical order: {line!r}")
 
 
 class TestPaths(unittest.TestCase):

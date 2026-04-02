@@ -12,6 +12,7 @@ from typing import Dict, Set
 
 from wdlib.v3_parser import V3Config
 from wdlib.envgen import BAND_FREQ_HZ
+from wdlib.modes import mode_sort_key
 
 
 def v3_to_ini(config: V3Config) -> str:
@@ -81,7 +82,7 @@ def v3_to_ini(config: V3Config) -> str:
             for band in sorted(rx_band_modes[rx_name].keys(),
                              key=lambda b: BAND_FREQ_HZ.get(b, 0)):
                 modes = rx_band_modes[rx_name][band]
-                modes_str = ' '.join(sorted(modes))
+                modes_str = ' '.join(sorted(modes, key=mode_sort_key))
                 freq = BAND_FREQ_HZ.get(band, 0)
                 out.append(f'[receiver:{rx_name}:{band}]')
                 out.append(f'modes = {modes_str}')
@@ -104,7 +105,7 @@ def v3_to_ini(config: V3Config) -> str:
             for band in sorted(rx_band_modes[rx_name].keys(),
                              key=lambda b: BAND_FREQ_HZ.get(b, 0)):
                 modes = rx_band_modes[rx_name][band]
-                modes_str = ' '.join(sorted(modes))
+                modes_str = ' '.join(sorted(modes, key=mode_sort_key))
                 out.append(f'[merge:{rx_name}:{band}]')
                 out.append(f'modes = {modes_str}')
                 out.append('')

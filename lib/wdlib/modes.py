@@ -83,6 +83,14 @@ def parse_mode(mode_str: str) -> DecodeMode:
     )
 
 
+_MODE_ORDER = {'W2': 0, 'F2': 1, 'F5': 2, 'F15': 3, 'F30': 4, 'I1': 5}
+
+
+def mode_sort_key(mode_str: str) -> int:
+    """Return a sort key for canonical mode ordering: W2 F2 F5 F15 F30 I1."""
+    return _MODE_ORDER.get(mode_str.upper(), 99)
+
+
 def parse_mode_list(mode_str: str) -> List[DecodeMode]:
     """Parse a colon-separated or space-separated mode list.
 

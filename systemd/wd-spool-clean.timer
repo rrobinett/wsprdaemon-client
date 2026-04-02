@@ -1,0 +1,16 @@
+# /etc/systemd/system/wd-spool-clean.timer
+# Triggers wd-spool-clean.service every 2 minutes.
+# Keeps the tmpfs spool from filling up when decoders are not running.
+# Once wd-decode is running, decoders will consume wav files within 2 minutes
+# and this timer becomes a safety net only.
+
+[Unit]
+Description=wsprdaemon spool janitor timer
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15
+
+[Install]
+WantedBy=timers.target

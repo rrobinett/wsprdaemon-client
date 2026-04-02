@@ -9,8 +9,9 @@
 
 [Unit]
 Description=wsprdaemon Kiwi recorder for %i
-After=network-online.target
+After=network-online.target var-spool-wsprdaemon.mount
 Wants=network-online.target
+Requires=var-spool-wsprdaemon.mount
 PartOf=wsprdaemon.target
 
 [Service]

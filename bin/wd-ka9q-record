@@ -1,27 +1,17 @@
 #!/bin/bash
 # /usr/local/sbin/wd-ka9q-record
-# Thin wrapper for systemd ExecStart — sources env, execs wd_record.
-# The actual recording is done by wd_record (from ka9q-radio).
-# This wrapper just sets up the environment and directory structure.
+# Thin wrapper — validates env vars and execs the Python recorder.
+# Channel creation and wav recording are handled by wd-ka9q-record.py
+# using ka9q-python (RadiodControl + ManagedStream).
 
 set -euo pipefail
 
-# Env vars are set by systemd EnvironmentFile directive
 : "${WD_RECEIVER_NAME:?WD_RECEIVER_NAME not set}"
-: "${WD_MULTICAST_DNS:?WD_MULTICAST_DNS not set}"
+: "${WD_RADIOD_STATUS:?WD_RADIOD_STATUS not set}"
 : "${WD_RECORDING_DIR:?WD_RECORDING_DIR not set}"
 : "${WD_BANDS:?WD_BANDS not set}"
 
-# Create per-band recording directories
-for band in ${WD_BANDS}; do
-    mkdir -p "${WD_RECORDING_DIR}/${band}"
-done
+VENV_PYTHON=/opt/wsprdaemon/venv/bin/python3
+RECORDER=/opt/wsprdaemon/bin/wd-ka9q-record.py
 
-echo "wd-ka9q-record: starting wd_record for ${WD_RECEIVER_NAME}"
-echo "  multicast: ${WD_MULTICAST_DNS}"
-echo "  bands: ${WD_BANDS}"
-echo "  recording dir: ${WD_RECORDING_DIR}"
-
-# exec wd_record — it listens to one multicast stream and produces
-# wav files for all component bands. Runs indefinitely.
-exec wd_record -d "${WD_RECORDING_DIR}" "${WD_MULTICAST_DNS}"
+exec "${VENV_PYTHON}" "${RECORDER}"

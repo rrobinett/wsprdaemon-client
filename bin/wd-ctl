@@ -86,13 +86,186 @@ def cmd_migrate_config(args):
 
 
 def cmd_apply(args):
-    """Generate env files from config and reconcile running services."""
-    print('apply: not yet implemented (coming in next iteration)')
-    print('This will:')
-    print('  1. Parse /etc/wsprdaemon/wsprdaemon.conf')
-    print('  2. Generate env files in /etc/wsprdaemon/env/')
-    print('  3. Compute desired service set')
-    print('  4. Start missing services, stop extra services')
+    """Generate env files from config, install units, and reconcile services."""
+    import shutil
+    import subprocess
+
+    # --- Locate v3 config ---
+    v3_candidates = [
+        args.config or '',
+        '/etc/wsprdaemon/wsprdaemon-v3.conf',
+        str(Path.home() / 'wsprdaemon.conf'),
+    ]
+    v3_path = next((p for p in v3_candidates if p and Path(p).is_file()), '')
+    if not v3_path:
+        print('Error: no v3 config found. Run migrate-config first or pass --config.',
+              file=sys.stderr)
+        return 1
+
+    # --- Parse and generate config + env files ---
+    print(f'Parsing config: {v3_path}')
+    config = parse_v3_config(v3_path)
+
+    conf_dir = Path('/etc/wsprdaemon')
+    env_dir  = conf_dir / 'env'
+    try:
+        conf_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        print('Error: need root to write to /etc/wsprdaemon. Run with sudo.',
+              file=sys.stderr)
+        return 1
+
+    ini_text = v3_to_ini(config)
+    ini_path = conf_dir / 'wsprdaemon.conf'
+    ini_path.write_text(ini_text)
+    print(f'  Config: {ini_path}')
+
+    written = generate_all_env_files(config, env_dir)
+    print(f'  Env files: {len(written)} files in {env_dir}/')
+
+    # --- Install systemd unit templates ---
+    unit_src = _SCRIPT_DIR.parent / 'systemd'
+    unit_dst = Path('/etc/systemd/system')
+    installed_units = []
+    for unit_file in unit_src.glob('*.service'):
+        dst = unit_dst / unit_file.name
+        shutil.copy2(unit_file, dst)
+        installed_units.append(unit_file.name)
+    for unit_file in unit_src.glob('*.target'):
+        dst = unit_dst / unit_file.name
+        shutil.copy2(unit_file, dst)
+        installed_units.append(unit_file.name)
+    for unit_file in unit_src.glob('*.timer'):
+        dst = unit_dst / unit_file.name
+        shutil.copy2(unit_file, dst)
+        installed_units.append(unit_file.name)
+    print(f'  Units installed: {", ".join(sorted(installed_units))}')
+
+    # --- Install wrapper scripts ---
+    sbin = Path('/usr/local/sbin')
+    wrappers = ['wd-ka9q-record', 'wd-kiwi-record', 'wd-decode', 'wd-post']
+    for name in wrappers:
+        src = _SCRIPT_DIR / name
+        if src.exists():
+            dst = sbin / name
+            shutil.copy2(src, dst)
+            dst.chmod(0o755)
+    print(f'  Wrappers installed to {sbin}/')
+
+    # --- Install Python recorder ---
+    opt_bin = Path('/opt/wsprdaemon/bin')
+    opt_bin.mkdir(parents=True, exist_ok=True)
+    py_src = _SCRIPT_DIR / 'wd-ka9q-record.py'
+    if py_src.exists():
+        shutil.copy2(py_src, opt_bin / 'wd-ka9q-record.py')
+    opt_lib = Path('/opt/wsprdaemon/lib')
+    opt_lib.mkdir(parents=True, exist_ok=True)
+    wdlib_src = _SCRIPT_DIR.parent / 'lib' / 'wdlib'
+    wdlib_dst = opt_lib / 'wdlib'
+    if wdlib_dst.is_symlink() or wdlib_dst.exists():
+        wdlib_dst.unlink() if wdlib_dst.is_symlink() else shutil.rmtree(wdlib_dst)
+    wdlib_dst.symlink_to(wdlib_src)
+
+    # --- Calculate tmpfs size from env files ---
+    # WSPR (12 kHz mono float32):  12000*60*4 = 2,880,000 bytes ≈ 3 MB/file
+    # IQ   (24 kHz stereo float32): 24000*60*2*4 = 11,520,000 bytes ≈ 12 MB/file
+    WSPR_MB_PER_FILE = 3    # 12000 Hz mono float32: 2,880,044 bytes ≈ 3 MB
+    IQ_MB_PER_FILE   = 12   # 24000 Hz stereo float32: 11,520,044 bytes ≈ 12 MB
+    # Size for wd-spool-clean.timer janitor age (5 min) + 2 min buffer.
+    # When wd-decode is running it will consume files within 1-2 minutes
+    # and this size becomes generous headroom.
+    KEEP_MINUTES     = 7
+
+    wspr_bands = iq_bands = 0
+    for fp in written:
+        fname = Path(fp).name
+        if 'wd-ka9q-record@' not in fname:
+            continue
+        lines = Path(fp).read_text().splitlines()
+        bands_val = next((l.split('=', 1)[1] for l in lines if l.startswith('WD_BANDS=')), '')
+        type_val  = next((l.split('=', 1)[1] for l in lines if l.startswith('WD_RECEIVER_TYPE=')), '')
+        n = len(bands_val.split()) if bands_val.strip() else 0
+        if 'wwv' in type_val.lower():
+            iq_bands += n
+        else:
+            wspr_bands += n
+
+    raw_mb    = (wspr_bands * WSPR_MB_PER_FILE + iq_bands * IQ_MB_PER_FILE) * KEEP_MINUTES
+    tmpfs_mb  = max(256, int(raw_mb * 1.5) + 64)   # 50% headroom + 64 MB base
+    print(f'  tmpfs size: {tmpfs_mb} MB  ({wspr_bands} WSPR bands, {iq_bands} IQ bands)')
+
+    # --- Generate and install the systemd mount unit ---
+    mount_unit = f'''\
+# Auto-generated by wd-ctl apply — do not edit manually
+[Unit]
+Description=wsprdaemon recording spool (tmpfs)
+DefaultDependencies=no
+Before=local-fs.target
+
+[Mount]
+What=tmpfs
+Where=/var/spool/wsprdaemon
+Type=tmpfs
+Options=size={tmpfs_mb}m,uid=wsprdaemon,gid=radio,mode=1775
+
+[Install]
+WantedBy=local-fs.target
+'''
+    mount_unit_path = Path('/etc/systemd/system/var-spool-wsprdaemon.mount')
+    mount_unit_path.write_text(mount_unit)
+    print(f'  Mount unit: {mount_unit_path}')
+
+    # --- Reload systemd (needed before we can start the mount unit) ---
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+    print('  systemd daemon reloaded')
+
+    # --- Mount the tmpfs (enable for persistence across reboots) ---
+    subprocess.run(['systemctl', 'enable', 'var-spool-wsprdaemon.mount'], check=True)
+    result = subprocess.run(
+        ['findmnt', '-t', 'tmpfs', '/var/spool/wsprdaemon'],
+        capture_output=True
+    )
+    if result.returncode != 0:
+        subprocess.run(['systemctl', 'start', 'var-spool-wsprdaemon.mount'], check=True)
+        print('  Mounted tmpfs at /var/spool/wsprdaemon')
+    else:
+        print('  tmpfs already mounted at /var/spool/wsprdaemon')
+
+    # --- Create spool subdirectories (tmpfs is now mounted) ---
+    spool = Path('/var/spool/wsprdaemon/recording')
+    spool.mkdir(parents=True, exist_ok=True)
+    for rx_name, rx in config.receivers.items():
+        if rx.receiver_type in ('ka9q', 'ka9q_wwv'):
+            rx_dir = spool / rx_name
+            rx_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.chown(str(rx_dir), user='wsprdaemon')
+            except Exception:
+                pass
+
+    # --- Start ka9q-record services ---
+    ka9q_instances = [
+        Path(f).stem.split('@')[1]
+        for f in written
+        if 'wd-ka9q-record@' in Path(f).name
+    ]
+    for instance in sorted(ka9q_instances):
+        svc = f'wd-ka9q-record@{instance}.service'
+        result = subprocess.run(
+            ['systemctl', 'enable', '--now', svc],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f'  Started: {svc}')
+        else:
+            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+
+    # --- Enable spool janitor timer ---
+    subprocess.run(['systemctl', 'enable', '--now', 'wd-spool-clean.timer'],
+                   capture_output=True)
+    print('  Spool janitor: wd-spool-clean.timer enabled')
+
+    print('\nApply complete. Check status with: wd-ctl status')
     return 0
 
 
@@ -205,7 +378,8 @@ def main():
                           help='Output directory (default: /etc/wsprdaemon)')
 
     # apply
-    sub.add_parser('apply', help='Apply config: generate env, reconcile services')
+    p_apply = sub.add_parser('apply', help='Apply config: generate env, reconcile services')
+    p_apply.add_argument('-c', '--config', help='Path to v3 wsprdaemon.conf (auto-detected if not given)')
 
     # teardown
     sub.add_parser('teardown', help='Stop and disable all services')

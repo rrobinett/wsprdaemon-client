@@ -10,12 +10,27 @@ generates:
 These env files are referenced by EnvironmentFile= in the systemd unit templates.
 """
 
-import os
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 from wdlib import paths
 from wdlib.v3_parser import V3Config, V3Receiver
+
+
+def _read_radiod_status_dns(ka9q_conf_name: str) -> str:
+    """Extract the status= DNS name from /etc/radio/radiod@<name>.conf."""
+    conf = Path(f'/etc/radio/radiod@{ka9q_conf_name}.conf')
+    if not conf.exists():
+        return ''
+    for raw in conf.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith('#'):
+            continue
+        m = re.match(r'^status\s*=\s*(\S+)', line)
+        if m:
+            return m.group(1)
+    return ''
 
 # WSPR band center frequencies in Hz (for wsprd and jt9)
 BAND_FREQ_HZ = {
@@ -53,22 +68,22 @@ def _env_header() -> str:
 
 def generate_ka9q_record_env(receiver: V3Receiver,
                               bands: Set[str],
-                              band_modes: Dict[str, set]) -> str:
+                              band_modes: Dict[str, set],
+                              radiod_status_dns: str = '') -> str:
     """Generate env file for a KA9Q recording service.
 
-    KA9Q recorders are 1-to-N: one process listens to one multicast
-    stream and produces wav files for all component bands.
+    KA9Q recorders are 1-to-N: one process uses ka9q-python to dynamically
+    create channels on radiod and write wav files for all component bands.
     """
     lines = [_env_header()]
     lines.append(f'WD_RECEIVER_NAME={receiver.name}')
-    lines.append(f'WD_RECEIVER_TYPE=ka9q')
-    lines.append(f'WD_MULTICAST_DNS={receiver.address}')
+    lines.append(f'WD_RECEIVER_TYPE={receiver.receiver_type}')
+    lines.append(f'WD_RADIOD_STATUS={radiod_status_dns}')
     lines.append(f'WD_RECEIVER_CALL={receiver.call}')
     lines.append(f'WD_RECEIVER_GRID={receiver.grid}')
     lines.append(f'WD_RECORDING_DIR={paths.receiver_recording_dir(receiver.name)}')
     lines.append(f'WD_LOG_DIR={paths.LOG_DIR}')
     lines.append(f'WD_RUN_DIR={paths.RUN_DIR}')
-    # List all bands this receiver handles (space-separated)
     sorted_bands = sorted(bands, key=lambda b: BAND_FREQ_HZ.get(b, 0))
     lines.append(f'WD_BANDS={" ".join(sorted_bands)}')
     return '\n'.join(lines) + '\n'
@@ -163,6 +178,28 @@ def generate_all_env_files(config: V3Config, output_dir: Path) -> List[str]:
             combined = existing_set | new_set
             rx_band_modes[rx_name][entry.band] = ':'.join(sorted(combined))
 
+    # Expand merge sources: every band assigned to a merge receiver must also
+    # be recorded by each component source receiver.  The merge only happens
+    # after decoding — all sources record independently.
+    for rx_name in list(rx_band_modes.keys()):
+        rx = config.receivers.get(rx_name)
+        if rx is None or not rx.is_merge:
+            continue
+        for src_name in rx.merge_sources:
+            src_rx = config.receivers.get(src_name)
+            if src_rx is None:
+                continue
+            if src_name not in rx_band_modes:
+                rx_band_modes[src_name] = {}
+            for band, modes in rx_band_modes[rx_name].items():
+                existing = rx_band_modes[src_name].get(band, '')
+                existing_set = set(existing.split(':')) - {''} if existing else set()
+                new_set = set(modes.split(':')) - {''}
+                rx_band_modes[src_name][band] = ':'.join(sorted(existing_set | new_set))
+
+    # Read the radiod status DNS once from the site radiod config
+    radiod_status_dns = _read_radiod_status_dns(config.ka9q_conf_name) if config.ka9q_conf_name else ''
+
     for rx_name, band_map in rx_band_modes.items():
         rx = config.receivers.get(rx_name)
         if not rx:
@@ -172,7 +209,7 @@ def generate_all_env_files(config: V3Config, output_dir: Path) -> List[str]:
             # KA9Q recorder — one env file per receiver
             env_path = output_dir / f'wd-ka9q-record@{rx_name}.env'
             env_path.write_text(generate_ka9q_record_env(
-                rx, set(band_map.keys()), config.band_modes
+                rx, set(band_map.keys()), config.band_modes, radiod_status_dns
             ))
             written.append(str(env_path))
 
@@ -191,7 +228,7 @@ def generate_all_env_files(config: V3Config, output_dir: Path) -> List[str]:
             # WWV/CHU IQ recording — one env per receiver
             env_path = output_dir / f'wd-ka9q-record@{rx_name}.env'
             env_path.write_text(generate_ka9q_record_env(
-                rx, set(band_map.keys()), config.band_modes
+                rx, set(band_map.keys()), config.band_modes, radiod_status_dns
             ))
             written.append(str(env_path))
 

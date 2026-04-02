@@ -1,0 +1,14 @@
+# /etc/systemd/system/wd-spool-clean.service
+# Delete wav files older than 5 minutes from the recording spool.
+# Run by wd-spool-clean.timer every 2 minutes.
+# Without this, the spool fills up when decoders are not running.
+
+[Unit]
+Description=wsprdaemon spool janitor
+After=var-spool-wsprdaemon.mount
+ConditionPathIsMountPoint=/var/spool/wsprdaemon
+
+[Service]
+Type=oneshot
+User=wsprdaemon
+ExecStart=/usr/bin/find /var/spool/wsprdaemon/recording -name '*.wav' -not -empty -mmin +5 -delete
