@@ -85,6 +85,105 @@ def cmd_migrate_config(args):
     return 0
 
 
+def _manage_radiod(conf_name: str) -> None:
+    """Ensure radiod@<conf_name>.service is running with its current config.
+
+    Logic:
+      1. Verify the ka9q-radio source tree is at the pinned commit (deps.conf).
+      2. If radiod is not running → start it.
+      3. If radiod is running but /etc/radio/radiod@<conf_name>.conf was modified
+         after the service last started → restart it.
+    """
+    import calendar
+    import configparser
+    import subprocess
+    from datetime import datetime
+
+    svc       = f'radiod@{conf_name}.service'
+    conf_file = Path(f'/etc/radio/radiod@{conf_name}.conf')
+
+    print(f'\n--- radiod: {svc} ---')
+
+    # --- Check source commit against deps.conf pin ---
+    deps_file = _SCRIPT_DIR.parent / 'deps.conf'
+    if deps_file.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(deps_file)
+        if 'ka9q-radio' in cfg:
+            pinned     = cfg['ka9q-radio'].get('commit', '').strip()
+            src_dir    = cfg['ka9q-radio'].get('install_to', '').strip()
+            if pinned and src_dir and Path(src_dir).is_dir():
+                result = subprocess.run(
+                    ['git', '-c', f'safe.directory={src_dir}',
+                     '-C', src_dir, 'rev-parse', 'HEAD'],
+                    capture_output=True, text=True
+                )
+                current = result.stdout.strip()
+                if current and not current.startswith(pinned[:8]):
+                    print(f'  WARNING: ka9q-radio source at {current[:12]}, '
+                          f'deps.conf pins {pinned[:12]}')
+                    print(f'  To update: cd {src_dir} && git checkout {pinned} && make && sudo make install')
+                else:
+                    print(f'  ka9q-radio source: OK at {current[:12]}')
+
+    if not conf_file.exists():
+        print(f'  radiod config not found: {conf_file}')
+        return
+
+    conf_mtime = conf_file.stat().st_mtime
+
+    # --- Get service state and start time ---
+    result = subprocess.run(
+        ['systemctl', 'show', svc,
+         '--property=ActiveState,ExecMainStartTimestamp'],
+        capture_output=True, text=True
+    )
+    props = {}
+    for line in result.stdout.splitlines():
+        k, _, v = line.partition('=')
+        props[k.strip()] = v.strip()
+
+    active_state = props.get('ActiveState', 'inactive')
+    start_ts_str = props.get('ExecMainStartTimestamp', '')
+
+    # Parse "Wed 2026-04-01 21:54:47 UTC" → epoch
+    start_ts = 0
+    if start_ts_str:
+        for fmt in ('%a %Y-%m-%d %H:%M:%S %Z', '%a %Y-%m-%d %H:%M:%S'):
+            try:
+                dt       = datetime.strptime(start_ts_str.strip(), fmt)
+                start_ts = calendar.timegm(dt.timetuple())
+                break
+            except ValueError:
+                continue
+
+    if active_state == 'active' and start_ts:
+        if conf_mtime > start_ts:
+            conf_dt  = datetime.utcfromtimestamp(conf_mtime).strftime('%H:%M:%S UTC')
+            start_dt = datetime.utcfromtimestamp(start_ts).strftime('%H:%M:%S UTC')
+            print(f'  Config changed ({conf_dt}) after last start ({start_dt}) — restarting')
+            result = subprocess.run(
+                ['systemctl', 'restart', svc],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f'  Restarted: {svc}')
+            else:
+                print(f'  Restart failed: {result.stderr.strip()}')
+        else:
+            print(f'  Running and config is current — no action needed')
+    else:
+        print(f'  State: {active_state} — starting')
+        result = subprocess.run(
+            ['systemctl', 'start', svc],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f'  Started: {svc}')
+        else:
+            print(f'  Failed to start: {result.stderr.strip()}')
+
+
 def cmd_apply(args):
     """Generate env files from config, install units, and reconcile services."""
     import shutil
@@ -95,6 +194,9 @@ def cmd_apply(args):
         args.config or '',
         '/etc/wsprdaemon/wsprdaemon-v3.conf',
         str(Path.home() / 'wsprdaemon.conf'),
+        # When invoked via sudo Path.home() resolves to /root; check the
+        # wsprdaemon user's home explicitly.
+        '/home/wsprdaemon/wsprdaemon.conf',
     ]
     v3_path = next((p for p in v3_candidates if p and Path(p).is_file()), '')
     if not v3_path:
@@ -289,6 +391,10 @@ WantedBy=local-fs.target
     subprocess.run(['systemctl', 'enable', '--now', 'wd-spool-clean.timer'],
                    capture_output=True)
     print('  Spool janitor: wd-spool-clean.timer enabled')
+
+    # --- Manage radiod ---
+    if config.ka9q_conf_name:
+        _manage_radiod(config.ka9q_conf_name)
 
     print('\nApply complete. Check status with: wd-ctl status')
     return 0
