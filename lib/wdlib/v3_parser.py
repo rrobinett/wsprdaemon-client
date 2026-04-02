@@ -31,6 +31,9 @@ class V3Receiver:
     call: str
     grid: str
     password: str      # 'NULL' or actual password
+    # v4 management fields — inferred during v3 parse or set explicitly in v4 INI
+    locality: str = ''      # 'local' (radiod on this host) | 'remote' (radiod elsewhere)
+    radiod_name: str = ''   # e.g. 'k3lr-rx888'; status DNS = <radiod_name>-status.local
 
     @property
     def receiver_type(self) -> str:
@@ -253,6 +256,24 @@ def parse_v3_config(config_path: str) -> V3Config:
             config.schedule_slots.append(slot)
         except ValueError:
             pass
+
+    # Infer locality and radiod_name for KA9Q receivers from v3 global KA9Q_CONF_NAME.
+    # Heuristic: extract the site prefix (first hyphen-delimited component) from both
+    # the receiver's audio stream DNS address and the global conf name.
+    # Match → local (radiod on this host); no match → remote (user-managed radiod).
+    if config.ka9q_conf_name:
+        local_prefix = config.ka9q_conf_name.split('-')[0].lower()
+        for rx in config.receivers.values():
+            if rx.receiver_type not in ('ka9q', 'ka9q_wwv'):
+                continue
+            addr_prefix = rx.address.split('-')[0].lower() if rx.address else ''
+            if addr_prefix == local_prefix:
+                rx.locality    = 'local'
+                rx.radiod_name = config.ka9q_conf_name
+            else:
+                rx.locality    = 'remote'
+                # radiod_name for remote cannot be inferred from v3 — left empty
+                # so the user can fill it in the generated v4 INI.
 
     # Build derived mappings
     for slot in config.schedule_slots:

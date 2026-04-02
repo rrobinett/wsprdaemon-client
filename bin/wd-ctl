@@ -392,9 +392,17 @@ WantedBy=local-fs.target
                    capture_output=True)
     print('  Spool janitor: wd-spool-clean.timer enabled')
 
-    # --- Manage radiod ---
-    if config.ka9q_conf_name:
-        _manage_radiod(config.ka9q_conf_name)
+    # --- Manage radiod for each local KA9Q receiver (deduplicated by radiod_name) ---
+    managed_radiods: set = set()
+    for rx in config.receivers.values():
+        if rx.receiver_type not in ('ka9q', 'ka9q_wwv'):
+            continue
+        if rx.locality != 'local' or not rx.radiod_name:
+            continue
+        if rx.radiod_name in managed_radiods:
+            continue
+        _manage_radiod(rx.radiod_name)
+        managed_radiods.add(rx.radiod_name)
 
     print('\nApply complete. Check status with: wd-ctl status')
     return 0

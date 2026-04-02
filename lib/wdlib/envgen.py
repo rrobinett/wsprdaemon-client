@@ -18,19 +18,39 @@ from wdlib import paths
 from wdlib.v3_parser import V3Config, V3Receiver
 
 
-def _read_radiod_status_dns(ka9q_conf_name: str) -> str:
-    """Extract the status= DNS name from /etc/radio/radiod@<name>.conf."""
-    conf = Path(f'/etc/radio/radiod@{ka9q_conf_name}.conf')
-    if not conf.exists():
-        return ''
-    for raw in conf.read_text().splitlines():
-        line = raw.strip()
-        if line.startswith('#'):
-            continue
-        m = re.match(r'^status\s*=\s*(\S+)', line)
-        if m:
-            return m.group(1)
-    return ''
+def _radiod_status_dns(receiver: 'V3Receiver') -> str:
+    """Return the status DNS name to use for this KA9Q receiver.
+
+    For local receivers: read the actual value from the radiod conf so
+    the recorder connects to whatever name radiod is currently advertising.
+    Falls back to the derived convention (<radiod_name>-status.local) when
+    the conf file is absent.
+
+    For remote receivers: always use the derived convention since we cannot
+    read the remote conf.
+    """
+    derived = f'{receiver.radiod_name}-status.local' if receiver.radiod_name else ''
+
+    if receiver.locality == 'local' and receiver.radiod_name:
+        conf = Path(f'/etc/radio/radiod@{receiver.radiod_name}.conf')
+        if conf.exists():
+            for raw in conf.read_text().splitlines():
+                line = raw.strip()
+                if line.startswith('#'):
+                    continue
+                m = re.match(r'^status\s*=\s*(\S+)', line)
+                if m:
+                    actual = m.group(1)
+                    if actual != derived and derived:
+                        import sys
+                        print(f'  WARNING: radiod@{receiver.radiod_name}: '
+                              f'status={actual!r} but convention would be '
+                              f'{derived!r} — update the conf to match',
+                              file=sys.stderr)
+                    return actual
+        return derived
+
+    return derived
 
 # WSPR band center frequencies in Hz (for wsprd and jt9)
 BAND_FREQ_HZ = {
@@ -68,17 +88,19 @@ def _env_header() -> str:
 
 def generate_ka9q_record_env(receiver: V3Receiver,
                               bands: Set[str],
-                              band_modes: Dict[str, set],
-                              radiod_status_dns: str = '') -> str:
+                              band_modes: Dict[str, set]) -> str:
     """Generate env file for a KA9Q recording service.
 
     KA9Q recorders are 1-to-N: one process uses ka9q-python to dynamically
     create channels on radiod and write wav files for all component bands.
     """
+    status_dns = _radiod_status_dns(receiver)
     lines = [_env_header()]
     lines.append(f'WD_RECEIVER_NAME={receiver.name}')
     lines.append(f'WD_RECEIVER_TYPE={receiver.receiver_type}')
-    lines.append(f'WD_RADIOD_STATUS={radiod_status_dns}')
+    lines.append(f'WD_KA9Q_LOCALITY={receiver.locality}')
+    lines.append(f'WD_KA9Q_RADIOD_NAME={receiver.radiod_name}')
+    lines.append(f'WD_RADIOD_STATUS={status_dns}')
     lines.append(f'WD_RECEIVER_CALL={receiver.call}')
     lines.append(f'WD_RECEIVER_GRID={receiver.grid}')
     lines.append(f'WD_RECORDING_DIR={paths.receiver_recording_dir(receiver.name)}')
@@ -197,9 +219,6 @@ def generate_all_env_files(config: V3Config, output_dir: Path) -> List[str]:
                 new_set = set(modes.split(':')) - {''}
                 rx_band_modes[src_name][band] = ':'.join(sorted(existing_set | new_set))
 
-    # Read the radiod status DNS once from the site radiod config
-    radiod_status_dns = _read_radiod_status_dns(config.ka9q_conf_name) if config.ka9q_conf_name else ''
-
     for rx_name, band_map in rx_band_modes.items():
         rx = config.receivers.get(rx_name)
         if not rx:
@@ -209,7 +228,7 @@ def generate_all_env_files(config: V3Config, output_dir: Path) -> List[str]:
             # KA9Q recorder — one env file per receiver
             env_path = output_dir / f'wd-ka9q-record@{rx_name}.env'
             env_path.write_text(generate_ka9q_record_env(
-                rx, set(band_map.keys()), config.band_modes, radiod_status_dns
+                rx, set(band_map.keys()), config.band_modes
             ))
             written.append(str(env_path))
 
@@ -228,7 +247,7 @@ def generate_all_env_files(config: V3Config, output_dir: Path) -> List[str]:
             # WWV/CHU IQ recording — one env per receiver
             env_path = output_dir / f'wd-ka9q-record@{rx_name}.env'
             env_path.write_text(generate_ka9q_record_env(
-                rx, set(band_map.keys()), config.band_modes, radiod_status_dns
+                rx, set(band_map.keys()), config.band_modes
             ))
             written.append(str(env_path))
 

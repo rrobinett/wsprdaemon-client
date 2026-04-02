@@ -70,6 +70,15 @@ def v3_to_ini(config: V3Config) -> str:
 
         out.append(f'[receiver:{rx_name}]')
         out.append(f'type = {rx.receiver_type}')
+        if rx.receiver_type in ('ka9q', 'ka9q_wwv'):
+            locality = rx.locality or 'local'
+            out.append(f'locality = {locality}')
+            if rx.radiod_name:
+                out.append(f'radiod_name = {rx.radiod_name}')
+                out.append(f'; status DNS: {rx.radiod_name}-status.local')
+            else:
+                out.append(f'; radiod_name = TODO  ; e.g. site-rx888')
+                out.append(f'; status DNS will be: <radiod_name>-status.local')
         out.append(f'address = {rx.address}')
         out.append(f'call = {rx.call}')
         out.append(f'grid = {rx.grid}')
