@@ -8,8 +8,8 @@
 Description=wsprdaemon spool janitor timer
 
 [Timer]
-OnBootSec=3min
-OnUnitActiveSec=2min
+OnBootSec=5min
+OnUnitActiveSec=5min
 RandomizedDelaySec=15
 
 [Install]

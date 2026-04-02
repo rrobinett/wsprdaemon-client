@@ -143,7 +143,7 @@ def cmd_apply(args):
 
     # --- Install wrapper scripts ---
     sbin = Path('/usr/local/sbin')
-    wrappers = ['wd-ka9q-record', 'wd-kiwi-record', 'wd-decode', 'wd-post']
+    wrappers = ['wd-ka9q-record', 'wd-kiwi-record', 'wd-kiwi-cleanup', 'wd-decode', 'wd-post']
     for name in wrappers:
         src = _SCRIPT_DIR / name
         if src.exists():
@@ -169,29 +169,36 @@ def cmd_apply(args):
     # --- Calculate tmpfs size from env files ---
     # WSPR (12 kHz mono float32):  12000*60*4 = 2,880,000 bytes ≈ 3 MB/file
     # IQ   (24 kHz stereo float32): 24000*60*2*4 = 11,520,000 bytes ≈ 12 MB/file
-    WSPR_MB_PER_FILE = 3    # 12000 Hz mono float32: 2,880,044 bytes ≈ 3 MB
-    IQ_MB_PER_FILE   = 12   # 24000 Hz stereo float32: 11,520,044 bytes ≈ 12 MB
-    # Size for wd-spool-clean.timer janitor age (5 min) + 2 min buffer.
-    # When wd-decode is running it will consume files within 1-2 minutes
-    # and this size becomes generous headroom.
-    KEEP_MINUTES     = 7
+    # File sizes (bytes → MB, ceiling):
+    #   KA9Q WSPR  _usr.wav: 12000 Hz mono float32 60s  = 2,880,044 bytes ≈ 3 MB
+    #   KA9Q IQ    _IQ.wav:  24000 Hz stereo float32 60s = 11,520,044 bytes ≈ 12 MB
+    #   Kiwi WSPR  _usb.wav: 12000 Hz mono int16 60s    = 1,440,044 bytes ≈ 2 MB
+    WSPR_MB  = 3
+    IQ_MB    = 12
+    KIWI_MB  = 2
+    # Retention: IQ files use I1 (1-min) mode — only need 3 min.
+    #            WSPR files need up to 32 min to support F30 (FST4W-1800).
+    IQ_KEEP   = 3
+    WSPR_KEEP = 32
 
-    wspr_bands = iq_bands = 0
+    wspr_bands = iq_bands = kiwi_bands = 0
     for fp in written:
         fname = Path(fp).name
-        if 'wd-ka9q-record@' not in fname:
-            continue
         lines = Path(fp).read_text().splitlines()
         bands_val = next((l.split('=', 1)[1] for l in lines if l.startswith('WD_BANDS=')), '')
         type_val  = next((l.split('=', 1)[1] for l in lines if l.startswith('WD_RECEIVER_TYPE=')), '')
-        n = len(bands_val.split()) if bands_val.strip() else 0
-        if 'wwv' in type_val.lower():
-            iq_bands += n
-        else:
-            wspr_bands += n
+        n = len(bands_val.split()) if bands_val.strip() else 1
+        if 'wd-ka9q-record@' in fname:
+            if 'wwv' in type_val.lower():
+                iq_bands += n
+            else:
+                wspr_bands += n
+        elif 'wd-kiwi-record@' in fname:
+            kiwi_bands += 1
 
-    raw_mb    = (wspr_bands * WSPR_MB_PER_FILE + iq_bands * IQ_MB_PER_FILE) * KEEP_MINUTES
-    tmpfs_mb  = max(256, int(raw_mb * 1.5) + 64)   # 50% headroom + 64 MB base
+    raw_mb   = (wspr_bands * WSPR_MB + kiwi_bands * KIWI_MB) * WSPR_KEEP \
+             + iq_bands * IQ_MB * IQ_KEEP
+    tmpfs_mb = max(512, int(raw_mb * 1.25) + 64)
     print(f'  tmpfs size: {tmpfs_mb} MB  ({wspr_bands} WSPR bands, {iq_bands} IQ bands)')
 
     # --- Generate and install the systemd mount unit ---
@@ -235,7 +242,7 @@ WantedBy=local-fs.target
     spool = Path('/var/spool/wsprdaemon/recording')
     spool.mkdir(parents=True, exist_ok=True)
     for rx_name, rx in config.receivers.items():
-        if rx.receiver_type in ('ka9q', 'ka9q_wwv'):
+        if rx.receiver_type in ('ka9q', 'ka9q_wwv', 'kiwi'):
             rx_dir = spool / rx_name
             rx_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -243,7 +250,7 @@ WantedBy=local-fs.target
             except Exception:
                 pass
 
-    # --- Start ka9q-record services ---
+    # --- Start/restart ka9q-record services ---
     ka9q_instances = [
         Path(f).stem.split('@')[1]
         for f in written
@@ -251,6 +258,23 @@ WantedBy=local-fs.target
     ]
     for instance in sorted(ka9q_instances):
         svc = f'wd-ka9q-record@{instance}.service'
+        result = subprocess.run(
+            ['systemctl', 'enable', '--now', svc],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f'  Started: {svc}')
+        else:
+            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+
+    # --- Start kiwi-record services ---
+    kiwi_instances = [
+        Path(f).stem.split('@')[1]
+        for f in written
+        if 'wd-kiwi-record@' in Path(f).name
+    ]
+    for instance in sorted(kiwi_instances):
+        svc = f'wd-kiwi-record@{instance}.service'
         result = subprocess.run(
             ['systemctl', 'enable', '--now', svc],
             capture_output=True, text=True
