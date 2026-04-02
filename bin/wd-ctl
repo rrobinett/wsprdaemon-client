@@ -12,6 +12,7 @@ Subcommands:
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -83,6 +84,82 @@ def cmd_migrate_config(args):
     print(f'\nMigration complete. Review {ini_path} and the env files.')
     print('Then run: wd-ctl apply')
     return 0
+
+
+def _parse_cpu_list(s: str) -> tuple:
+    """Parse a Linux CPU list string ('0-1', '0,8', '0-1,8-9') into a sorted tuple."""
+    cpus = []
+    for part in s.split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            cpus.extend(range(int(lo), int(hi) + 1))
+        elif part:
+            cpus.append(int(part))
+    return tuple(sorted(cpus))
+
+
+def _get_ht_pairs() -> list:
+    """Return sorted list of hyperthreading sibling groups from the OS.
+
+    Each element is a tuple of CPU IDs that share a physical core.
+    On non-HT systems each tuple has one element.
+    Sorted by lowest CPU ID in the group.
+    """
+    import glob as _glob
+    seen: set = set()
+    pairs: list = []
+    cpu_dirs = sorted(
+        _glob.glob('/sys/devices/system/cpu/cpu[0-9]*'),
+        key=lambda p: int(re.sub(r'.*cpu', '', p))
+    )
+    for d in cpu_dirs:
+        try:
+            raw = Path(f'{d}/topology/thread_siblings_list').read_text().strip()
+            group = _parse_cpu_list(raw)
+        except (OSError, ValueError):
+            cpu_id = int(re.sub(r'.*cpu', '', d))
+            group = (cpu_id,)
+        key = frozenset(group)
+        if key not in seen:
+            seen.add(key)
+            pairs.append(group)
+    return sorted(pairs, key=lambda g: g[0])
+
+
+def _get_radiod_cpu_assignments() -> dict:
+    """Return {radiod_name: frozenset(cpus)} from all existing cpu-affinity.conf drop-ins."""
+    import glob as _glob
+    result = {}
+    for path in _glob.glob('/etc/systemd/system/radiod@*.service.d/cpu-affinity.conf'):
+        m = re.search(r'radiod@(.+)\.service\.d', path)
+        if not m:
+            continue
+        name = m.group(1)
+        try:
+            content = Path(path).read_text()
+            ma = re.search(r'^CPUAffinity\s*=\s*(.+)$', content, re.MULTILINE)
+            if ma:
+                result[name] = frozenset(int(c) for c in ma.group(1).split())
+        except (OSError, ValueError):
+            pass
+    return result
+
+
+def _apply_radiod_cpu_affinity(radiod_name: str, cpus: tuple) -> None:
+    """Write (or update) the cpu-affinity.conf drop-in for radiod@<radiod_name>."""
+    drop_in_dir = Path(f'/etc/systemd/system/radiod@{radiod_name}.service.d')
+    drop_in_dir.mkdir(parents=True, exist_ok=True)
+    conf_path = drop_in_dir / 'cpu-affinity.conf'
+    cpu_str = ' '.join(str(c) for c in cpus)
+    lines = ['[Service]', f'CPUAffinity={cpu_str}']
+    # Only add pin script line if it exists on this host
+    pin_script = Path('/usr/local/bin/pin-radiod-threads.sh')
+    if pin_script.exists():
+        pin_args = ' '.join(str(c) for c in cpus)
+        lines.append(f'ExecStartPost={pin_script} $MAINPID {pin_args}')
+    conf_path.write_text('\n'.join(lines) + '\n')
+    print(f'  radiod@{radiod_name}: CPUAffinity={cpu_str}')
 
 
 def _manage_radiod(conf_name: str) -> None:
@@ -392,17 +469,57 @@ WantedBy=local-fs.target
                    capture_output=True)
     print('  Spool janitor: wd-spool-clean.timer enabled')
 
-    # --- Manage radiod for each local KA9Q receiver (deduplicated by radiod_name) ---
-    managed_radiods: set = set()
-    for rx in config.receivers.values():
+    # --- Collect ordered list of local radiod names (stable sort by name) ---
+    local_radiods: list = []
+    _seen_radiods: set = set()
+    for rx in sorted(config.receivers.values(), key=lambda r: r.name):
         if rx.receiver_type not in ('ka9q', 'ka9q_wwv'):
             continue
         if rx.locality != 'local' or not rx.radiod_name:
             continue
-        if rx.radiod_name in managed_radiods:
+        if rx.radiod_name not in _seen_radiods:
+            local_radiods.append(rx.radiod_name)
+            _seen_radiods.add(rx.radiod_name)
+
+    # --- Manage radiod service for each local radiod ---
+    for radiod_name in local_radiods:
+        _manage_radiod(radiod_name)
+
+    # --- Assign CPU affinity to local radiod instances ---
+    # Skip HT pairs already used by manually-managed (non-local) radiod instances.
+    # This ensures wd-ctl-managed radiods don't conflict with user-managed ones.
+    print('\n--- CPU affinity ---')
+    ht_pairs = _get_ht_pairs()
+    all_assignments = _get_radiod_cpu_assignments()
+    local_radiod_set = set(local_radiods)
+    print(f'  HT pairs: {[list(p) for p in ht_pairs]}')
+
+    affinity_changed = False
+    for i, radiod_name in enumerate(local_radiods):
+        if i >= len(ht_pairs):
+            print(f'  WARNING: no CPU pair for radiod@{radiod_name} '
+                  f'(only {len(ht_pairs)} pairs on this host)', file=sys.stderr)
             continue
-        _manage_radiod(rx.radiod_name)
-        managed_radiods.add(rx.radiod_name)
+        pair = ht_pairs[i]   # local radiods own pairs 0, 1, 2 ... in name order
+        current = all_assignments.get(radiod_name)
+        if current == frozenset(pair):
+            print(f'  radiod@{radiod_name}: CPUAffinity already {list(pair)} — no change')
+        else:
+            _apply_radiod_cpu_affinity(radiod_name, pair)
+            affinity_changed = True
+
+    if not local_radiods:
+        print('  No local radiod instances configured')
+
+    if affinity_changed:
+        subprocess.run(['systemctl', 'daemon-reload'], check=True)
+        for radiod_name in local_radiods:
+            result = subprocess.run(
+                ['systemctl', 'restart', f'radiod@{radiod_name}.service'],
+                capture_output=True, text=True
+            )
+            status = 'restarted' if result.returncode == 0 else f'restart failed: {result.stderr.strip()}'
+            print(f'  radiod@{radiod_name}: {status}')
 
     print('\nApply complete. Check status with: wd-ctl status')
     return 0
