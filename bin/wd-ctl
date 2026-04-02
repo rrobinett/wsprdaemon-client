@@ -143,7 +143,8 @@ def cmd_apply(args):
 
     # --- Install wrapper scripts ---
     sbin = Path('/usr/local/sbin')
-    wrappers = ['wd-ka9q-record', 'wd-kiwi-record', 'wd-kiwi-cleanup', 'wd-decode', 'wd-post']
+    wrappers = ['wd-ka9q-record', 'wd-kiwi-record', 'wd-kiwi-cleanup',
+                'wd-spool-clean', 'wd-decode', 'wd-post']
     for name in wrappers:
         src = _SCRIPT_DIR / name
         if src.exists():
@@ -385,6 +386,104 @@ def cmd_verbosity(args):
     return 0
 
 
+def cmd_install_deps(args):
+    """Install or verify external dependencies declared in deps.conf."""
+    import configparser
+    import subprocess
+
+    deps_file = _SCRIPT_DIR.parent / 'deps.conf'
+    if not deps_file.exists():
+        print(f'Error: deps.conf not found at {deps_file}', file=sys.stderr)
+        return 1
+
+    cfg = configparser.ConfigParser()
+    cfg.read(deps_file)
+    errors = 0
+
+    for dep in cfg.sections():
+        dep_type   = cfg[dep].get('type', '').strip()
+        url        = cfg[dep].get('url', '').strip()
+        commit     = cfg[dep].get('commit', '').strip()
+        install_to = cfg[dep].get('install_to', '').strip()
+
+        print(f'\n[{dep}]  type={dep_type}  version={commit}')
+
+        if dep_type == 'git':
+            target = Path(install_to)
+            if target.exists():
+                current = subprocess.run(
+                    ['git', '-c', f'safe.directory={target}',
+                     '-C', str(target), 'rev-parse', 'HEAD'],
+                    capture_output=True, text=True
+                ).stdout.strip()
+                if current.startswith(commit[:8]):
+                    print(f'  OK — {target} at {current[:12]}')
+                else:
+                    print(f'  MISMATCH — have {current[:12]}, want {commit[:12]}')
+                    print(f'  Run: git -C {target} fetch && git -C {target} checkout {commit}')
+                    errors += 1
+            else:
+                print(f'  Cloning {url} → {target}')
+                result = subprocess.run(
+                    ['git', 'clone', url, str(target)],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f'  ERROR: {result.stderr.strip()}', file=sys.stderr)
+                    errors += 1
+                    continue
+                result = subprocess.run(
+                    ['git', '-C', str(target), 'checkout', commit],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f'  ERROR checking out {commit}: {result.stderr.strip()}',
+                          file=sys.stderr)
+                    errors += 1
+                else:
+                    print(f'  Checked out {commit[:12]}')
+
+        elif dep_type == 'pypi':
+            venv_pip = Path('/opt/wsprdaemon/venv/bin/pip')
+            pip_cmd  = str(venv_pip) if venv_pip.exists() else 'pip3'
+            result = subprocess.run(
+                [pip_cmd, 'show', url],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                installed_ver = next(
+                    (l.split(':', 1)[1].strip()
+                     for l in result.stdout.splitlines()
+                     if l.startswith('Version:')),
+                    'unknown'
+                )
+                if installed_ver == commit:
+                    print(f'  OK — {url}=={installed_ver}')
+                else:
+                    print(f'  VERSION MISMATCH — have {installed_ver}, want {commit}')
+                    print(f'  Run: {pip_cmd} install "{url}=={commit}"')
+                    errors += 1
+            else:
+                print(f'  Installing {url}=={commit}')
+                result = subprocess.run(
+                    [pip_cmd, 'install', f'{url}=={commit}'],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f'  ERROR: {result.stderr.strip()}', file=sys.stderr)
+                    errors += 1
+                else:
+                    print(f'  Installed')
+        else:
+            print(f'  Unknown dep type "{dep_type}", skipping')
+
+    if errors:
+        print(f'\ninstall-deps: {errors} error(s) — see above', file=sys.stderr)
+        return 1
+    print('\ninstall-deps: all dependencies satisfied')
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='wd-ctl',
@@ -420,6 +519,10 @@ def main():
     p_verb.add_argument('direction', choices=['up', 'down'])
     p_verb.add_argument('target', help='Service name or "all"')
 
+    # install-deps
+    sub.add_parser('install-deps',
+                   help='Install or verify external dependencies from deps.conf')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -433,6 +536,7 @@ def main():
         'status': cmd_status,
         'validate': cmd_validate,
         'verbosity': cmd_verbosity,
+        'install-deps': cmd_install_deps,
     }
 
     return dispatch[args.command](args)

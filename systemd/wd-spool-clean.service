@@ -1,11 +1,11 @@
 # /etc/systemd/system/wd-spool-clean.service
-# Delete stale wav files from the recording spool.
-# Different retention by file type:
-#   *_IQ.wav  (WWV/CHU IQ) : 3 minutes  — I1 mode decodes each file independently
-#   *_usr.wav (KA9Q WSPR)  : 32 minutes — F30 needs 30 consecutive 1-min files
-#   *_usb.wav (Kiwi WSPR)  : 32 minutes — same F30 requirement
-# When wd-decode is running it consumes files well within these windows
-# and this janitor is a safety net only.
+# Smart per-band spool janitor.
+# Retention per directory is derived from WD_RECEIVER_MODES in each band's
+# env file: max(mode_window) + 2 min.  Typical values:
+#   I1-only dirs (WWV/CHU IQ) →  3 min
+#   W2/F2/F5    dirs          →  7 min
+#   F15         dirs          → 17 min
+#   F30         dirs          → 32 min
 # Run by wd-spool-clean.timer every 5 minutes.
 
 [Unit]
@@ -16,7 +16,4 @@ ConditionPathIsMountPoint=/var/spool/wsprdaemon
 [Service]
 Type=oneshot
 User=wsprdaemon
-ExecStart=/bin/bash -c '\
-    find /var/spool/wsprdaemon/recording -name "*_IQ.wav"  -not -empty -mmin +3  -delete ; \
-    find /var/spool/wsprdaemon/recording -name "*_usr.wav" -not -empty -mmin +32 -delete ; \
-    find /var/spool/wsprdaemon/recording -name "*_usb.wav" -not -empty -mmin +32 -delete'
+ExecStart=/usr/local/sbin/wd-spool-clean

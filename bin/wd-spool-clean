@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# /usr/local/sbin/wd-spool-clean
+# Smart per-band spool janitor.
+#
+# Reads WD_RECORDING_DIR and WD_RECEIVER_MODES from every env file under
+# /etc/wsprdaemon/env/ and computes the minimum safe retention window for
+# each recording directory:
+#
+#   retention = max(mode_window_minutes) + BUFFER_MINUTES
+#
+# Mode decode windows:
+#   I1  → 1 min  (WWV/CHU IQ — one file per decode)
+#   W2  → 2 min  (wsprd 2-min WSPR)
+#   F2  → 2 min  (jt9 FST4W 2-min)
+#   F5  → 5 min
+#   F15 → 15 min
+#   F30 → 30 min
+#
+# Run by wd-spool-clean.timer every 5 minutes.
+
+import glob
+import os
+import sys
+import time
+
+ENV_DIR        = '/etc/wsprdaemon/env'
+BUFFER_MINUTES = 2   # extra margin above the longest decode window
+
+MODE_WINDOW = {
+    'I1':  1,
+    'W2':  2,
+    'F2':  2,
+    'F5':  5,
+    'F15': 15,
+    'F30': 30,
+}
+
+
+def retention_for_modes(modes_str: str) -> int:
+    """Return retention in minutes for a colon-separated mode list e.g. 'F2:F5:W2'."""
+    modes   = [m.strip() for m in modes_str.split(':') if m.strip()]
+    windows = [MODE_WINDOW.get(m, 2) for m in modes]
+    return max(windows, default=2) + BUFFER_MINUTES
+
+
+def parse_env(path: str) -> dict:
+    env = {}
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            k, _, v = line.partition('=')
+            env[k.strip()] = v.strip()
+    return env
+
+
+def collect_retentions() -> dict:
+    """Return {recording_dir: retention_minutes} across all band env files."""
+    retentions: dict[str, int] = {}
+    for env_file in sorted(glob.glob(os.path.join(ENV_DIR, 'wd-*.env'))):
+        env      = parse_env(env_file)
+        rec_dir  = env.get('WD_RECORDING_DIR', '')
+        modes    = env.get('WD_RECEIVER_MODES', '')
+        if not rec_dir or not modes:
+            continue
+        minutes  = retention_for_modes(modes)
+        # If two env files map to the same directory, keep the longer window.
+        if minutes > retentions.get(rec_dir, 0):
+            retentions[rec_dir] = minutes
+    return retentions
+
+
+def purge_directory(directory: str, max_age_minutes: int) -> int:
+    if not os.path.isdir(directory):
+        return 0
+    cutoff  = time.time() - max_age_minutes * 60
+    deleted = 0
+    for fname in os.listdir(directory):
+        if not fname.endswith('.wav'):
+            continue
+        fpath = os.path.join(directory, fname)
+        try:
+            st = os.stat(fpath)
+        except OSError:
+            continue
+        if st.st_size == 0:
+            continue   # still being written or already flagged elsewhere
+        if st.st_mtime < cutoff:
+            try:
+                os.unlink(fpath)
+                deleted += 1
+            except OSError as exc:
+                print(f'wd-spool-clean: cannot delete {fpath}: {exc}',
+                      file=sys.stderr)
+    return deleted
+
+
+def main() -> None:
+    retentions = collect_retentions()
+    if not retentions:
+        print('wd-spool-clean: no band env files found, nothing to do')
+        return
+
+    total = 0
+    for rec_dir, minutes in sorted(retentions.items()):
+        n = purge_directory(rec_dir, minutes)
+        if n:
+            print(f'wd-spool-clean: {rec_dir}: removed {n} file(s) older than {minutes} min')
+        total += n
+
+    if total == 0:
+        print('wd-spool-clean: nothing to purge')
+
+
+if __name__ == '__main__':
+    main()
