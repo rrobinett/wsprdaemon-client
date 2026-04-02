@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """wd-ka9q-record — KA9Q recording daemon for wsprdaemon v4.
 
-Uses ka9q-python (RadiodControl + ManagedStream) to dynamically create
-WSPR/FST4W channels on radiod and write 1-minute wav files into the spool
-directory.  Channels are created at startup and removed on SIGTERM.
+Uses ka9q-python RadiodControl to dynamically create WSPR/FST4W channels
+on radiod, then receives RTP multicast using a single select() loop —
+one receive thread for ALL bands.  No per-band threads, no numpy in the
+hot path.
+
+Thread count: 3 (main + receive + health-monitor) regardless of band count.
+Hot path per packet: 12-byte header strip + bytearray.extend(payload).
 
 Environment variables (set by systemd EnvironmentFile):
     WD_RADIOD_STATUS    Radiod status/control DNS  (e.g. k3lr-hf.local)
@@ -23,20 +27,22 @@ files longer are truncated.  The timestamp in the filename is the UTC
 second at which the minute window began.
 """
 
-import math
 import os
+import select as _select
 import signal
+import socket
 import struct
 import sys
 import threading
 import time
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-import numpy as np
-from ka9q import RadiodControl, ManagedStream
+from ka9q import RadiodControl
+from ka9q.discovery import ChannelInfo
 
 # wdlib is in /opt/wsprdaemon/lib (installed) or relative to this script
 _HERE = Path(__file__).resolve().parent
@@ -70,117 +76,191 @@ else:
     GAIN         = GAIN_DB
     FILE_SUFFIX  = '_usr'
 
-WINDOW_SEC      = 60
-# Exact float32 values expected in every completed minute file
-EXPECTED_FLOATS = SAMPLE_RATE * WINDOW_SEC * CHANNELS
+WINDOW_SEC     = 60
+EXPECTED_BYTES = SAMPLE_RATE * WINDOW_SEC * CHANNELS * 4  # float32 = 4 bytes
+DROP_TIMEOUT   = 10.0   # seconds without packets before channel recreation
 
 
-# ── IEEE_FLOAT WAV writer ────────────────────────────────────────────────────
-def write_ieee_float_wav(path: Path, data: np.ndarray,
-                         sample_rate: int, channels: int) -> None:
-    """Write a IEEE_FLOAT (AudioFormat=3) wav file.
-
-    Python's wave module only supports PCM (AudioFormat=1).
-    wsprd/sox expect AudioFormat=3 to correctly interpret float32 samples.
-    """
-    samples = data.astype(np.float32)
-    raw = samples.tobytes()          # little-endian float32
+# ── WAV writer ────────────────────────────────────────────────────────────────
+def _write_wav(path: Path, raw: bytes, sample_rate: int, channels: int) -> None:
+    """Write an IEEE_FLOAT (AudioFormat=3) wav file from raw float32 bytes."""
     data_size = len(raw)
-
     with open(str(path), 'wb') as f:
-        # RIFF header
         f.write(b'RIFF')
         f.write(struct.pack('<I', 36 + data_size))
         f.write(b'WAVE')
-        # fmt chunk
         f.write(b'fmt ')
-        f.write(struct.pack('<I', 16))                          # chunk size
-        f.write(struct.pack('<H', 3))                           # IEEE_FLOAT
+        f.write(struct.pack('<I', 16))
+        f.write(struct.pack('<H', 3))                            # IEEE_FLOAT
         f.write(struct.pack('<H', channels))
         f.write(struct.pack('<I', sample_rate))
-        f.write(struct.pack('<I', sample_rate * channels * 4))  # ByteRate
-        f.write(struct.pack('<H', channels * 4))                # BlockAlign
-        f.write(struct.pack('<H', 32))                          # BitsPerSample
-        # data chunk
+        f.write(struct.pack('<I', sample_rate * channels * 4))   # ByteRate
+        f.write(struct.pack('<H', channels * 4))                 # BlockAlign
+        f.write(struct.pack('<H', 32))                           # BitsPerSample
         f.write(b'data')
         f.write(struct.pack('<I', data_size))
         f.write(raw)
 
 
-# ── Per-band wav writer ──────────────────────────────────────────────────────
-class BandWriter:
-    """Accumulates samples for one band and flushes 1-minute wav files."""
+# ── Per-band state ────────────────────────────────────────────────────────────
+@dataclass
+class BandState:
+    band:        str
+    freq_hz:     int
+    channel:     ChannelInfo
+    sock:        socket.socket
+    out_dir:     Path
+    buf:         bytearray = field(default_factory=bytearray)
+    win_start:   Optional[float] = None   # Unix time of current window start
+    last_pkt_t:  float = 0.0              # for health monitoring
 
-    def __init__(self, band: str, freq_hz: int, out_dir: Path, file_suffix: str):
-        self.band        = band
-        self.freq_hz     = freq_hz
-        self.out_dir     = out_dir
-        self.file_suffix = file_suffix
-        self.out_dir.mkdir(parents=True, exist_ok=True)
 
-        self._lock     = threading.Lock()
-        self._chunks: List[np.ndarray] = []
-        self._win_start: Optional[float] = None
+def _open_socket(channel: ChannelInfo) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, 'SO_REUSEPORT'):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+    sock.bind(('0.0.0.0', channel.port))
+    mreq = struct.pack('=4s4s',
+                       socket.inet_aton(channel.multicast_address),
+                       socket.inet_aton('0.0.0.0'))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    sock.setblocking(False)
+    return sock
 
-    def on_samples(self, samples, quality) -> None:
-        """ManagedStream callback — ~267 ms cadence (10 packets × 320 samples)."""
+
+def _flush(bs: BandState, start_utc: float) -> None:
+    """Write one minute wav file for the given band."""
+    raw = bytes(bs.buf)
+    bs.buf = bytearray()
+
+    if not raw:
+        return
+
+    # Enforce exact byte count — zero-pad front if short, truncate if long
+    if len(raw) < EXPECTED_BYTES:
+        deficit = EXPECTED_BYTES - len(raw)
+        log.warning('[%s] short window: %d/%d bytes, zero-padding front',
+                    bs.band, len(raw), EXPECTED_BYTES)
+        raw = bytes(deficit) + raw
+    elif len(raw) > EXPECTED_BYTES:
+        log.warning('[%s] long window: %d/%d bytes, truncating',
+                    bs.band, len(raw), EXPECTED_BYTES)
+        raw = raw[:EXPECTED_BYTES]
+
+    dt   = datetime.fromtimestamp(start_utc, tz=timezone.utc)
+    name = dt.strftime(f'%Y%m%d_%H%M%S_{bs.freq_hz}{FILE_SUFFIX}.wav')
+    path = bs.out_dir / name
+    _write_wav(path, raw, SAMPLE_RATE, CHANNELS)
+    log.info('[%s] wrote %s (%d samples / 60 s)',
+             bs.band, name, len(raw) // (CHANNELS * 4))
+
+
+# ── Receive loop (single thread, all bands) ───────────────────────────────────
+def _receive_loop(states: List[BandState], states_lock: threading.Lock,
+                  running: threading.Event) -> None:
+    """Single select() loop demuxing all band sockets."""
+
+    while running.is_set():
+        with states_lock:
+            sock_to_state: Dict[socket.socket, BandState] = {
+                bs.sock: bs for bs in states
+            }
+
+        if not sock_to_state:
+            time.sleep(0.1)
+            continue
+
+        try:
+            readable, _, _ = _select.select(list(sock_to_state.keys()), [], [], 1.0)
+        except (ValueError, OSError):
+            # A socket was closed (during health restore); rebuild next iteration
+            continue
+
         now = time.time()
-        win = math.floor(now / WINDOW_SEC) * WINDOW_SEC
+        win = (int(now) // WINDOW_SEC) * WINDOW_SEC
 
-        # Convert to float32 numpy array, handling both real and complex IQ
-        if np.iscomplexobj(samples):
-            # IQ: interleave real (I) and imaginary (Q) → stereo float32
-            flat = np.empty(len(samples) * 2, dtype=np.float32)
-            flat[0::2] = samples.real.astype(np.float32)
-            flat[1::2] = samples.imag.astype(np.float32)
-            chunk = flat
-        else:
-            chunk = samples.astype(np.float32)
+        for sock in readable:
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                continue
 
-        with self._lock:
-            if self._win_start is None:
-                self._win_start = win + WINDOW_SEC   # align to next full minute
-                return
+            if len(data) < 12:
+                continue
+            version = (data[0] >> 6) & 0x03
+            if version != 2:
+                continue
+            csrc_count = data[0] & 0x0F
+            hdr_len    = 12 + csrc_count * 4
+            payload    = data[hdr_len:]
+            if not payload:
+                continue
 
-            if now < self._win_start:
-                return   # pre-window, discard
+            bs = sock_to_state.get(sock)
+            if bs is None:
+                continue
 
-            if win > self._win_start:
-                self._flush(self._win_start)
-                self._win_start = win
+            bs.last_pkt_t = now
 
-            self._chunks.append(chunk)
+            # Minute-window management
+            if bs.win_start is None:
+                bs.win_start = win + WINDOW_SEC  # align to next full minute
+                continue
 
-    def _flush(self, start_utc: float) -> None:
-        if not self._chunks:
-            return
-        data = np.concatenate(self._chunks)
-        self._chunks = []
+            if now < bs.win_start:
+                continue  # pre-window, discard
 
-        # Enforce exact sample count — pad front with zeros if short (startup
-        # jitter), truncate if long (rare clock slip).
-        if len(data) < EXPECTED_FLOATS:
-            deficit = EXPECTED_FLOATS - len(data)
-            log.warning('[%s] short window: %d/%d floats, zero-padding front',
-                        self.band, len(data), EXPECTED_FLOATS)
-            data = np.concatenate([np.zeros(deficit, dtype=np.float32), data])
-        elif len(data) > EXPECTED_FLOATS:
-            log.warning('[%s] long window: %d/%d floats, truncating',
-                        self.band, len(data), EXPECTED_FLOATS)
-            data = data[:EXPECTED_FLOATS]
+            if win > bs.win_start:
+                _flush(bs, bs.win_start)
+                bs.win_start = win
 
-        dt   = datetime.fromtimestamp(start_utc, tz=timezone.utc)
-        name = dt.strftime(f'%Y%m%d_%H%M%S_{self.freq_hz}{self.file_suffix}.wav')
-        path = self.out_dir / name
+            bs.buf.extend(payload)
 
-        write_ieee_float_wav(path, data, SAMPLE_RATE, CHANNELS)
-        log.info('[%s] wrote %s (%d samples / %.1f s)',
-                 self.band, name, len(data) // CHANNELS, len(data) / CHANNELS / SAMPLE_RATE)
 
-    def flush_final(self) -> None:
-        with self._lock:
-            if self._win_start is not None:
-                self._flush(self._win_start)
+# ── Health monitor (one thread, all bands) ────────────────────────────────────
+def _health_monitor(states: List[BandState], states_lock: threading.Lock,
+                    control: RadiodControl, running: threading.Event) -> None:
+    """Recreate stale channels when no packets arrive for DROP_TIMEOUT seconds."""
+    while running.is_set():
+        time.sleep(2.0)
+        now = time.time()
+
+        with states_lock:
+            for bs in states:
+                if bs.last_pkt_t == 0.0:
+                    continue  # never received — give startup time
+                if now - bs.last_pkt_t < DROP_TIMEOUT:
+                    continue
+
+                log.warning('[%s] no packets for %.0fs — recreating channel',
+                            bs.band, now - bs.last_pkt_t)
+                try:
+                    # Close old socket
+                    try:
+                        bs.sock.close()
+                    except OSError:
+                        pass
+
+                    # Ask radiod to (re)create the channel
+                    channel = control.ensure_channel(
+                        frequency_hz=bs.freq_hz,
+                        preset=PRESET,
+                        sample_rate=SAMPLE_RATE,
+                        agc_enable=0,
+                        gain=GAIN,
+                    )
+                    bs.channel   = channel
+                    bs.sock      = _open_socket(channel)
+                    bs.last_pkt_t = now  # reset timer
+                    log.info('[%s] channel restored at %s:%d',
+                             bs.band, channel.multicast_address, channel.port)
+                except Exception as exc:
+                    log.error('[%s] channel restore failed: %s', bs.band, exc)
+                    bs.last_pkt_t = now  # avoid hammering
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -195,54 +275,83 @@ def main() -> int:
 
     RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 
-    streams: List[ManagedStream] = []
-    writers: List[BandWriter]    = []
-    stop_event = threading.Event()
+    running     = threading.Event()
+    states_lock = threading.Lock()
+    states: List[BandState] = []
 
     def _stop(sig, _frame):
         log.info('received signal %d, shutting down', sig)
-        stop_event.set()
+        running.clear()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT,  _stop)
 
+    running.set()
+
     with RadiodControl(RADIOD_STATUS) as control:
+        # Create channels and open sockets for all bands
         for band in BANDS:
             freq_hz = BAND_FREQ_HZ.get(band)
             if freq_hz is None:
                 log.warning('unknown band %r — skipping', band)
                 continue
 
-            writer = BandWriter(band, freq_hz, RECORDING_DIR / band, FILE_SUFFIX)
-            writers.append(writer)
+            try:
+                channel = control.ensure_channel(
+                    frequency_hz=freq_hz,
+                    preset=PRESET,
+                    sample_rate=SAMPLE_RATE,
+                    agc_enable=0,
+                    gain=GAIN,
+                )
+            except Exception as exc:
+                log.error('[%s] ensure_channel failed: %s — skipping', band, exc)
+                continue
 
-            stream = ManagedStream(
-                control=control,
-                frequency_hz=freq_hz,
-                preset=PRESET,
-                sample_rate=SAMPLE_RATE,
-                gain=GAIN,
-                on_samples=writer.on_samples,
-                on_stream_dropped=lambda reason, b=band:
-                    log.warning('[%s] stream dropped: %s', b, reason),
-                on_stream_restored=lambda ch, b=band:
-                    log.info('[%s] stream restored at %.4f MHz',
-                             b, ch.frequency / 1e6),
-            )
-            stream.start()
-            streams.append(stream)
-            log.info('[%s] stream started at %d Hz (preset=%s channels=%d)',
-                     band, freq_hz, PRESET, CHANNELS)
+            out_dir = RECORDING_DIR / band
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        stop_event.wait()
+            sock = _open_socket(channel)
+            bs   = BandState(band=band, freq_hz=freq_hz,
+                             channel=channel, sock=sock, out_dir=out_dir)
+            states.append(bs)
+            log.info('[%s] channel ready: %s:%d (SSRC %d)',
+                     band, channel.multicast_address, channel.port, channel.ssrc)
 
-        log.info('stopping %d stream(s)', len(streams))
-        for s in streams:
-            s.stop()
-        for w in writers:
-            w.flush_final()
+        if not states:
+            log.error('no bands configured, exiting')
+            return 1
 
-    log.info('channels removed, exiting')
+        # Start receive and health-monitor threads
+        rx_thread = threading.Thread(
+            target=_receive_loop,
+            args=(states, states_lock, running),
+            daemon=True, name='rx-loop')
+        hm_thread = threading.Thread(
+            target=_health_monitor,
+            args=(states, states_lock, control, running),
+            daemon=True, name='health-monitor')
+        rx_thread.start()
+        hm_thread.start()
+
+        # Block main thread until SIGTERM/SIGINT
+        while running.is_set():
+            time.sleep(0.5)
+
+        log.info('stopping — flushing %d band(s)', len(states))
+        rx_thread.join(timeout=3.0)
+        hm_thread.join(timeout=3.0)
+
+        with states_lock:
+            for bs in states:
+                if bs.win_start is not None and bs.buf:
+                    _flush(bs, bs.win_start)
+                try:
+                    bs.sock.close()
+                except OSError:
+                    pass
+
+    log.info('exiting')
     return 0
 
 
