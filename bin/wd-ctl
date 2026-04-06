@@ -787,7 +787,9 @@ def _apply_rac(config) -> None:
         ca_path = config.rac_tls_ca or ''
         if not ca_path:
             # Default: look for the gw2 cert we save during wd-ctl apply
-            default_ca = Path('/etc/wsprdaemon/gw2-ca.crt')
+            default_ca = Path('/etc/wsprdaemon/gw-ca-bundle.crt')
+            if not default_ca.exists():
+                default_ca = Path('/etc/wsprdaemon/gw2-ca.crt')
             if default_ca.exists():
                 ca_path = str(default_ca)
         if ca_path:
