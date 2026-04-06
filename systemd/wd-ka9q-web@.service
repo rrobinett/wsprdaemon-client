@@ -1,0 +1,34 @@
+# /etc/systemd/system/wd-ka9q-web@.service
+# ka9q-web radiod status web UI — one instance per local radiod.
+# Connects to the radiod status multicast stream and serves a browser UI.
+#
+# Instance name = radiod config name, e.g.: wd-ka9q-web@k3lr-rx888.service
+# Env vars (from EnvironmentFile):
+#   KA9Q_WEB_STATUS  — radiod status multicast address (e.g. k3lr-rx888-status.local)
+#   KA9Q_WEB_PORT    — HTTP port to serve on (8081, 8082, ...)
+
+[Unit]
+Description=ka9q-web status UI for %i
+After=network-online.target
+Wants=network-online.target
+PartOf=wsprdaemon.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-ka9q-web@%i.env
+ExecStart=/usr/local/sbin/ka9q-web \
+    -m ${KA9Q_WEB_STATUS} \
+    -p ${KA9Q_WEB_PORT} \
+    -d /usr/local/share/ka9q-web/html
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-ka9q-web@%i
+
+[Install]
+WantedBy=wsprdaemon.target
