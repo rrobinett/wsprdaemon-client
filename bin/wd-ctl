@@ -839,9 +839,9 @@ def _apply_rac(config) -> None:
     # --- Write the failover launcher script ---
     # Uses bash /dev/tcp for TCP probing (no nc/curl dependency).
     # exec replaces the shell with frpc so systemd tracks the right PID.
-    # When frpc exits (server gone), systemd Restart=always re-runs the script,
-    # which re-probes — so the client automatically switches back to the primary
-    # once it recovers, without any timer or polling loop inside the script.
+    # When on fallback: frpc runs in background; a 60s poll loop detects when
+    # the primary returns and kills frpc so systemd restarts to the primary.
+    # When on primary: exec frpc directly so systemd tracks the correct PID.
     connector = Path('/opt/wsprdaemon/bin/wd-rac-connect')
     fallback_block = ''
     if fallback:
@@ -851,7 +851,19 @@ def _apply_rac(config) -> None:
             f'    logger -t wd-rac "primary {primary} unreachable — connecting to fallback {fallback}:{server_port}"\n'
             f'    sed "s|^serverAddr = .*|serverAddr = \\"{fallback}\\"|" \\\n'
             f'        /etc/wsprdaemon/frpc.toml > "$FALLBACK_CONF"\n'
-            f'    exec "{frpc_bin}" -c "$FALLBACK_CONF"\n'
+            f'    "{frpc_bin}" -c "$FALLBACK_CONF" &\n'
+            f'    FRPC_PID=$!\n'
+            f'    # Poll every 60s; when primary returns, kill frpc so systemd restarts to primary\n'
+            f'    while kill -0 "$FRPC_PID" 2>/dev/null; do\n'
+            f'        sleep 60\n'
+            f'        if _host_alive "{primary}" "{server_port}"; then\n'
+            f'            logger -t wd-rac "primary {primary} is back — switching back from fallback"\n'
+            f'            kill "$FRPC_PID"\n'
+            f'            wait "$FRPC_PID" 2>/dev/null\n'
+            f'            exit 0\n'
+            f'        fi\n'
+            f'    done\n'
+            f'    exit 1\n'
         )
     connector.write_text(
         f'#!/bin/bash\n'
