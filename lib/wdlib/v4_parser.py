@@ -1,7 +1,6 @@
 """Parse wsprdaemon v4 INI configuration files.
 
-Reads /etc/wsprdaemon/wsprdaemon.conf (INI format) and returns a V3Config
-so the rest of the pipeline (envgen, wd-ctl) works unchanged.
+Reads /etc/wsprdaemon/wsprdaemon.conf (INI format) and returns a WdConfig.
 
 Section shapes:
   [general]
@@ -27,52 +26,55 @@ Section shapes:
 """
 
 import configparser
-from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
-from wdlib.v3_parser import (
-    V3Config, V3Receiver, V3ScheduleEntry, V3ScheduleSlot,
+from wdlib.config import (
+    WdConfig, Receiver, ScheduleEntry, ScheduleSlot,
+    HfTimestdConfig, Ka9qWebConfig,
 )
 from wdlib.envgen import BAND_FREQ_HZ
 
 
-def parse_v4_config(config_path: str) -> V3Config:
-    """Parse a v4 INI config file and return a V3Config."""
+def parse_v4_config(config_path: str) -> WdConfig:
+    """Parse a v4 INI config file and return a WdConfig."""
     cfg = configparser.ConfigParser(
         comment_prefixes=(';', '#'),
         inline_comment_prefixes=(';', '#'),
         strict=False,
+        interpolation=None,   # prevent % in values (e.g. storage_quota) from being treated as interpolation
     )
     cfg.read(config_path)
 
-    result = V3Config()
+    result = WdConfig()
 
     # ── [general] ────────────────────────────────────────────────────────────
     if cfg.has_section('general'):
         g = cfg['general']
-        result.rac            = g.get('rac', '').strip()
-        result.ka9q_conf_name = g.get('ka9q_conf_name', '').strip()
-        result.ka9q_web_dns   = g.get('ka9q_web_dns', '').strip()
+        result.rac                 = g.get('rac', '').strip()
+        result.rac_token           = g.get('rac_token', '').strip()
+        result.rac_server          = g.get('rac_server', 'remote.wsprdaemon.org').strip()
+        result.rac_fallback_server = g.get('rac_fallback_server', '').strip()
+        result.rac_tls_ca          = g.get('rac_tls_ca', '').strip()
+        result.ka9q_conf_name      = g.get('ka9q_conf_name', '').strip()
+        result.ka9q_web_dns        = g.get('ka9q_web_dns', '').strip()
+        result.reserved_cpus       = g.get('reserved_cpus', '').strip()
 
-    # ── [receiver:NAME] and [receiver:NAME:BAND] ──────────────────────────────
-    # First pass: build receiver objects
+    # ── [receiver:NAME] ──────────────────────────────────────────────────────
     for section in cfg.sections():
         parts = section.split(':')
         if parts[0] != 'receiver' or len(parts) != 2:
             continue
         rx_name = parts[1]
         s = cfg[section]
-
-        rx = V3Receiver(
-            name      = rx_name,
-            address   = s.get('address', '').strip(),
-            call      = s.get('call', '').strip(),
-            grid      = s.get('grid', '').strip(),
-            password  = s.get('password', 'NULL').strip() or 'NULL',
-            locality  = s.get('locality', '').strip(),
+        result.receivers[rx_name] = Receiver(
+            name        = rx_name,
+            address     = s.get('address', '').strip(),
+            call        = s.get('call', '').strip(),
+            grid        = s.get('grid', '').strip(),
+            password    = s.get('password', 'NULL').strip() or 'NULL',
+            locality    = s.get('locality', '').strip(),
             radiod_name = s.get('radiod_name', '').strip(),
         )
-        result.receivers[rx_name] = rx
 
     # ── [merge:NAME] ─────────────────────────────────────────────────────────
     for section in cfg.sections():
@@ -82,18 +84,16 @@ def parse_v4_config(config_path: str) -> V3Config:
         rx_name = parts[1]
         s = cfg[section]
         sources = s.get('sources', '').split()
-        rx = V3Receiver(
+        result.receivers[rx_name] = Receiver(
             name     = rx_name,
             address  = ','.join(sources),   # merge address = CSV of source names
             call     = s.get('call', '').strip(),
             grid     = s.get('grid', '').strip(),
             password = 'NULL',
         )
-        result.receivers[rx_name] = rx
 
-    # ── [schedule:LABEL] ─────────────────────────────────────────────────────
-    # Collect per-band modes from receiver and merge band sections
-    rx_band_modes: Dict[str, Dict[str, str]] = {}   # rx → band → "W2 F2 F5"
+    # ── Band modes from receiver/merge band sections ──────────────────────────
+    rx_band_modes: Dict[str, Dict[str, str]] = {}   # rx → band → "W2:F2:F5"
 
     for section in cfg.sections():
         parts = section.split(':')
@@ -104,40 +104,57 @@ def parse_v4_config(config_path: str) -> V3Config:
             continue
         modes_raw = cfg[section].get('modes', '').strip()
         if modes_raw:
-            if rx_name not in rx_band_modes:
-                rx_band_modes[rx_name] = {}
-            # normalise: space-separated → colon-separated
-            rx_band_modes[rx_name][band] = ':'.join(modes_raw.split())
+            rx_band_modes.setdefault(rx_name, {})[band] = ':'.join(modes_raw.split())
 
+    # ── [schedule:LABEL] ─────────────────────────────────────────────────────
     for section in cfg.sections():
         parts = section.split(':')
         if parts[0] != 'schedule' or len(parts) != 2:
             continue
         s    = cfg[section]
         time = s.get('time', '00:00').strip()
-        slot = V3ScheduleSlot(time=time)
+        slot = ScheduleSlot(time=time)
 
         for key, val in s.items():
             if key == 'time':
                 continue
             rx_name = key.upper()
-            bands   = val.split()
-            for band in bands:
+            for band in val.split():
                 modes_str = rx_band_modes.get(rx_name, {}).get(band, 'W2')
-                # modes_str is already colon-separated
-                slot.entries.append(V3ScheduleEntry(
+                slot.entries.append(ScheduleEntry(
                     receiver = rx_name,
                     band     = band,
                     modes    = modes_str,
                 ))
         result.schedule_slots.append(slot)
 
-    # ── Derived mappings (mirrors parse_v3_config) ────────────────────────────
+    # ── Derived mappings ──────────────────────────────────────────────────────
     for slot in result.schedule_slots:
         for entry in slot.entries:
             result.receiver_bands.setdefault(entry.receiver, set()).add(entry.band)
             for mode in entry.modes.split(':'):
                 result.band_modes.setdefault(entry.band, set()).add(mode)
+
+    # ── [hf-timestd] ─────────────────────────────────────────────────────────
+    if cfg.has_section('hf-timestd'):
+        h = cfg['hf-timestd']
+        result.hf_timestd = HfTimestdConfig(
+            enabled          = h.getboolean('enabled', False),
+            timing_authority = h.get('timing_authority', 'rtp').strip(),
+            compression      = h.get('compression', 'zstd').strip(),
+            uploader_enabled = h.getboolean('uploader_enabled', False),
+            physics_enabled  = h.getboolean('physics_enabled', False),
+            storage_quota    = h.get('storage_quota', '70%').strip(),
+            archive_path     = h.get('archive_path', '').strip(),
+        )
+
+    # ── [ka9q-web] ───────────────────────────────────────────────────────────
+    if cfg.has_section('ka9q-web'):
+        kw = cfg['ka9q-web']
+        result.ka9q_web = Ka9qWebConfig(
+            enabled   = kw.getboolean('enabled', False),
+            base_port = kw.getint('base_port', 8081),
+        )
 
     # ── Infer locality/radiod_name for receivers that still have blanks ───────
     if result.ka9q_conf_name:
@@ -146,12 +163,12 @@ def parse_v4_config(config_path: str) -> V3Config:
             if rx.receiver_type not in ('ka9q', 'ka9q_wwv'):
                 continue
             if rx.locality and rx.radiod_name:
-                continue   # already set in INI
+                continue
             addr_prefix = rx.address.split('-')[0].lower() if rx.address else ''
             if addr_prefix == local_prefix:
-                rx.locality     = rx.locality or 'local'
-                rx.radiod_name  = rx.radiod_name or result.ka9q_conf_name
+                rx.locality    = rx.locality or 'local'
+                rx.radiod_name = rx.radiod_name or result.ka9q_conf_name
             else:
-                rx.locality     = rx.locality or 'remote'
+                rx.locality    = rx.locality or 'remote'
 
     return result

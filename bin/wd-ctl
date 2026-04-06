@@ -2,7 +2,6 @@
 """wd-ctl — wsprdaemon v4 orchestrator.
 
 Subcommands:
-    migrate-config  Convert v3 bash-array config to v4 INI + env files
     apply           Generate env files from current config and ensure services match
     teardown        Stop and disable all wsprdaemon services
     status          Show status of all wsprdaemon services
@@ -26,65 +25,8 @@ elif Path('/opt/wsprdaemon/lib').exists():
     sys.path.insert(0, '/opt/wsprdaemon/lib')
 
 from wdlib import paths
-from wdlib.v3_parser import parse_v3_config
 from wdlib.v4_parser import parse_v4_config
-from wdlib.ini_writer import v3_to_ini
 from wdlib.envgen import generate_all_env_files
-
-
-def cmd_migrate_config(args):
-    """Convert a v3 wsprdaemon.conf to v4 INI format + env files."""
-    v3_path = args.input
-    if not Path(v3_path).exists():
-        print(f'Error: v3 config not found: {v3_path}', file=sys.stderr)
-        return 1
-
-    print(f'Parsing v3 config: {v3_path}')
-    config = parse_v3_config(v3_path)
-
-    # Report what we found
-    rx_types = {}
-    for rx in config.receivers.values():
-        t = rx.receiver_type
-        rx_types[t] = rx_types.get(t, 0) + 1
-    print(f'  Receivers: {len(config.receivers)}', end='')
-    for t, n in sorted(rx_types.items()):
-        print(f'  ({n} {t})', end='')
-    print()
-    print(f'  Schedule slots: {len(config.schedule_slots)}')
-
-    total_entries = sum(len(s.entries) for s in config.schedule_slots)
-    print(f'  Schedule entries: {total_entries}')
-
-    # Generate INI config
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    ini_text = v3_to_ini(config)
-    ini_path = output_dir / 'wsprdaemon.conf'
-    ini_path.write_text(ini_text)
-    print(f'\n  INI config written: {ini_path}')
-
-    # Generate env files
-    env_dir = output_dir / 'env'
-    written = generate_all_env_files(config, env_dir)
-    print(f'  Environment files: {len(written)} files in {env_dir}/')
-
-    # List them grouped by service type
-    by_type = {}
-    for fp in sorted(written):
-        fname = Path(fp).name
-        svc_type = fname.split('@')[0] if '@' in fname else 'other'
-        by_type.setdefault(svc_type, []).append(fname)
-
-    for svc_type, files in sorted(by_type.items()):
-        print(f'\n    {svc_type}:')
-        for f in files:
-            print(f'      {f}')
-
-    print(f'\nMigration complete. Review {ini_path} and the env files.')
-    print('Then run: wd-ctl apply')
-    return 0
 
 
 def _parse_cpu_list(s: str) -> tuple:
@@ -161,6 +103,330 @@ def _apply_radiod_cpu_affinity(radiod_name: str, cpus: tuple) -> None:
         lines.append(f'ExecStartPost={pin_script} $MAINPID {pin_args}')
     conf_path.write_text('\n'.join(lines) + '\n')
     print(f'  radiod@{radiod_name}: CPUAffinity={cpu_str}')
+
+
+def _all_cpus() -> list:
+    """Return sorted list of all logical CPU IDs on this host."""
+    import glob as _glob2
+    cpus = []
+    for d in _glob2.glob('/sys/devices/system/cpu/cpu[0-9]*'):
+        try:
+            cpus.append(int(re.sub(r'.*cpu', '', d)))
+        except ValueError:
+            pass
+    return sorted(cpus)
+
+
+def _apply_worker_cpu_affinity(reserved: set) -> None:
+    """Write 99-wdctl-cpu-affinity.conf drop-ins for all wd-ctl-managed services.
+
+    Worker CPUs = all CPUs minus the reserved set (wd-ctl radiod + user-specified).
+    Writes drop-ins for:
+      - wd-* template service families
+      - timestd-* pipeline services
+    Also disables hf-timestd's own affinity watcher so it can't override us.
+    """
+    import subprocess
+
+    worker = [c for c in _all_cpus() if c not in reserved]
+    if not worker:
+        print('  WARNING: no worker CPUs remaining after reservations — skipping affinity',
+              file=sys.stderr)
+        return
+
+    cpu_str = ' '.join(str(c) for c in worker)
+    drop_in_content = f'[Service]\nCPUAffinity=\nCPUAffinity={cpu_str}\n'
+
+    # Unit templates and singletons to pin to worker CPUs.
+    # Use the base template name (without instance) for @ services.
+    units = [
+        # wd-ctl-managed templates
+        'wd-ka9q-record@.service',
+        'wd-kiwi-record@.service',
+        'wd-decode@.service',
+        'wd-post@.service',
+        'wd-ka9q-web@.service',
+        'wd-spool-clean.service',
+        # hf-timestd pipeline services
+        'timestd-core-recorder.service',
+        'timestd-metrology@.service',
+        'timestd-l2-calibration.service',
+        'timestd-fusion.service',
+        'timestd-physics.service',
+        'timestd-web-api.service',
+        'timestd-radiod-monitor.service',
+    ]
+
+    unit_dir = Path('/etc/systemd/system')
+    for unit in units:
+        drop_in_dir = unit_dir / f'{unit}.d'
+        drop_in_dir.mkdir(parents=True, exist_ok=True)
+        conf = drop_in_dir / '99-wdctl-cpu-affinity.conf'
+        conf.write_text(drop_in_content)
+
+    print(f'  Worker CPUs: {cpu_str}  (reserved: {sorted(reserved)})')
+    print(f'  CPU affinity drop-ins written for {len(units)} service units')
+
+    # Disable hf-timestd's affinity watcher — wd-ctl owns all affinity now.
+    affinity_watcher = Path('/etc/systemd/system/timestd-radiod-affinity.path')
+    if affinity_watcher.exists():
+        subprocess.run(['systemctl', 'disable', '--now',
+                        'timestd-radiod-affinity.path'],
+                       capture_output=True)
+        print('  Disabled timestd-radiod-affinity.path (wd-ctl owns affinity)')
+
+
+def _load_deps():
+    """Return a ConfigParser loaded with deps.conf."""
+    import configparser as _cp
+    dcfg = _cp.ConfigParser()
+    dcfg.read(_SCRIPT_DIR.parent / 'deps.conf')
+    return dcfg
+
+
+def _ensure_onion_src(url: str, pinned: str, src_dir: Path) -> 'Path | None':
+    """Clone onion source if absent and verify pinned commit.
+
+    onion is a C library build-dep of ka9q-web — its coordinates live inside
+    [ka9q-web] in deps.conf, not as a standalone section.
+    """
+    import subprocess
+
+    if not src_dir.exists():
+        print(f'  Cloning onion → {src_dir} ...')
+        result = subprocess.run(['git', 'clone', url, str(src_dir)],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f'  ERROR cloning onion: {result.stderr.strip()}', file=sys.stderr)
+            return None
+        if pinned:
+            subprocess.run(['git', '-C', str(src_dir), 'checkout', pinned],
+                           capture_output=True)
+
+    if pinned:
+        result = subprocess.run(
+            ['git', '-c', f'safe.directory={src_dir}',
+             '-C', str(src_dir), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True,
+        )
+        current = result.stdout.strip()
+        if current and not current.startswith(pinned[:12]):
+            print(f'  WARNING: onion at {current[:12]}, ka9q-web expects {pinned[:12]}')
+            print(f'  To update: cd {src_dir} && git checkout {pinned}')
+            print(f'  Then rebuild: cd build && cmake .. && make && sudo make install')
+        else:
+            print(f'  onion source: OK at {current[:12]}')
+
+    return src_dir
+
+
+def _build_onion(src_dir: Path) -> bool:
+    """Configure and build the onion HTTP library in-tree.
+
+    Installs to /usr/local (lib + headers). Returns True on success.
+    Safe to call repeatedly — skips if already built (libonion present).
+    """
+    import subprocess
+
+    lib_path = Path('/usr/local/lib/libonion.so')
+    if lib_path.exists():
+        print('  onion: already installed')
+        return True
+
+    build_dir = src_dir / 'build'
+    build_dir.mkdir(exist_ok=True)
+    print(f'  Configuring onion in {build_dir} ...')
+    result = subprocess.run(
+        ['cmake', '..', '-DCMAKE_INSTALL_PREFIX=/usr/local',
+         '-DHAVE_SQLITE3=OFF', '-DHAVE_REDIS=OFF', '-DHAVE_HIREDIS=OFF',
+         '-DHAVE_JPEG=OFF', '-DHAVE_PAM=OFF', '-DHAVE_SYSTEMD=OFF',
+         '-DHAVE_XML2=OFF', '-DONION_USE_SSL=ON'],
+        cwd=str(build_dir), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f'  ERROR: onion cmake failed:\n{result.stderr.strip()}', file=sys.stderr)
+        return False
+
+    import os
+    nproc = str(os.cpu_count() or 2)
+    print(f'  Building onion (make -j{nproc}) ...')
+    result = subprocess.run(['make', f'-j{nproc}'], cwd=str(build_dir),
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'  ERROR: onion build failed:\n{result.stderr[-800:]}', file=sys.stderr)
+        return False
+
+    result = subprocess.run(['make', 'install'], cwd=str(build_dir),
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'  ERROR: onion install failed:\n{result.stderr.strip()}', file=sys.stderr)
+        return False
+
+    # Refresh linker cache so ka9q-web can find libonion at runtime
+    subprocess.run(['ldconfig'], capture_output=True)
+    print('  onion: built and installed')
+    return True
+
+
+def _build_ka9q_web(src_dir: Path) -> bool:
+    """Build and install ka9q-web. Returns True on success.
+
+    Requires onion headers + lib to already be installed system-wide.
+    Safe to call repeatedly — skips if binary already present.
+    """
+    import os
+    import subprocess
+
+    binary = Path('/usr/local/sbin/ka9q-web')
+    if binary.exists():
+        print('  ka9q-web: binary already installed')
+        return True
+
+    nproc = str(os.cpu_count() or 2)
+    print(f'  Building ka9q-web (make -j{nproc}) ...')
+    result = subprocess.run(['make', f'-j{nproc}'], cwd=str(src_dir),
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'  ERROR: ka9q-web build failed:\n{result.stderr[-800:]}', file=sys.stderr)
+        return False
+
+    result = subprocess.run(['make', 'install'], cwd=str(src_dir),
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'  ERROR: ka9q-web install failed:\n{result.stderr.strip()}', file=sys.stderr)
+        return False
+
+    print('  ka9q-web: built and installed')
+    return True
+
+
+def _ensure_git_repo(section: str, dcfg) -> Path | None:
+    """Clone a git dep from deps.conf if absent; verify pinned commit; return src_dir."""
+    import subprocess
+
+    url        = dcfg.get(section, 'url', fallback='').strip()
+    pinned     = dcfg.get(section, 'commit', fallback='').strip()
+    install_to = dcfg.get(section, 'install_to', fallback='').strip()
+
+    if not url or not install_to:
+        print(f'  ERROR: [{section}] missing url/install_to in deps.conf', file=sys.stderr)
+        return None
+
+    src_dir = Path(install_to)
+
+    if not src_dir.exists():
+        print(f'  Cloning {section} → {src_dir} ...')
+        result = subprocess.run(['git', 'clone', url, str(src_dir)],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f'  ERROR cloning {section}: {result.stderr.strip()}', file=sys.stderr)
+            return None
+        if pinned:
+            subprocess.run(
+                ['git', '-C', str(src_dir), 'checkout', pinned],
+                capture_output=True,
+            )
+
+    # Verify commit
+    if pinned:
+        result = subprocess.run(
+            ['git', '-c', f'safe.directory={src_dir}',
+             '-C', str(src_dir), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True,
+        )
+        current = result.stdout.strip()
+        if current and not current.startswith(pinned[:12]):
+            print(f'  WARNING: {section} source at {current[:12]}, '
+                  f'deps.conf pins {pinned[:12]}')
+            print(f'  To update: cd {src_dir} && git checkout {pinned} && make && sudo make install')
+        else:
+            print(f'  {section} source: OK at {current[:12]}')
+
+    return src_dir
+
+
+def _apply_ka9q_web(config) -> None:
+    """Deploy one ka9q-web instance per unique local KA9Q radiod.
+
+    Each instance gets:
+      /etc/wsprdaemon/env/wd-ka9q-web@<radiod_name>.env  — KA9Q_WEB_STATUS + KA9Q_WEB_PORT
+      wd-ka9q-web@<radiod_name>.service                  — started via systemctl
+
+    onion is built first (if needed) because ka9q-web links against it.
+    """
+    import subprocess
+
+    dcfg = _load_deps()
+
+    # --- Ensure onion (build-time library dep of ka9q-web) is present and built ---
+    # onion_src/onion_commit/onion_url live inside [ka9q-web] in deps.conf, not as
+    # a standalone section, because onion is a library — not a service.
+    print('  Checking onion (ka9q-web build dep) ...')
+    kw_sect   = dcfg['ka9q-web'] if dcfg.has_section('ka9q-web') else {}
+    onion_url = kw_sect.get('onion_url', '').strip()
+    onion_pin = kw_sect.get('onion_commit', '').strip()
+    onion_src = kw_sect.get('onion_src', '').strip()
+    if not onion_url or not onion_src:
+        print('  ERROR: onion_url/onion_src missing from [ka9q-web] in deps.conf',
+              file=sys.stderr)
+        return
+    onion_dir = _ensure_onion_src(onion_url, onion_pin, Path(onion_src))
+    if onion_dir is None:
+        return
+    if not _build_onion(onion_dir):
+        return
+
+    # --- Ensure ka9q-web is present and built ---
+    print('  Checking ka9q-web ...')
+    kw_dir = _ensure_git_repo('ka9q-web', dcfg)
+    if kw_dir is None:
+        return
+    if not _build_ka9q_web(kw_dir):
+        return
+
+    # --- Collect unique *local* radiod names (stable name-sort, same as hf-timestd) ---
+    # Remote radiods have their own host; no point running a web UI here for them.
+    seen: set = set()
+    instances: list = []
+    for rx in sorted(config.receivers.values(), key=lambda r: r.name):
+        if rx.receiver_type not in ('ka9q',):
+            continue
+        if rx.locality != 'local':
+            continue
+        if not rx.radiod_name or rx.radiod_name in seen:
+            continue
+        seen.add(rx.radiod_name)
+        instances.append(rx.radiod_name)
+
+    if not instances:
+        print('  ka9q-web: no KA9Q receivers found — skipping')
+        return
+
+    base_port = config.ka9q_web.base_port
+    env_dir   = Path('/etc/wsprdaemon/env')
+
+    for i, radiod_name in enumerate(instances):
+        port        = base_port + i
+        status_addr = f'{radiod_name}-status.local'
+        print(f'\n  --- ka9q-web instance: {radiod_name} ---')
+        print(f'  status: {status_addr}   port: {port}')
+
+        env_path = env_dir / f'wd-ka9q-web@{radiod_name}.env'
+        env_path.write_text(
+            f'KA9Q_WEB_STATUS={status_addr}\n'
+            f'KA9Q_WEB_PORT={port}\n'
+        )
+        print(f'  env:    {env_path}')
+
+        svc = f'wd-ka9q-web@{radiod_name}.service'
+        result = subprocess.run(
+            ['systemctl', 'enable', '--now', svc],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            print(f'  Started: {svc}')
+        else:
+            print(f'  Failed to start {svc}: {result.stderr.strip()}')
 
 
 def _manage_radiod(conf_name: str) -> None:
@@ -262,53 +528,493 @@ def _manage_radiod(conf_name: str) -> None:
             print(f'  Failed to start: {result.stderr.strip()}')
 
 
+def _grid_to_latlon(grid: str) -> tuple:
+    """Convert Maidenhead grid square to approximate (lat, lon) center point."""
+    g = grid.strip()
+    if len(g) < 4:
+        return (0.0, 0.0)
+    try:
+        lon = (ord(g[0].upper()) - ord('A')) * 20.0 - 180.0
+        lat = (ord(g[1].upper()) - ord('A')) * 10.0 - 90.0
+        lon += int(g[2]) * 2.0
+        lat += int(g[3]) * 1.0
+        if len(g) >= 6:
+            # Subsquare letters may be upper or lower case
+            lon += (ord(g[4].lower()) - ord('a')) * (2.0 / 24.0) + (1.0 / 24.0)
+            lat += (ord(g[5].lower()) - ord('a')) * (1.0 / 24.0) + (0.5 / 24.0)
+        else:
+            lon += 1.0
+            lat += 0.5
+        return (round(lat, 4), round(lon, 4))
+    except (IndexError, ValueError, TypeError):
+        return (0.0, 0.0)
+
+
+def _build_timestd_toml(call: str, grid: str, lat: float, lon: float,
+                        radiod_status: str, htd) -> str:
+    """Generate timestd-config.toml content for one radiod instance."""
+    rtp_accuracy = '0.001' if htd.timing_authority in ('rtp', 'fusion') else '1.0'
+
+    channels = [
+        (2500000,  'WWV 2.5 MHz'),
+        (3330000,  'CHU 3.33 MHz'),
+        (5000000,  'WWV 5 MHz'),
+        (7850000,  'CHU 7.85 MHz'),
+        (10000000, 'WWV 10 MHz'),
+        (14670000, 'CHU 14.67 MHz'),
+        (15000000, 'WWV 15 MHz'),
+        (20000000, 'WWV 20 MHz'),
+        (25000000, 'WWV 25 MHz'),
+    ]
+    ch_blocks = '\n'.join(
+        f'[[recorder.channel_group.timestd.channels]]\n'
+        f'frequency_hz = {freq}\n'
+        f'description  = "{desc}"\n'
+        for freq, desc in channels
+    )
+
+    uploader_enabled  = str(htd.uploader_enabled).lower()
+    physics_products  = str(htd.physics_enabled).lower()
+    realtime_iono     = str(htd.physics_enabled).lower()
+    archive_root_line = (f'archive_root         = "{htd.archive_path}"'
+                         if htd.archive_path else
+                         '# archive_root       = "/mnt/external/timestd-archive"  ; uncomment to enable')
+
+    return f"""\
+# Auto-generated by wd-ctl apply — do not edit manually.
+# Source of truth: /etc/wsprdaemon/wsprdaemon.conf
+
+[station]
+callsign      = "{call}"
+grid_square   = "{grid}"
+id            = ""
+instrument_id = ""
+description   = "wsprdaemon station {call}"
+latitude      = {lat}
+longitude     = {lon}
+
+[ka9q]
+status_address       = "{radiod_status}"
+auto_create_channels = true
+source               = "radiod"
+
+[recorder]
+engine               = "radiod"
+mode                 = "production"
+compression          = "{htd.compression}"
+recording_interval   = 60
+continuous           = true
+tiered_storage       = true
+# storage_quota: start deleting oldest data when disk reaches this %.
+storage_quota        = "{htd.storage_quota}"
+# raw_buffer_min_days: keep at least this many UTC days of raw IQ in the pipeline buffer.
+# Today and yesterday are always preserved regardless of this value.
+raw_buffer_min_days  = 1
+{archive_root_line}
+
+[recorder.channel_defaults]
+preset      = "iq"
+sample_rate = 24000
+agc         = 0
+gain        = 60
+encoding    = "F32"
+
+{ch_blocks}
+[metrology]
+# physics_products: enable tick_phase, test_signal, detection_attempts, all_arrivals writers.
+# Set false on resource-constrained hardware; core timing pipeline is unaffected.
+physics_products = {physics_products}
+
+# realtime_iono: fetch WAM-IPE + GIRO ionospheric data in real time.
+# When false, propagation model uses climatological fallback only.
+realtime_iono = {realtime_iono}
+
+[timing]
+authority                = "{htd.timing_authority}"
+rtp_expected_accuracy_ms = {rtp_accuracy}
+always_run_fusion        = false
+
+[uploader]
+enabled = {uploader_enabled}
+
+[gnss_vtec]
+enabled = false
+host    = ""
+port    = 0
+
+[logging]
+level          = "INFO"
+console_output = false
+file_output    = true
+
+[monitoring]
+enable_metrics = false
+
+[web_ui]
+port             = 8000
+refresh_interval = 10
+"""
+
+
+def _build_timestd_env(instance: str, data_root: str, webui_port: int) -> str:
+    """Generate /etc/hf-timestd/{instance}/environment content."""
+    return f"""\
+TIMESTD_INSTANCE={instance}
+TIMESTD_MODE=production
+TIMESTD_DATA_ROOT={data_root}
+TIMESTD_LOG_DIR=/var/log/hf-timestd
+TIMESTD_CONFIG=/etc/hf-timestd/{instance}/timestd-config.toml
+TIMESTD_PROJECT=/opt/hf-timestd
+TIMESTD_INSTALL_DIR=/opt/hf-timestd
+TIMESTD_WEBUI=/opt/hf-timestd/web-api
+TIMESTD_VENV=/opt/hf-timestd/venv
+TIMESTD_LOG_LEVEL=INFO
+TIMESTD_WEBUI_PORT={webui_port}
+"""
+
+
+def _apply_rac(config) -> None:
+    """Install the Remote Access Channel (RAC) frpc service.
+
+    Port strategy:
+      35735 — legacy frps (no auth, no TLS); v3 clients and any v4 without rac_token
+      35736 — frps-secure (token auth + TLS);  v4 clients with rac_token set
+
+    Writes:
+      /etc/wsprdaemon/frpc.toml      — template (serverAddr substituted at runtime)
+      /opt/wsprdaemon/bin/wd-rac-connect — failover launcher script
+      /etc/systemd/system/wd-remote-access.service
+
+    Does NOT enable or start the service — RAC runs independently of wd-ctl.
+
+    Failover logic (when rac_fallback_server is set):
+      Each time systemd launches the service, wd-rac-connect probes the primary
+      host first; if unreachable it tries the fallback.  systemd Restart=always
+      drives the retry loop so the probe runs again on every restart, which means
+      the client will naturally switch back to the primary once it recovers.
+    """
+    import platform
+    import subprocess
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    rac_str = config.rac
+    if not rac_str:
+        return
+    try:
+        rac = int(rac_str)
+    except ValueError:
+        print(f'  ERROR: rac = "{rac_str}" is not a valid integer', file=sys.stderr)
+        return
+
+    # Station call sign — first non-merge receiver's call
+    call = ''
+    for rx in sorted(config.receivers.values(), key=lambda r: r.name):
+        if not rx.is_merge and rx.call:
+            call = rx.call
+            break
+
+    ssh_port      = 35800 + rac
+    web_port      = ssh_port + 10000
+    ka9q_web_port = config.ka9q_web.base_port
+
+    # Secure port if rac_token is set; legacy port otherwise.
+    has_token   = bool(config.rac_token)
+    server_port = 35736 if has_token else 35735
+    primary     = config.rac_server or 'remote.wsprdaemon.org'
+    fallback    = config.rac_fallback_server
+
+    print(f'  RAC channel: {rac}  SSH→{ssh_port}  web→{web_port}')
+    print(f'  Station: {call}  primary: {primary}:{server_port}'
+          + (f'  fallback: {fallback}:{server_port}' if fallback else ''))
+    if has_token:
+        print(f'  Auth: token + TLS (frps-secure port {server_port})')
+    else:
+        print(f'  Auth: none (legacy port {server_port}) — set rac_token to enable secure mode')
+
+    # --- Ensure frpc binary is present ---
+    frpc_version = '0.64.0'
+    frpc_bin     = Path('/opt/wsprdaemon/bin/frpc')
+    if frpc_bin.exists():
+        print(f'  frpc: already present at {frpc_bin}')
+    else:
+        machine = platform.machine().lower()
+        arch = 'arm64' if machine in ('aarch64', 'arm64') else 'amd64'
+        tarball_name = f'frp_{frpc_version}_linux_{arch}.tar.gz'
+        url = (f'https://github.com/fatedier/frp/releases/download/'
+               f'v{frpc_version}/{tarball_name}')
+        print(f'  Downloading frpc {frpc_version} ({arch}) ...')
+        frpc_bin.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tarball = Path(tmp) / tarball_name
+                urllib.request.urlretrieve(url, str(tarball))
+                with tarfile.open(str(tarball), 'r:gz') as tf:
+                    inner  = f'frp_{frpc_version}_linux_{arch}/frpc'
+                    member = tf.getmember(inner)
+                    member.name = 'frpc'
+                    tf.extract(member, path=str(frpc_bin.parent))
+            frpc_bin.chmod(0o755)
+            print(f'  frpc installed: {frpc_bin}')
+        except Exception as exc:
+            print(f'  ERROR downloading frpc: {exc}', file=sys.stderr)
+            print(f'  Install manually: extract frpc from {tarball_name} → {frpc_bin}',
+                  file=sys.stderr)
+            return
+
+    # --- Build the frpc.toml template ---
+    # serverAddr is a placeholder; wd-rac-connect substitutes the actual host
+    # at runtime so the same template drives both primary and fallback configs.
+    auth_lines = (
+        f'\nauth.method = "token"\nauth.token  = "{config.rac_token}"\n'
+        if has_token else ''
+    )
+    if has_token:
+        ca_path = config.rac_tls_ca or ''
+        if not ca_path:
+            # Default: look for the gw2 cert we save during wd-ctl apply
+            default_ca = Path('/etc/wsprdaemon/gw2-ca.crt')
+            if default_ca.exists():
+                ca_path = str(default_ca)
+        if ca_path:
+            tls_lines = (
+                f'\ntransport.tls.enable = true\n'
+                f'transport.tls.trustedCaFile = "{ca_path}"\n'
+            )
+        else:
+            # Let's Encrypt cert on server — system CA bundle is sufficient
+            tls_lines = '\ntransport.tls.enable = true\n'
+    else:
+        tls_lines = ''
+    frpc_conf = Path('/etc/wsprdaemon/frpc.toml')
+    frpc_conf.write_text(
+        f'# Auto-generated by wd-ctl apply — do not edit manually.\n'
+        f'# Source of truth: /etc/wsprdaemon/wsprdaemon.conf  [general] rac = {rac}\n'
+        f'# serverAddr is replaced at runtime by wd-rac-connect for failover support.\n'
+        f'\n'
+        f'serverAddr = "{primary}"\n'
+        f'serverPort = {server_port}\n'
+        + auth_lines
+        + tls_lines +
+        f'\n'
+        f'[[proxies]]\n'
+        f'name       = "{call}"\n'
+        f'type       = "tcp"\n'
+        f'localIP    = "127.0.0.1"\n'
+        f'localPort  = 22\n'
+        f'remotePort = {ssh_port}\n'
+        f'\n'
+        f'[[proxies]]\n'
+        f'name       = "{call}-WEB"\n'
+        f'type       = "tcp"\n'
+        f'localIP    = "127.0.0.1"\n'
+        f'localPort  = {ka9q_web_port}\n'
+        f'remotePort = {web_port}\n'
+    )
+    print(f'  frpc config: {frpc_conf}')
+
+    # --- Write the failover launcher script ---
+    # Uses bash /dev/tcp for TCP probing (no nc/curl dependency).
+    # exec replaces the shell with frpc so systemd tracks the right PID.
+    # When frpc exits (server gone), systemd Restart=always re-runs the script,
+    # which re-probes — so the client automatically switches back to the primary
+    # once it recovers, without any timer or polling loop inside the script.
+    connector = Path('/opt/wsprdaemon/bin/wd-rac-connect')
+    fallback_block = ''
+    if fallback:
+        fallback_block = (
+            f'\n'
+            f'elif _host_alive "{fallback}" "{server_port}"; then\n'
+            f'    logger -t wd-rac "primary {primary} unreachable — connecting to fallback {fallback}:{server_port}"\n'
+            f'    sed "s|^serverAddr = .*|serverAddr = \\"{fallback}\\"|" \\\n'
+            f'        /etc/wsprdaemon/frpc.toml > "$FALLBACK_CONF"\n'
+            f'    exec "{frpc_bin}" -c "$FALLBACK_CONF"\n'
+        )
+    connector.write_text(
+        f'#!/bin/bash\n'
+        f'# wd-rac-connect — frpc launcher with gateway failover\n'
+        f'# Generated by wd-ctl apply — do not edit manually.\n'
+        f'\n'
+        f'FALLBACK_CONF=/run/wsprdaemon/frpc-fallback.toml\n'
+        f'\n'
+        f'# Probe a TCP port — 5s timeout so TLS servers do not stall the probe.\n'
+        f'_host_alive() {{\n'
+        f'    timeout 5 bash -c "echo > /dev/tcp/$1/$2" 2>/dev/null\n'
+        f'}}\n'
+        f'\n'
+        f'if _host_alive "{primary}" "{server_port}"; then\n'
+        f'    logger -t wd-rac "connecting to primary {primary}:{server_port}"\n'
+        f'    exec "{frpc_bin}" -c /etc/wsprdaemon/frpc.toml\n'
+        + fallback_block +
+        f'else\n'
+        f'    logger -t wd-rac "no gateway reachable — will retry via systemd restart"\n'
+        f'    exit 1\n'
+        f'fi\n'
+    )
+    connector.chmod(0o755)
+    print(f'  Launcher: {connector}')
+
+    # --- Install wd-remote-access.service ---
+    # RestartSec=30: back-off between retries / failover probe interval.
+    # StartLimitIntervalSec=0: unlimited restarts (gateway may be down a long time).
+    svc_path = Path('/etc/systemd/system/wd-remote-access.service')
+    svc_path.write_text(
+        f'# Auto-generated by wd-ctl apply — do not edit manually.\n'
+        f'[Unit]\n'
+        f'Description=wsprdaemon Remote Access Channel {rac} ({call} → {primary}:{server_port})\n'
+        f'After=network-online.target\n'
+        f'Wants=network-online.target\n'
+        f'\n'
+        f'[Service]\n'
+        f'User=wsprdaemon\n'
+        f'RuntimeDirectory=wsprdaemon\n'
+        f'RuntimeDirectoryPreserve=yes\n'
+        f'ExecStart=/opt/wsprdaemon/bin/wd-rac-connect\n'
+        f'Restart=always\n'
+        f'RestartSec=30\n'
+        f'StartLimitIntervalSec=0\n'
+        f'\n'
+        f'[Install]\n'
+        f'WantedBy=multi-user.target\n'
+    )
+    print(f'  Service unit: {svc_path}')
+
+    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+    print(f'  RAC installed (not started).')
+    print(f'  Enable with: systemctl enable --now wd-remote-access')
+    print(f'  SSH access:  ssh -p {ssh_port} {call}@{primary}')
+
+
+def _apply_hf_timestd(config) -> None:
+    """Ensure hf-timestd is installed and running.
+
+    hf-timestd is a single global instance (one config, one set of services).
+    It connects to the primary local KA9Q radiod's status stream.
+    Config paths used by deploy.sh:
+      /etc/hf-timestd/timestd-config.toml  — generated from wsprdaemon.conf
+      /etc/hf-timestd/environment           — instance env vars
+    """
+    import configparser as _cp
+    import subprocess
+
+    htd = config.hf_timestd
+
+    # Find the primary local KA9Q radiod (first by name-sort)
+    primary_radiod = None
+    primary_call   = ''
+    primary_grid   = ''
+    for rx in sorted(config.receivers.values(), key=lambda r: r.name):
+        if rx.receiver_type not in ('ka9q',) or rx.locality != 'local':
+            continue
+        if not rx.radiod_name:
+            continue
+        primary_radiod = rx.radiod_name
+        primary_call   = rx.call or ''
+        primary_grid   = rx.grid or ''
+        break
+
+    if not primary_radiod:
+        print('  hf-timestd: no local KA9Q radiod found — skipping')
+        return
+
+    # Fall back to any non-merge receiver for call/grid if needed
+    if not primary_call:
+        for rx in config.receivers.values():
+            if not rx.is_merge and rx.call:
+                primary_call, primary_grid = rx.call, rx.grid
+                break
+
+    # Verify/clone hf-timestd source
+    hft_dir = _ensure_git_repo('hf-timestd', _load_deps())
+    if hft_dir is None:
+        return
+
+    deploy_sh = hft_dir / 'scripts' / 'deploy.sh'
+    if not deploy_sh.exists():
+        print(f'  ERROR: deploy.sh not found at {deploy_sh}', file=sys.stderr)
+        return
+
+    # Write config before deploy.sh runs so it skips the interactive wizard
+    conf_dir = Path('/etc/hf-timestd')
+    conf_dir.mkdir(parents=True, exist_ok=True)
+
+    lat, lon          = _grid_to_latlon(primary_grid)
+    radiod_status     = f'{primary_radiod}-status.local'
+    data_root         = '/var/lib/timestd'
+    webui_port        = 8000
+
+    toml_path = conf_dir / 'timestd-config.toml'
+    toml_path.write_text(
+        _build_timestd_toml(primary_call, primary_grid, lat, lon, radiod_status, htd)
+    )
+    print(f'  radiod:  {primary_radiod}  ({radiod_status})')
+    print(f'  config:  {toml_path}')
+
+    env_path = conf_dir / 'environment'
+    env_path.write_text(_build_timestd_env(primary_radiod, data_root, webui_port))
+    print(f'  env:     {env_path}')
+
+    print('  Running deploy.sh --yes ...')
+    result = subprocess.run(
+        ['bash', str(deploy_sh), '--yes'],
+        cwd=str(hft_dir),
+    )
+    if result.returncode != 0:
+        print(f'  WARNING: deploy.sh exited {result.returncode}', file=sys.stderr)
+    else:
+        print('  hf-timestd deployed')
+
+    # --- Apply physics_enabled policy ---
+    # deploy.sh always enables everything; enforce the operator's choice here.
+    physics_units = [
+        'timestd-physics.service',
+        'timestd-ionex-download.timer',
+        'timestd-ionex-download.service',
+        'timestd-iono-reanalysis.timer',
+        'timestd-iono-reanalysis.service',
+        'timestd-chrony-monitor.timer',
+        'timestd-chrony-monitor.service',
+    ]
+    if htd.physics_enabled:
+        print('  physics_enabled = true — enabling ionospheric pipeline')
+        subprocess.run(['systemctl', 'enable', '--now'] + physics_units,
+                       capture_output=True)
+    else:
+        print('  physics_enabled = false — disabling ionospheric pipeline')
+        subprocess.run(['systemctl', 'disable', '--now'] + physics_units,
+                       capture_output=True)
+
+
 def cmd_apply(args):
     """Generate env files from config, install units, and reconcile services."""
     import shutil
     import subprocess
 
-    # --- Locate v3 config ---
-    v3_candidates = [
-        args.config or '',
-        '/etc/wsprdaemon/wsprdaemon-v3.conf',
-        str(Path.home() / 'wsprdaemon.conf'),
-        # When invoked via sudo Path.home() resolves to /root; check the
-        # wsprdaemon user's home explicitly.
-        '/home/wsprdaemon/wsprdaemon.conf',
-    ]
-    v3_path = next((p for p in v3_candidates if p and Path(p).is_file()), '')
-    if not v3_path:
-        print('Error: no v3 config found. Run migrate-config first or pass --config.',
-              file=sys.stderr)
+    # --- Parse /etc/wsprdaemon/wsprdaemon.conf (v4 INI — single source of truth) ---
+    v4_ini = Path('/etc/wsprdaemon/wsprdaemon.conf')
+    if not v4_ini.exists():
+        print(f'Error: config not found: {v4_ini}', file=sys.stderr)
+        print('Create /etc/wsprdaemon/wsprdaemon.conf to get started.', file=sys.stderr)
         return 1
 
-    # --- Parse config: prefer v4 INI if it exists, fall back to v3 ---
-    v4_ini = Path('/etc/wsprdaemon/wsprdaemon.conf')
-    if v4_ini.exists():
-        print(f'Parsing config: {v4_ini}  (v4 INI)')
-        config = parse_v4_config(str(v4_ini))
-    else:
-        print(f'Parsing config: {v3_path}  (v3 bash)')
-        config = parse_v3_config(v3_path)
+    print(f'Parsing config: {v4_ini}')
+    config = parse_v4_config(str(v4_ini))
 
     conf_dir = Path('/etc/wsprdaemon')
     env_dir  = conf_dir / 'env'
     try:
-        conf_dir.mkdir(parents=True, exist_ok=True)
+        env_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError:
         print('Error: need root to write to /etc/wsprdaemon. Run with sudo.',
               file=sys.stderr)
         return 1
 
-    ini_text = v3_to_ini(config)
-    ini_path = conf_dir / 'wsprdaemon.conf'
-    ini_path.write_text(ini_text)
-    print(f'  Config: {ini_path}')
-
     written = generate_all_env_files(config, env_dir)
     print(f'  Env files: {len(written)} files in {env_dir}/')
 
     # --- Install systemd unit templates ---
+    # Must happen before any peer-service blocks that call systemctl enable.
     unit_src = _SCRIPT_DIR.parent / 'systemd'
     unit_dst = Path('/etc/systemd/system')
     installed_units = []
@@ -325,6 +1031,21 @@ def cmd_apply(args):
         shutil.copy2(unit_file, dst)
         installed_units.append(unit_file.name)
     print(f'  Units installed: {", ".join(sorted(installed_units))}')
+
+    # --- hf-timestd integration ---
+    if config.hf_timestd.enabled:
+        print('\n--- hf-timestd ---')
+        _apply_hf_timestd(config)
+
+    # --- ka9q-web integration ---
+    if config.ka9q_web.enabled:
+        print('\n--- ka9q-web ---')
+        _apply_ka9q_web(config)
+
+    # --- Remote Access Channel (RAC) ---
+    if config.rac:
+        print('\n--- Remote Access Channel (RAC) ---')
+        _apply_rac(config)
 
     # --- Install wrapper scripts ---
     sbin = Path('/usr/local/sbin')
@@ -517,8 +1238,33 @@ WantedBy=local-fs.target
     if not local_radiods:
         print('  No local radiod instances configured')
 
+    # --- Build reserved CPU set: wd-ctl radiods + user-specified extras ---
+    reserved_cpus: set = set()
+    for radiod_name in local_radiods:
+        assigned = all_assignments.get(radiod_name) or frozenset()
+        # If just assigned this session, get from ht_pairs
+        if not assigned:
+            idx = local_radiods.index(radiod_name)
+            if idx < len(ht_pairs):
+                assigned = frozenset(ht_pairs[idx])
+        reserved_cpus |= set(assigned)
+
+    # Add any CPUs reserved by the user for manually-managed services
+    user_reserved = config.reserved_cpus
+    if user_reserved:
+        for tok in user_reserved.replace(',', ' ').split():
+            try:
+                reserved_cpus.add(int(tok))
+            except ValueError:
+                pass
+        print(f'  User-reserved CPUs: {sorted(int(t) for t in user_reserved.replace(",", " ").split() if t.isdigit())}')
+
+    # --- Write worker CPU affinity drop-ins for all managed services ---
+    _apply_worker_cpu_affinity(reserved_cpus)
+
+    # --- Reload and restart radiod if affinity changed ---
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
     if affinity_changed:
-        subprocess.run(['systemctl', 'daemon-reload'], check=True)
         for radiod_name in local_radiods:
             result = subprocess.run(
                 ['systemctl', 'restart', f'radiod@{radiod_name}.service'],
@@ -532,8 +1278,54 @@ WantedBy=local-fs.target
 
 
 def cmd_teardown(args):
-    """Stop and disable all wsprdaemon services."""
-    print('teardown: not yet implemented')
+    """Stop and disable all wsprdaemon-managed services, including local radiod instances."""
+    import subprocess
+
+    def _stop(units, label):
+        subprocess.run(
+            ['systemctl', 'stop', '--ignore-not-found'] + units,
+            capture_output=True, text=True
+        )
+        print(f'  Stopped: {label}')
+
+    print('Stopping wsprdaemon services...')
+
+    # --- Recorders and decoders ---
+    _stop(['wd-spool-clean.timer', 'wd-spool-clean.service'], 'spool janitor')
+    _stop(['wd-ka9q-record@*', 'wd-kiwi-record@*'], 'recorders')
+    _stop(['wd-decode@*', 'wd-post@*'], 'decoders / posters')
+    _stop(['wd-ka9q-web@*'], 'ka9q-web instances')
+    _stop(['timestd-pipeline-watchdog.timer'], 'hf-timestd watchdog')
+    _stop(['timestd-core-recorder'], 'hf-timestd core recorder')
+    _stop(['timestd-metrology@*'], 'hf-timestd metrology workers')
+    _stop(['timestd-l2-calibration', 'timestd-fusion',
+           'timestd-physics', 'timestd-web-api',
+           'timestd-radiod-monitor'], 'hf-timestd pipeline services')
+
+    # --- Local radiod instances from config ---
+    v4_ini = Path('/etc/wsprdaemon/wsprdaemon.conf')
+    if v4_ini.exists():
+        config = parse_v4_config(str(v4_ini))
+        local_radiods = []
+        seen = set()
+        for rx in sorted(config.receivers.values(), key=lambda r: r.name):
+            if rx.receiver_type not in ('ka9q', 'ka9q_wwv'):
+                continue
+            if rx.locality != 'local' or not rx.radiod_name:
+                continue
+            if rx.radiod_name not in seen:
+                local_radiods.append(rx.radiod_name)
+                seen.add(rx.radiod_name)
+        for radiod_name in local_radiods:
+            svc = f'radiod@{radiod_name}.service'
+            _stop([svc], f'radiod@{radiod_name}')
+    else:
+        print('  (no config found — skipping radiod stop)')
+
+    # --- Clear failed unit state ---
+    subprocess.run(['systemctl', 'reset-failed'], capture_output=True)
+
+    print('\nTeardown complete.')
     return 0
 
 
@@ -555,6 +1347,7 @@ def cmd_status(args):
         'wd-decode@*',
         'wd-post@*',
         'wd-upload-*',
+        'wd-ka9q-web@*',
     ]
 
     found_any = False
@@ -575,15 +1368,14 @@ def cmd_status(args):
 
 def cmd_validate(args):
     """Validate config without applying."""
-    conf_path = args.config or str(paths.CONF_FILE)
+    conf_path = args.config or '/etc/wsprdaemon/wsprdaemon.conf'
     if not Path(conf_path).exists():
         print(f'Error: config not found: {conf_path}', file=sys.stderr)
         return 1
 
-    # For now, try parsing as v3 to validate
     print(f'Validating: {conf_path}')
     try:
-        config = parse_v3_config(conf_path)
+        config = parse_v4_config(conf_path)
         print(f'  Receivers: {len(config.receivers)}')
         print(f'  Schedule slots: {len(config.schedule_slots)}')
 
@@ -728,18 +1520,8 @@ def main():
     )
     sub = parser.add_subparsers(dest='command', help='Subcommand')
 
-    # migrate-config
-    p_migrate = sub.add_parser('migrate-config',
-                               help='Convert v3 config to v4 format')
-    p_migrate.add_argument('input',
-                          help='Path to v3 wsprdaemon.conf')
-    p_migrate.add_argument('-o', '--output-dir',
-                          default='/etc/wsprdaemon',
-                          help='Output directory (default: /etc/wsprdaemon)')
-
     # apply
-    p_apply = sub.add_parser('apply', help='Apply config: generate env, reconcile services')
-    p_apply.add_argument('-c', '--config', help='Path to v3 wsprdaemon.conf (auto-detected if not given)')
+    sub.add_parser('apply', help='Apply config: generate env files and reconcile services')
 
     # teardown
     sub.add_parser('teardown', help='Stop and disable all services')
@@ -767,7 +1549,6 @@ def main():
         return 1
 
     dispatch = {
-        'migrate-config': cmd_migrate_config,
         'apply': cmd_apply,
         'teardown': cmd_teardown,
         'status': cmd_status,
