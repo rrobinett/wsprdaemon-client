@@ -17,16 +17,31 @@ from pathlib import Path
 
 # Add the lib directory to the path so wdlib is importable
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_LIB_DIR = _SCRIPT_DIR.parent / 'lib'
-if _LIB_DIR.exists():
+
+# Resolve source tree root — works from the source tree (bin/) and installed (/usr/local/sbin/).
+# Priority: beside this script, then /opt/wsprdaemon (install.sh copies deps.conf there),
+# then a hard fallback to the default source tree location.
+_SOURCE_ROOT = _SCRIPT_DIR.parent
+if not (_SOURCE_ROOT / 'deps.conf').exists():
+    for _candidate in [
+        Path('/opt/wsprdaemon'),
+        Path('/home/wsprdaemon/wsprdaemon-client'),
+    ]:
+        if (_candidate / 'deps.conf').exists():
+            _SOURCE_ROOT = _candidate
+            break
+
+_LIB_DIR = _SOURCE_ROOT / 'lib'
+if (_LIB_DIR / 'wdlib').exists():
     sys.path.insert(0, str(_LIB_DIR))
-# Also check /opt/wsprdaemon/lib for installed location
-elif Path('/opt/wsprdaemon/lib').exists():
+elif Path('/opt/wsprdaemon/lib/wdlib').exists():
     sys.path.insert(0, '/opt/wsprdaemon/lib')
 
 from wdlib import paths
 from wdlib.v4_parser import parse_v4_config
 from wdlib.envgen import generate_all_env_files
+from wdlib.v3_parser import parse_v3_config
+from wdlib.ini_writer import write_v4_ini
 
 
 def _parse_cpu_list(s: str) -> tuple:
@@ -180,7 +195,7 @@ def _load_deps():
     """Return a ConfigParser loaded with deps.conf."""
     import configparser as _cp
     dcfg = _cp.ConfigParser()
-    dcfg.read(_SCRIPT_DIR.parent / 'deps.conf')
+    dcfg.read(_SOURCE_ROOT / 'deps.conf')
     return dcfg
 
 
@@ -449,7 +464,7 @@ def _manage_radiod(conf_name: str) -> None:
     print(f'\n--- radiod: {svc} ---')
 
     # --- Check source commit against deps.conf pin ---
-    deps_file = _SCRIPT_DIR.parent / 'deps.conf'
+    deps_file = _SOURCE_ROOT / 'deps.conf'
     if deps_file.exists():
         cfg = configparser.ConfigParser()
         cfg.read(deps_file)
@@ -1092,22 +1107,28 @@ def cmd_apply(args):
 
     # --- Install systemd unit templates ---
     # Must happen before any peer-service blocks that call systemctl enable.
-    unit_src = _SCRIPT_DIR.parent / 'systemd'
+    # Skipped gracefully when running from the installed location (install.sh
+    # already placed units in /etc/systemd/system/).
+    unit_src = _SOURCE_ROOT / 'systemd'
     unit_dst = Path('/etc/systemd/system')
     installed_units = []
-    for unit_file in unit_src.glob('*.service'):
-        dst = unit_dst / unit_file.name
-        shutil.copy2(unit_file, dst)
-        installed_units.append(unit_file.name)
-    for unit_file in unit_src.glob('*.target'):
-        dst = unit_dst / unit_file.name
-        shutil.copy2(unit_file, dst)
-        installed_units.append(unit_file.name)
-    for unit_file in unit_src.glob('*.timer'):
-        dst = unit_dst / unit_file.name
-        shutil.copy2(unit_file, dst)
-        installed_units.append(unit_file.name)
-    print(f'  Units installed: {", ".join(sorted(installed_units))}')
+    if unit_src.is_dir():
+        for unit_file in unit_src.glob('*.service'):
+            dst = unit_dst / unit_file.name
+            shutil.copy2(unit_file, dst)
+            installed_units.append(unit_file.name)
+        for unit_file in unit_src.glob('*.target'):
+            dst = unit_dst / unit_file.name
+            shutil.copy2(unit_file, dst)
+            installed_units.append(unit_file.name)
+        for unit_file in unit_src.glob('*.timer'):
+            dst = unit_dst / unit_file.name
+            shutil.copy2(unit_file, dst)
+            installed_units.append(unit_file.name)
+    if installed_units:
+        print(f'  Units installed: {", ".join(sorted(installed_units))}')
+    else:
+        print(f'  Units: already in place (skipping reinstall)')
 
     # --- hf-timestd integration ---
     if config.hf_timestd.enabled:
@@ -1125,30 +1146,42 @@ def cmd_apply(args):
         _apply_rac(config)
 
     # --- Install wrapper scripts ---
+    # Skip if source and destination are the same file (running from installed location).
     sbin = Path('/usr/local/sbin')
     wrappers = ['wd-ka9q-record', 'wd-kiwi-record', 'wd-kiwi-cleanup',
                 'wd-spool-clean', 'wd-decode', 'wd-post']
     for name in wrappers:
         src = _SCRIPT_DIR / name
-        if src.exists():
-            dst = sbin / name
-            shutil.copy2(src, dst)
-            dst.chmod(0o755)
+        if not src.exists():
+            continue
+        dst = sbin / name
+        if dst.exists() and src.resolve() == dst.resolve():
+            continue
+        shutil.copy2(src, dst)
+        dst.chmod(0o755)
     print(f'  Wrappers installed to {sbin}/')
 
     # --- Install Python recorder ---
     opt_bin = Path('/opt/wsprdaemon/bin')
     opt_bin.mkdir(parents=True, exist_ok=True)
+    # Look in source bin/ first, then the source root bin/
     py_src = _SCRIPT_DIR / 'wd-ka9q-record.py'
+    if not py_src.exists():
+        py_src = _SOURCE_ROOT / 'bin' / 'wd-ka9q-record.py'
     if py_src.exists():
-        shutil.copy2(py_src, opt_bin / 'wd-ka9q-record.py')
+        py_dst = opt_bin / 'wd-ka9q-record.py'
+        if not py_dst.exists() or py_src.resolve() != py_dst.resolve():
+            shutil.copy2(py_src, py_dst)
     opt_lib = Path('/opt/wsprdaemon/lib')
     opt_lib.mkdir(parents=True, exist_ok=True)
-    wdlib_src = _SCRIPT_DIR.parent / 'lib' / 'wdlib'
+    wdlib_src = _SOURCE_ROOT / 'lib' / 'wdlib'
     wdlib_dst = opt_lib / 'wdlib'
-    if wdlib_dst.is_symlink() or wdlib_dst.exists():
-        wdlib_dst.unlink() if wdlib_dst.is_symlink() else shutil.rmtree(wdlib_dst)
-    wdlib_dst.symlink_to(wdlib_src)
+    # Only create a symlink when the source is a real directory outside /opt/wsprdaemon
+    # (i.e. running from a source tree). Skip if they'd resolve to the same path.
+    if wdlib_src.is_dir() and wdlib_src.resolve() != wdlib_dst.resolve():
+        if wdlib_dst.is_symlink() or wdlib_dst.exists():
+            wdlib_dst.unlink() if wdlib_dst.is_symlink() else shutil.rmtree(wdlib_dst)
+        wdlib_dst.symlink_to(wdlib_src)
 
     # --- Calculate tmpfs size from env files ---
     # WSPR (12 kHz mono float32):  12000*60*4 = 2,880,000 bytes ≈ 3 MB/file
@@ -1259,6 +1292,40 @@ WantedBy=local-fs.target
     ]
     for instance in sorted(kiwi_instances):
         svc = f'wd-kiwi-record@{instance}.service'
+        result = subprocess.run(
+            ['systemctl', 'enable', '--now', svc],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f'  Started: {svc}')
+        else:
+            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+
+    # --- Start decode services ---
+    decode_instances = [
+        Path(f).stem.split('@')[1]
+        for f in written
+        if 'wd-decode@' in Path(f).name
+    ]
+    for instance in sorted(decode_instances):
+        svc = f'wd-decode@{instance}.service'
+        result = subprocess.run(
+            ['systemctl', 'enable', '--now', svc],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f'  Started: {svc}')
+        else:
+            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+
+    # --- Start post services ---
+    post_instances = [
+        Path(f).stem.split('@')[1]
+        for f in written
+        if 'wd-post@' in Path(f).name
+    ]
+    for instance in sorted(post_instances):
+        svc = f'wd-post@{instance}.service'
         result = subprocess.run(
             ['systemctl', 'enable', '--now', svc],
             capture_output=True, text=True
@@ -1497,7 +1564,7 @@ def cmd_install_deps(args):
     import configparser
     import subprocess
 
-    deps_file = _SCRIPT_DIR.parent / 'deps.conf'
+    deps_file = _SOURCE_ROOT / 'deps.conf'
     if not deps_file.exists():
         print(f'Error: deps.conf not found at {deps_file}', file=sys.stderr)
         return 1
@@ -1505,6 +1572,19 @@ def cmd_install_deps(args):
     cfg = configparser.ConfigParser()
     cfg.read(deps_file)
     errors = 0
+
+    # --- Ensure the wsprdaemon venv exists ---
+    venv_dir = Path('/opt/wsprdaemon/venv')
+    if not venv_dir.exists():
+        print(f'Creating Python venv at {venv_dir}...')
+        result = subprocess.run(
+            [sys.executable, '-m', 'venv', str(venv_dir)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f'ERROR: could not create venv: {result.stderr.strip()}', file=sys.stderr)
+            return 1
+        print(f'  Venv created: {venv_dir}')
 
     for dep in cfg.sections():
         dep_type   = cfg[dep].get('type', '').strip()
@@ -1550,10 +1630,13 @@ def cmd_install_deps(args):
                     print(f'  Checked out {commit[:12]}')
 
         elif dep_type == 'pypi':
-            venv_pip = Path('/opt/wsprdaemon/venv/bin/pip')
-            pip_cmd  = str(venv_pip) if venv_pip.exists() else 'pip3'
+            pip_cmd = str(Path('/opt/wsprdaemon/venv/bin/pip'))
+            is_git_url = url.startswith('git+')
+            # Derive the package name for 'pip show': last path component without .git
+            pkg_name = url.rstrip('/').split('/')[-1].replace('.git', '') if is_git_url else url
+
             result = subprocess.run(
-                [pip_cmd, 'show', url],
+                [pip_cmd, 'show', pkg_name],
                 capture_output=True, text=True
             )
             if result.returncode == 0:
@@ -1564,15 +1647,22 @@ def cmd_install_deps(args):
                     'unknown'
                 )
                 if installed_ver == commit:
-                    print(f'  OK — {url}=={installed_ver}')
+                    print(f'  OK — {pkg_name}=={installed_ver}')
                 else:
                     print(f'  VERSION MISMATCH — have {installed_ver}, want {commit}')
-                    print(f'  Run: {pip_cmd} install "{url}=={commit}"')
+                    if is_git_url:
+                        print(f'  Run: {pip_cmd} install --upgrade "{url}@{commit}"')
+                    else:
+                        print(f'  Run: {pip_cmd} install "{url}=={commit}"')
                     errors += 1
             else:
-                print(f'  Installing {url}=={commit}')
+                if is_git_url:
+                    install_spec = f'{url}@{commit}'
+                else:
+                    install_spec = f'{url}=={commit}'
+                print(f'  Installing {install_spec}')
                 result = subprocess.run(
-                    [pip_cmd, 'install', f'{url}=={commit}'],
+                    [pip_cmd, 'install', install_spec],
                     capture_output=True, text=True
                 )
                 if result.returncode != 0:
@@ -1590,12 +1680,54 @@ def cmd_install_deps(args):
     return 0
 
 
+def cmd_migrate_config(args) -> int:
+    """Convert a v3 bash config file to v4 INI format."""
+    import socket
+    hostname = getattr(args, 'hostname', None) or socket.gethostname()
+
+    print(f'Migrating v3 config for hostname: {hostname}')
+    try:
+        v3_data = parse_v3_config(args.input, hostname=hostname)
+    except ValueError as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        return 1
+
+    ini_text = write_v4_ini(v3_data)
+
+    out_dir = Path(args.output_dir) if args.output_dir else Path('/etc/wsprdaemon')
+    out_file = out_dir / 'wsprdaemon.conf'
+
+    if out_file.exists() and not args.force:
+        print(f'ERROR: {out_file} already exists. Use --force to overwrite.', file=sys.stderr)
+        return 1
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(ini_text)
+    print(f'Written: {out_file}')
+
+    # Summary
+    rx_count = len(v3_data['receivers'])
+    slot_count = len(v3_data['schedule'])
+    total_entries = sum(len(s['entries']) for s in v3_data['schedule'])
+    print(f'  Receivers:      {rx_count}')
+    print(f'  Schedule slots: {slot_count}  ({total_entries} band entries)')
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='wd-ctl',
         description='wsprdaemon v4 orchestrator'
     )
     sub = parser.add_subparsers(dest='command', help='Subcommand')
+
+    # migrate-config
+    p_mig = sub.add_parser('migrate-config', help='Convert v3 bash config to v4 INI format')
+    p_mig.add_argument('input', help='Path to v3 wsprdaemon.conf')
+    p_mig.add_argument('-o', '--output-dir', default='/etc/wsprdaemon',
+                       help='Output directory (default: /etc/wsprdaemon)')
+    p_mig.add_argument('--hostname', help='Override hostname for case-block selection')
+    p_mig.add_argument('--force', action='store_true', help='Overwrite existing config')
 
     # apply
     sub.add_parser('apply', help='Apply config: generate env files and reconcile services')
@@ -1626,6 +1758,7 @@ def main():
         return 1
 
     dispatch = {
+        'migrate-config': cmd_migrate_config,
         'apply': cmd_apply,
         'teardown': cmd_teardown,
         'status': cmd_status,

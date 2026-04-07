@@ -112,8 +112,11 @@ run_decode_cycle() {
 if ${use_inotify}; then
     echo "wd-decode: using inotifywait for ${WD_RECEIVER_TYPE} source"
     while true; do
-        # Wait for a new wav file to be closed
-        inotifywait -q -e close_write -t 120 "${WD_RECORDING_DIR}" --include '\.wav$' >/dev/null 2>&1 || true
+        # wspr-recorder writes .wav.tmp then renames → MOVED_TO .wav,
+        # then writes a .json sidecar via CLOSE_WRITE. Trigger on either
+        # so the decode fires once the wav is fully in place.
+        inotifywait -q -e moved_to -e close_write -t 120 "${WD_RECORDING_DIR}" \
+            --include '\.(wav|json)$' >/dev/null 2>&1 || true
         run_decode_cycle
     done
 else

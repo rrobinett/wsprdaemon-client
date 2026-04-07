@@ -120,6 +120,34 @@ chmod 2775 "${ETC_DIR}/env"
 info "Installing wdlib..."
 cp -r "${SCRIPT_DIR}/lib/wdlib" "${INSTALL_DIR}/lib/"
 
+# Install Python recorder
+mkdir -p "${INSTALL_DIR}/bin"
+cp "${SCRIPT_DIR}/bin/wd-ka9q-record.py" "${INSTALL_DIR}/bin/wd-ka9q-record.py"
+
+# Install deps.conf so wd-ctl can resolve source-tree paths when installed
+cp "${SCRIPT_DIR}/deps.conf" "${INSTALL_DIR}/deps.conf"
+
+# Install decoder binaries (arch-specific)
+info "Installing decoder binaries (wsprd, jt9)..."
+ARCH=$(uname -m)
+case "${ARCH}" in
+    x86_64)
+        install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-x86-v27"   "${SBIN_DIR}/wsprd"
+        install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-x86-v27"     "${SBIN_DIR}/jt9"
+        ;;
+    aarch64)
+        install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-arm64-v27" "${SBIN_DIR}/wsprd"
+        install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-arm64-v27"   "${SBIN_DIR}/jt9"
+        ;;
+    armv7l|armhf)
+        install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-armhf-v26" "${SBIN_DIR}/wsprd"
+        install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-arm32-v26"   "${SBIN_DIR}/jt9"
+        ;;
+    *)
+        warn "Unknown architecture ${ARCH} — wsprd and jt9 not installed"
+        ;;
+esac
+
 # Install executables
 info "Installing executables to ${SBIN_DIR}..."
 install -m 755 "${SCRIPT_DIR}/bin/wd-ctl" "${SBIN_DIR}/wd-ctl"
