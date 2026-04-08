@@ -71,14 +71,19 @@ def upload_dir(target: str, call: str, grid: str,
                receiver_name: str = '', band: str = '') -> Path:
     """Upload queue directory.
 
-    For wsprnet:      /var/spool/wsprdaemon/posting/uploads/wsprnet/<CALL>_<GRID>/
-    For wsprdaemon:   /var/spool/wsprdaemon/posting/uploads/wsprdaemon/<CALL>/<RECEIVER>/<BAND>/
+    Callsigns may contain '/' (e.g. AC0G/B1) which is illegal in directory
+    names.  Replace '/' with '=' matching v3 convention; upload daemons
+    reverse the substitution when submitting to wsprnet/wsprdaemon.
+
+    For wsprnet:      /var/spool/wsprdaemon/posting/uploads/wsprnet/<CALL=safe>_<GRID>/
+    For wsprdaemon:   /var/spool/wsprdaemon/posting/uploads/wsprdaemon/<CALL=safe>/<RECEIVER>/<BAND>/
     """
+    safe_call = call.replace('/', '=')
     base = POSTING_DIR / 'uploads' / target
     if target == 'wsprnet':
-        return base / f'{call}_{grid}'
+        return base / f'{safe_call}_{grid}'
     else:
-        return base / call / receiver_name / band
+        return base / safe_call / receiver_name / band
 
 
 def instance_id(receiver_name: str, band: str) -> Path:

@@ -143,7 +143,12 @@ decode_window() {
             cp -p "${all_wspr_save}" "${all_wspr}"
 
             # Run wsprd — appends new spots to ALL_WSPR.TXT
-            "${WSPRD_BIN}" -a "${WSPRD_STATE_DIR}" -f "${freq_mhz}" "${concat_wav}" \
+            # -c: write .c2 file (first-pass subtraction aid)
+            # -C 500: max decoder cycles/bit (v3 default, faster than 10000)
+            # -o 4: OSD decoding depth 4 (v3 default)
+            # -d: deeper search for weak signals
+            "${WSPRD_BIN}" -a "${WSPRD_STATE_DIR}" -c -C 500 -o 4 -d \
+                -f "${freq_mhz}" "${concat_wav}" \
                 > /dev/null 2>&1 || true
 
             # Sort updated ALL_WSPR.TXT and diff to find new spots
