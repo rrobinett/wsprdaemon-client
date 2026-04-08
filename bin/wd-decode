@@ -144,9 +144,20 @@ decode_window() {
             fi
             ;;
         F)
-            # jt9 — FST4W decoder with period flag; -a/-t set data/temp dirs
+            # jt9 FST4W decoder.
+            # -f 1500: audio center frequency offset in Hz (not RF MHz)
+            # -F 100: +/- 100 Hz search tolerance
+            # plotspec/decdata markers enable extended output to fst4_decodes.dat
+            # Basic decoded spots (per run) go to decoded.txt.
             local period_sec=$(( window * 60 ))
-            "${JT9_BIN}" -a "${work_dir}" -t "${work_dir}" -p "${period_sec}" -f "${freq_mhz}" "${concat_wav}" > "${spots_file}" 2>/dev/null
+            touch "${work_dir}/plotspec" "${work_dir}/decdata"
+            "${JT9_BIN}" -a "${work_dir}" -t "${work_dir}" --fst4w \
+                -p "${period_sec}" -f 1500 -F 100 "${concat_wav}" \
+                > "${work_dir}/jt9_output.txt" 2>&1 || true
+            # decoded.txt has the basic spot lines from this run
+            if [[ -s "${work_dir}/decoded.txt" ]]; then
+                cp "${work_dir}/decoded.txt" "${spots_file}"
+            fi
             ;;
         I)
             # IQ recording — no decode, just archive
