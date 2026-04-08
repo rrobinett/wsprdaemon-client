@@ -16,7 +16,7 @@ Environment variables (set by systemd EnvironmentFile):
     WD_RECEIVER_NAME    Receiver name              (e.g. KA9Q_0)
     WD_BANDS            Space-separated band list  (e.g. "630 80 40 20")
     WD_RECORDING_DIR    Spool root for this receiver
-    WD_GAIN_DB          RF output gain in dB       (default: 60)
+    WD_GAIN_DB          Audio channel gain in dB   (default: 0 — no gain, matches v3)
 
 WAV output: YYYYMMDDTHHMMSSz_{freq_hz}_usb.wav  (matches kiwi format)
 """
@@ -41,7 +41,7 @@ RADIOD_STATUS = os.environ['WD_RADIOD_STATUS']
 RX_NAME       = os.environ['WD_RECEIVER_NAME']
 BANDS         = os.environ['WD_BANDS'].split()
 RECORDING_DIR = Path(os.environ['WD_RECORDING_DIR'])
-GAIN_DB       = float(os.environ.get('WD_GAIN_DB', '60'))
+GAIN_DB       = float(os.environ.get('WD_GAIN_DB', '0'))
 
 WSPR_RECORDER = '/opt/wsprdaemon/venv/bin/wspr-recorder'
 
