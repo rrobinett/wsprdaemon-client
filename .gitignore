@@ -1,1 +1,9 @@
 __pycache__/
+# wsprd working files (written when testing from repo root)
+ALL_WSPR.TXT
+hashtable.txt
+wspr_spots.txt
+wspr_timer.out
+wspr_wisdom.dat
+jt9_wisdom.dat
+.wsprd_result

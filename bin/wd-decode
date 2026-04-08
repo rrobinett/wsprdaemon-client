@@ -8,6 +8,25 @@
 
 set -euo pipefail
 
+# Resolve decoder binaries from the project's decoders directory.
+# Never rely on PATH — these are versioned project binaries.
+_DECODER_DIR="/opt/wsprdaemon/bin/decoders"
+_ARCH=$(uname -m)
+case "${_ARCH}" in
+    x86_64)       WSPRD_BIN="${_DECODER_DIR}/wsprd-x86-v27"
+                  JT9_BIN="${_DECODER_DIR}/jt9-x86-v27" ;;
+    aarch64)      WSPRD_BIN="${_DECODER_DIR}/wsprd-arm64-v27"
+                  JT9_BIN="${_DECODER_DIR}/jt9-arm64-v27" ;;
+    armv7l|armhf) WSPRD_BIN="${_DECODER_DIR}/wsprd-armhf-v26"
+                  JT9_BIN="${_DECODER_DIR}/jt9-arm32-v26" ;;
+    *)  echo "wd-decode: unsupported architecture ${_ARCH}" >&2; exit 1 ;;
+esac
+
+if [[ ! -x "${WSPRD_BIN}" ]]; then
+    echo "wd-decode: wsprd binary not found: ${WSPRD_BIN}" >&2
+    exit 1
+fi
+
 : "${WD_RECEIVER_NAME:?}"
 : "${WD_RECEIVER_TYPE:?}"
 : "${WD_RECEIVER_BAND:?}"
@@ -74,13 +93,15 @@ decode_window() {
 
     case "${prefix}" in
         W)
-            # wsprd — WSPR-2 decoder
-            wsprd -f "${freq_mhz}" "${concat_wav}" > "${spots_file}" 2>/dev/null
+            # wsprd — WSPR-2 decoder; -a sets its working data dir (defaults to CWD)
+            # Filter out <DecodeFinished> marker (not a real spot)
+            "${WSPRD_BIN}" -a "${work_dir}" -f "${freq_mhz}" "${concat_wav}" 2>/dev/null \
+                | grep -v '^<' > "${spots_file}" || true
             ;;
         F)
-            # jt9 — FST4W decoder with period flag
+            # jt9 — FST4W decoder with period flag; -a/-t set data/temp dirs
             local period_sec=$(( window * 60 ))
-            jt9 -p "${period_sec}" -f "${freq_mhz}" "${concat_wav}" > "${spots_file}" 2>/dev/null
+            "${JT9_BIN}" -a "${work_dir}" -t "${work_dir}" -p "${period_sec}" -f "${freq_mhz}" "${concat_wav}" > "${spots_file}" 2>/dev/null
             ;;
         I)
             # IQ recording — no decode, just archive
@@ -102,10 +123,26 @@ decode_window() {
     fi
 }
 
+cleanup_old_wavs() {
+    # Find the largest window across all modes — that's how many wav files we need to keep.
+    local max_window=2
+    for mode in "${MODES[@]}"; do
+        local w="${mode:1}"
+        (( w > max_window )) && max_window="${w}"
+    done
+    # Keep max_window + 1 files as a buffer; delete everything older.
+    local keep=$(( max_window + 1 ))
+    find "${WD_RECORDING_DIR}" -maxdepth 1 -name '*.wav' -printf '%T@\t%p\n' 2>/dev/null | \
+        sort -rn | tail -n +$(( keep + 1 )) | cut -f2 | xargs -r rm -f
+    find "${WD_RECORDING_DIR}" -maxdepth 1 -name '*.json' -printf '%T@\t%p\n' 2>/dev/null | \
+        sort -rn | tail -n +$(( keep + 1 )) | cut -f2 | xargs -r rm -f
+}
+
 run_decode_cycle() {
     for mode in "${MODES[@]}"; do
         decode_window "${mode}" || true
     done
+    cleanup_old_wavs
 }
 
 # Main loop

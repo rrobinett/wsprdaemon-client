@@ -127,26 +127,18 @@ cp "${SCRIPT_DIR}/bin/wd-ka9q-record.py" "${INSTALL_DIR}/bin/wd-ka9q-record.py"
 # Install deps.conf so wd-ctl can resolve source-tree paths when installed
 cp "${SCRIPT_DIR}/deps.conf" "${INSTALL_DIR}/deps.conf"
 
-# Install decoder binaries (arch-specific)
-info "Installing decoder binaries (wsprd, jt9)..."
-ARCH=$(uname -m)
-case "${ARCH}" in
-    x86_64)
-        install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-x86-v27"   "${SBIN_DIR}/wsprd"
-        install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-x86-v27"     "${SBIN_DIR}/jt9"
-        ;;
-    aarch64)
-        install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-arm64-v27" "${SBIN_DIR}/wsprd"
-        install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-arm64-v27"   "${SBIN_DIR}/jt9"
-        ;;
-    armv7l|armhf)
-        install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-armhf-v26" "${SBIN_DIR}/wsprd"
-        install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-arm32-v26"   "${SBIN_DIR}/jt9"
-        ;;
-    *)
-        warn "Unknown architecture ${ARCH} — wsprd and jt9 not installed"
-        ;;
-esac
+# Install decoder binaries into /opt/wsprdaemon/bin/decoders/ (all arches).
+# wd-decode resolves the right binary at runtime via arch detection.
+# These are versioned project binaries — do NOT install to /usr/local/sbin/.
+info "Installing decoder binaries to ${INSTALL_DIR}/bin/decoders/..."
+mkdir -p "${INSTALL_DIR}/bin/decoders"
+install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-x86-v27"   "${INSTALL_DIR}/bin/decoders/"
+install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-arm64-v27" "${INSTALL_DIR}/bin/decoders/"
+install -m 755 "${SCRIPT_DIR}/bin/decoders/wsprd-armhf-v26" "${INSTALL_DIR}/bin/decoders/"
+install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-x86-v27"     "${INSTALL_DIR}/bin/decoders/"
+install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-x86-v26"     "${INSTALL_DIR}/bin/decoders/"
+install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-arm64-v27"   "${INSTALL_DIR}/bin/decoders/"
+install -m 755 "${SCRIPT_DIR}/bin/decoders/jt9-arm32-v26"   "${INSTALL_DIR}/bin/decoders/"
 
 # Install executables
 info "Installing executables to ${SBIN_DIR}..."

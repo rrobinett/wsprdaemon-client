@@ -19,7 +19,7 @@ User=wsprdaemon
 Group=radio
 EnvironmentFile=/etc/wsprdaemon/env/wd-decode@%i.env
 ExecStart=/usr/local/sbin/wd-decode
-WorkingDirectory=/var/spool/wsprdaemon/recording
+WorkingDirectory=/tmp
 
 Restart=always
 RestartSec=5
