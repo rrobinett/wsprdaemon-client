@@ -38,10 +38,6 @@ fi
 
 mkdir -p "${WD_POSTING_DIR}"
 
-# Persistent wsprd working directory — holds ALL_WSPR.TXT hash table across decode cycles.
-# Lives on tmpfs (/run) so it persists within a session but not across reboots.
-WSPRD_STATE_DIR="${WD_RUN_DIR}/wsprd/${WD_RECEIVER_NAME}/${WD_RECEIVER_BAND}"
-mkdir -p "${WSPRD_STATE_DIR}"
 readonly MAX_ALL_WSPR_SIZE=200000   # ~200KB — truncate when exceeded (v3 uses same limit)
 
 # Parse mode list (colon-separated: W2:F2:F5)
@@ -99,11 +95,6 @@ decode_window() {
         return 0  # Not on the correct cycle boundary for this mode
     fi
 
-    # Create temp directory for decode work
-    local work_dir
-    work_dir=$(mktemp -d "/tmp/wd-decode-${WD_RECEIVER_NAME}-${WD_RECEIVER_BAND}-XXXXXX")
-    trap "rm -rf '${work_dir}'" RETURN
-
     # Derive a WSPR-format timestamp filename (YYMMDD_HHMM.wav) so wsprd
     # embeds the correct date/time in ALL_WSPR.TXT output lines.
     # KA9Q filenames: 20260408T014800Z_7038600_usb.wav → 260408_0148
@@ -114,8 +105,11 @@ decode_window() {
         wspr_ts=$(date -u +%y%m%d_%H%M)
     fi
 
-    # Concatenate wav files with sox → 16-bit PCM
-    local concat_wav="${work_dir}/${wspr_ts}.wav"
+    # Concatenate wav files with sox → 16-bit PCM.
+    # Write directly into recording dir so wsprd's persistent files (ALL_WSPR.TXT,
+    # hashtable.txt, wspr_wisdom.dat) accumulate there across decode cycles — same
+    # behaviour as v3, which always ran wsprd in the recording directory.
+    local concat_wav="${WD_RECORDING_DIR}/${wspr_ts}.wav"
     # shellcheck disable=SC2086
     sox ${wav_files} -b 16 -e signed-integer "${concat_wav}" 2>/dev/null
 
@@ -125,7 +119,7 @@ decode_window() {
     fi
 
     # Run decoder based on prefix
-    local spots_file="${work_dir}/spots.txt"
+    local spots_file="${WD_RECORDING_DIR}/spots.txt"
     local freq_mhz
     freq_mhz=$(echo "scale=6; ${freq_hz}/1000000" | bc)
 
@@ -134,8 +128,8 @@ decode_window() {
             # wsprd appends new spots to ALL_WSPR.TXT (not stdout).
             # We diff before/after to find the newly added lines.
             # ALL_WSPR.TXT is also the decoder's hash table — it must persist across cycles.
-            local all_wspr="${WSPRD_STATE_DIR}/ALL_WSPR.TXT"
-            local all_wspr_save="${WSPRD_STATE_DIR}/ALL_WSPR.TXT.save"
+            local all_wspr="${WD_RECORDING_DIR}/ALL_WSPR.TXT"
+            local all_wspr_save="${WD_RECORDING_DIR}/ALL_WSPR.TXT.save"
 
             # Ensure the file exists, then sort and save the pre-decode state
             touch "${all_wspr}"
@@ -147,13 +141,13 @@ decode_window() {
             # -C 500: max decoder cycles/bit (v3 default, faster than 10000)
             # -o 4: OSD decoding depth 4 (v3 default)
             # -d: deeper search for weak signals
-            "${WSPRD_BIN}" -a "${WSPRD_STATE_DIR}" -c -C 500 -o 4 -d \
+            "${WSPRD_BIN}" -a "${WD_RECORDING_DIR}" -c -C 500 -o 4 -d \
                 -f "${freq_mhz}" "${concat_wav}" \
                 > /dev/null 2>&1 || true
 
             # Sort updated ALL_WSPR.TXT and diff to find new spots
-            sort -k1,2 -k5,5 "${all_wspr}" > "${WSPRD_STATE_DIR}/sort.tmp"
-            mv "${WSPRD_STATE_DIR}/sort.tmp" "${all_wspr}"
+            sort -k1,2 -k5,5 "${all_wspr}" > "${WD_RECORDING_DIR}/sort.tmp"
+            mv "${WD_RECORDING_DIR}/sort.tmp" "${all_wspr}"
             comm --nocheck-order -13 "${all_wspr_save}" "${all_wspr}" \
                 | sort -k1,2 -k5,5 > "${spots_file}" || true
 
@@ -161,8 +155,8 @@ decode_window() {
             local all_wspr_size
             all_wspr_size=$(stat -c%s "${all_wspr}" 2>/dev/null || echo 0)
             if (( all_wspr_size > MAX_ALL_WSPR_SIZE )); then
-                tail -c "${MAX_ALL_WSPR_SIZE}" "${all_wspr}" > "${WSPRD_STATE_DIR}/trunc.tmp"
-                mv "${WSPRD_STATE_DIR}/trunc.tmp" "${all_wspr}"
+                tail -c "${MAX_ALL_WSPR_SIZE}" "${all_wspr}" > "${WD_RECORDING_DIR}/trunc.tmp"
+                mv "${WD_RECORDING_DIR}/trunc.tmp" "${all_wspr}"
             fi
             ;;
         F)
@@ -172,13 +166,13 @@ decode_window() {
             # plotspec/decdata markers enable extended output to fst4_decodes.dat
             # Basic decoded spots (per run) go to decoded.txt.
             local period_sec=$(( window * 60 ))
-            touch "${work_dir}/plotspec" "${work_dir}/decdata"
-            "${JT9_BIN}" -a "${work_dir}" -t "${work_dir}" --fst4w \
+            touch "${WD_RECORDING_DIR}/plotspec" "${WD_RECORDING_DIR}/decdata"
+            "${JT9_BIN}" -a "${WD_RECORDING_DIR}" -t "${WD_RECORDING_DIR}" --fst4w \
                 -p "${period_sec}" -f 1500 -F 100 "${concat_wav}" \
-                > "${work_dir}/jt9_output.txt" 2>&1 || true
+                > "${WD_RECORDING_DIR}/jt9_output.txt" 2>&1 || true
             # decoded.txt has the basic spot lines from this run
-            if [[ -s "${work_dir}/decoded.txt" ]]; then
-                cp "${work_dir}/decoded.txt" "${spots_file}"
+            if [[ -s "${WD_RECORDING_DIR}/decoded.txt" ]]; then
+                cp "${WD_RECORDING_DIR}/decoded.txt" "${spots_file}"
             fi
             ;;
         I)
@@ -190,6 +184,10 @@ decode_window() {
             return 1
             ;;
     esac
+
+    # Remove the concatenated wav — it has served its purpose and should not
+    # be mistaken for an original KA9Q recording on the next decode cycle.
+    rm -f "${concat_wav}"
 
     # Move spots to posting directory if we got any
     if [[ -s "${spots_file}" ]]; then
