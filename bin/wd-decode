@@ -78,6 +78,27 @@ decode_window() {
         return 0  # Not enough files yet for this window
     fi
 
+    # Check that the first (oldest) file in the window starts on the correct
+    # UTC minute boundary for this mode:
+    #   W2, F2  → even minutes only        (minute % 2 == 0)
+    #   F5      → multiples of 5           (minute % 5 == 0)
+    #   F15     → multiples of 15          (minute % 15 == 0)
+    #   F30     → multiples of 30          (minute % 30 == 0)
+    # KA9Q filenames: 20260408T014800Z_... → minute = 48
+    local first_wav
+    first_wav="${wav_files%%$'\n'*}"
+    local fn_base
+    fn_base=$(basename "${first_wav}" .wav)
+    local first_minute
+    if [[ "${fn_base}" =~ ^20[0-9]{6}T[0-9]{2}([0-9]{2})[0-9]{2}Z ]]; then
+        first_minute="${BASH_REMATCH[1]}"
+    else
+        first_minute=$(date -u +%M)
+    fi
+    if (( 10#${first_minute} % window != 0 )); then
+        return 0  # Not on the correct cycle boundary for this mode
+    fi
+
     # Create temp directory for decode work
     local work_dir
     work_dir=$(mktemp -d "/tmp/wd-decode-${WD_RECEIVER_NAME}-${WD_RECEIVER_BAND}-XXXXXX")
@@ -86,11 +107,7 @@ decode_window() {
     # Derive a WSPR-format timestamp filename (YYMMDD_HHMM.wav) so wsprd
     # embeds the correct date/time in ALL_WSPR.TXT output lines.
     # KA9Q filenames: 20260408T014800Z_7038600_usb.wav → 260408_0148
-    local first_wav
-    first_wav="${wav_files%%$'\n'*}"  # first line without spawning a subshell pipe
     local wspr_ts
-    local fn_base
-    fn_base=$(basename "${first_wav}" .wav)
     if [[ "${fn_base}" =~ ^20([0-9]{6})T([0-9]{2})([0-9]{2})[0-9]{2}Z ]]; then
         wspr_ts="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
     else
