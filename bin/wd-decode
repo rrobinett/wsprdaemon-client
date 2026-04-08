@@ -188,11 +188,13 @@ decode_window() {
 
     # Move spots to posting directory if we got any
     if [[ -s "${spots_file}" ]]; then
+        local spot_count
+        spot_count=$(wc -l < "${spots_file}")
         local timestamp
         timestamp=$(date -u +%Y%m%d_%H%M%S)
         local dest="${WD_POSTING_DIR}/${WD_RECEIVER_NAME}_${WD_RECEIVER_BAND}_${mode}_${timestamp}_spots.txt"
         mv "${spots_file}" "${dest}"
-        echo "wd-decode: ${mode} → $(wc -l < "${dest}") spots → ${dest}"
+        echo "wd-decode: ${mode} → ${spot_count} spots → ${dest}"
     fi
 }
 
