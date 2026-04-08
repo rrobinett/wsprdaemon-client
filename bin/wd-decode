@@ -87,7 +87,7 @@ decode_window() {
     # embeds the correct date/time in ALL_WSPR.TXT output lines.
     # KA9Q filenames: 20260408T014800Z_7038600_usb.wav → 260408_0148
     local first_wav
-    first_wav=$(echo "${wav_files}" | head -1)
+    first_wav="${wav_files%%$'\n'*}"  # first line without spawning a subshell pipe
     local wspr_ts
     local fn_base
     fn_base=$(basename "${first_wav}" .wav)
