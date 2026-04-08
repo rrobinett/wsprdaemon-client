@@ -34,8 +34,15 @@ fi
 : "${WD_RECEIVER_FREQ_HZ:?}"
 : "${WD_RECORDING_DIR:?}"
 : "${WD_POSTING_DIR:?}"
+: "${WD_RUN_DIR:?}"
 
 mkdir -p "${WD_POSTING_DIR}"
+
+# Persistent wsprd working directory — holds ALL_WSPR.TXT hash table across decode cycles.
+# Lives on tmpfs (/run) so it persists within a session but not across reboots.
+WSPRD_STATE_DIR="${WD_RUN_DIR}/wsprd/${WD_RECEIVER_NAME}/${WD_RECEIVER_BAND}"
+mkdir -p "${WSPRD_STATE_DIR}"
+readonly MAX_ALL_WSPR_SIZE=200000   # ~200KB — truncate when exceeded (v3 uses same limit)
 
 # Parse mode list (colon-separated: W2:F2:F5)
 IFS=':' read -ra MODES <<< "${WD_RECEIVER_MODES}"
@@ -76,8 +83,22 @@ decode_window() {
     work_dir=$(mktemp -d "/tmp/wd-decode-${WD_RECEIVER_NAME}-${WD_RECEIVER_BAND}-XXXXXX")
     trap "rm -rf '${work_dir}'" RETURN
 
+    # Derive a WSPR-format timestamp filename (YYMMDD_HHMM.wav) so wsprd
+    # embeds the correct date/time in ALL_WSPR.TXT output lines.
+    # KA9Q filenames: 20260408T014800Z_7038600_usb.wav → 260408_0148
+    local first_wav
+    first_wav=$(echo "${wav_files}" | head -1)
+    local wspr_ts
+    local fn_base
+    fn_base=$(basename "${first_wav}" .wav)
+    if [[ "${fn_base}" =~ ^20([0-9]{6})T([0-9]{2})([0-9]{2})[0-9]{2}Z ]]; then
+        wspr_ts="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+    else
+        wspr_ts=$(date -u +%y%m%d_%H%M)
+    fi
+
     # Concatenate wav files with sox → 16-bit PCM
-    local concat_wav="${work_dir}/decode_input.wav"
+    local concat_wav="${work_dir}/${wspr_ts}.wav"
     # shellcheck disable=SC2086
     sox ${wav_files} -b 16 -e signed-integer "${concat_wav}" 2>/dev/null
 
@@ -93,10 +114,34 @@ decode_window() {
 
     case "${prefix}" in
         W)
-            # wsprd — WSPR-2 decoder; -a sets its working data dir (defaults to CWD)
-            # Filter out <DecodeFinished> marker (not a real spot)
-            "${WSPRD_BIN}" -a "${work_dir}" -f "${freq_mhz}" "${concat_wav}" 2>/dev/null \
-                | grep -v '^<' > "${spots_file}" || true
+            # wsprd appends new spots to ALL_WSPR.TXT (not stdout).
+            # We diff before/after to find the newly added lines.
+            # ALL_WSPR.TXT is also the decoder's hash table — it must persist across cycles.
+            local all_wspr="${WSPRD_STATE_DIR}/ALL_WSPR.TXT"
+            local all_wspr_save="${WSPRD_STATE_DIR}/ALL_WSPR.TXT.save"
+
+            # Ensure the file exists, then sort and save the pre-decode state
+            touch "${all_wspr}"
+            sort -k1,2 -k5,5 "${all_wspr}" > "${all_wspr_save}"
+            cp -p "${all_wspr_save}" "${all_wspr}"
+
+            # Run wsprd — appends new spots to ALL_WSPR.TXT
+            "${WSPRD_BIN}" -a "${WSPRD_STATE_DIR}" -f "${freq_mhz}" "${concat_wav}" \
+                > /dev/null 2>&1 || true
+
+            # Sort updated ALL_WSPR.TXT and diff to find new spots
+            sort -k1,2 -k5,5 "${all_wspr}" > "${WSPRD_STATE_DIR}/sort.tmp"
+            mv "${WSPRD_STATE_DIR}/sort.tmp" "${all_wspr}"
+            comm --nocheck-order -13 "${all_wspr_save}" "${all_wspr}" \
+                | sort -k1,2 -k5,5 > "${spots_file}" || true
+
+            # Truncate ALL_WSPR.TXT if it exceeds the size limit to prevent unbounded growth
+            local all_wspr_size
+            all_wspr_size=$(stat -c%s "${all_wspr}" 2>/dev/null || echo 0)
+            if (( all_wspr_size > MAX_ALL_WSPR_SIZE )); then
+                tail -c "${MAX_ALL_WSPR_SIZE}" "${all_wspr}" > "${WSPRD_STATE_DIR}/trunc.tmp"
+                mv "${WSPRD_STATE_DIR}/trunc.tmp" "${all_wspr}"
+            fi
             ;;
         F)
             # jt9 — FST4W decoder with period flag; -a/-t set data/temp dirs
