@@ -1,0 +1,29 @@
+# /etc/systemd/system/wd-upload-wsprdaemon@.service
+# Upload daemon — one instance per reporter CALL+GRID.
+# Bundles spot files from the wsprdaemon upload queue tree into a bzip2 tar
+# and FTPs it to graphs.wsprdaemon.org/upload/.
+#
+# Instance name = safe-call_grid (e.g. wd-upload-wsprdaemon@AC0G=B1_EM38ww.service)
+
+[Unit]
+Description=wsprdaemon.org uploader for %i
+After=network-online.target
+Wants=network-online.target
+PartOf=wsprdaemon.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-upload-wsprdaemon@%I.env
+ExecStart=/usr/local/sbin/wd-upload-wsprdaemon
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-upload-wsprdaemon@%i
+
+[Install]
+WantedBy=wsprdaemon.target

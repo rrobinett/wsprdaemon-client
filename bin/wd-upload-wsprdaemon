@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""wd-upload-wsprdaemon — upload WSPR spots to wsprdaemon.org via SFTP or FTP tar bundle.
+
+One instance per reporter CALL+GRID. Watches the upload queue tree for spot
+files produced by wd-post, bundles them (≤MAX_FILES) into a bzip2 tar, and
+uploads the bundle via SFTP (preferred) or FTP (fallback).
+
+SFTP protocol: puts file as uploads/NAME.tbz.part then renames to remove .part,
+matching the v3 convention so the server never processes a partial file.
+SFTP host key changes are handled automatically (ssh-keygen -R + retry with
+StrictHostKeyChecking=accept-new).
+
+On success: deletes processed files, removes empty directories.
+On failure: leaves files in queue and retries after RETRY_SECS.
+
+Environment variables:
+    WD_UPLOAD_WSPRDAEMON_DIR   Root of queue tree (e.g. .../wsprdaemon/AC0G=B1)
+    WD_RECEIVER_CALL           Reporter callsign (e.g. AC0G/B1)
+    WD_UPLOAD_ID               Tar file name prefix (e.g. AC0G_B1)
+    WD_VERSION                 Version string embedded in config (default: 4.0)
+    WD_BURST_THRESHOLD         File count for immediate upload (default: 15)
+
+    SFTP (primary — set WD_SFTP_SERVER to enable):
+    WD_SFTP_SERVER             user@host for SFTP upload (e.g. AC0G_B1@logs.wsprdaemon.org)
+    WD_SFTP_PATH               Remote directory for uploads (default: uploads)
+    WD_SFTP_CONNECT_TIMEOUT    Connection timeout seconds (default: 10)
+    WD_SFTP_XFER_TIMEOUT       Transfer timeout seconds (default: 90)
+
+    FTP (fallback when SFTP not configured or fails):
+    WD_FTP_SERVER              FTP hostname (default: graphs.wsprdaemon.org)
+    WD_FTP_USER                FTP username (default: noisegraphs)
+    WD_FTP_PASSWORD            FTP password (default: xahFie6g)
+    WD_FTP_PATH                FTP upload path (default: upload)
+
+    WD_MAX_FILES               Max spot files per tar bundle (default: 10000)
+"""
+
+import ftplib
+import io
+import logging
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+for _p in ['/opt/wsprdaemon/lib', str(_HERE.parent / 'lib')]:
+    if Path(_p).exists() and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+log = logging.getLogger('wd-upload-wsprdaemon')
+
+UPLOAD_DIR      = Path(os.environ['WD_UPLOAD_WSPRDAEMON_DIR'])
+REPORTER_CALL   = os.environ['WD_RECEIVER_CALL']       # e.g. AC0G/B1
+UPLOAD_ID       = os.environ.get('WD_UPLOAD_ID',
+                      REPORTER_CALL.replace('/', '_'))  # e.g. AC0G_B1
+VERSION         = os.environ.get('WD_VERSION', '4.0')
+
+# SFTP (primary, optional)
+SFTP_SERVER         = os.environ.get('WD_SFTP_SERVER', '')  # user@host; empty = disabled
+SFTP_PATH           = os.environ.get('WD_SFTP_PATH', 'uploads')
+SFTP_CONNECT_TIMEOUT = int(os.environ.get('WD_SFTP_CONNECT_TIMEOUT', '10'))
+SFTP_XFER_TIMEOUT   = int(os.environ.get('WD_SFTP_XFER_TIMEOUT', '90'))
+
+# FTP (fallback)
+FTP_SERVER      = os.environ.get('WD_FTP_SERVER', 'graphs.wsprdaemon.org')
+FTP_USER        = os.environ.get('WD_FTP_USER', 'noisegraphs')
+FTP_PASSWORD    = os.environ.get('WD_FTP_PASSWORD', 'xahFie6g')
+FTP_PATH        = os.environ.get('WD_FTP_PATH', 'upload')
+FTP_TIMEOUT     = 90          # seconds
+
+MAX_FILES       = int(os.environ.get('WD_MAX_FILES', '10000'))
+BURST_THRESHOLD = int(os.environ.get('WD_BURST_THRESHOLD', '15'))
+STABILITY_SECS  = 10          # file count must be stable before uploading
+CHECK_INTERVAL  = 2           # polling interval during stability check
+RETRY_SECS      = 60          # pause after network/server error
+UPLOAD_INTERVAL = 10          # minimum seconds between successful uploads
+
+
+# ---------------------------------------------------------------------------
+# File collection
+# ---------------------------------------------------------------------------
+
+def collect_files() -> list:
+    """Return all spot files in queue tree, sorted oldest-first."""
+    return sorted(UPLOAD_DIR.rglob('*_spots.txt'), key=lambda p: p.stat().st_mtime)
+
+
+# ---------------------------------------------------------------------------
+# Tar bundle creation
+# ---------------------------------------------------------------------------
+
+def _config_bytes() -> bytes:
+    """Create a minimal uploads_config.txt to include in the tar."""
+    lines = [
+        f'CLIENT_VERSION={VERSION}',
+        'UPLOADS_WSPRNET_LINE_FORMAT_VERSION=1',
+        'UPLOADS_WSPRDAEMON_SPOT_LINE_FORMAT_VERSION=2',
+        'SIGNAL_LEVEL_UPLOAD=yes',
+    ]
+    return '\n'.join(lines).encode() + b'\n'
+
+
+def build_tar(files: list, tar_path: Path) -> int:
+    """
+    Create a bzip2 tar at tar_path containing the given spot files.
+    Paths inside the tar are prefixed with 'wsprdaemon/' relative to UPLOAD_DIR.
+    Returns the total bytes of spot data included.
+    """
+    total_bytes = 0
+    with tarfile.open(tar_path, 'w:bz2') as tf:
+        # Include a minimal config file (matches v3 tar content)
+        cfg = _config_bytes()
+        ti = tarfile.TarInfo(name='wsprdaemon/uploads_config.txt')
+        ti.size = len(cfg)
+        ti.mtime = int(time.time())
+        tf.addfile(ti, io.BytesIO(cfg))
+
+        for f in files:
+            try:
+                rel = f.relative_to(UPLOAD_DIR)
+            except ValueError:
+                rel = Path(f.name)
+            arcname = f'wsprdaemon/{rel}'
+            try:
+                total_bytes += f.stat().st_size
+                tf.add(str(f), arcname=arcname, recursive=False)
+            except OSError as e:
+                log.warning('cannot add %s to tar: %s', f, e)
+
+    return total_bytes
+
+
+# ---------------------------------------------------------------------------
+# SFTP upload (primary, when WD_SFTP_SERVER is set)
+# ---------------------------------------------------------------------------
+
+def _sftp_batch_cmd(tar_path: Path, tar_name: str) -> bytes:
+    """Return the sftp batch commands for a .part-then-rename upload."""
+    part = f'{SFTP_PATH}/{tar_name}.part'
+    dest = f'{SFTP_PATH}/{tar_name}'
+    return f'put {tar_path} {part}\nrename {part} {dest}\n'.encode()
+
+
+def _run_sftp(batch_cmd: bytes, extra_opts: list = None) -> tuple:
+    """
+    Run sftp in batch mode. Returns (returncode, combined_output).
+    extra_opts: additional -o options (list of strings).
+    """
+    opts = extra_opts or []
+    cmd = [
+        'sftp', '-b', '-',
+        '-o', 'BatchMode=yes',
+        '-o', f'ConnectTimeout={SFTP_CONNECT_TIMEOUT}',
+    ]
+    for opt in opts:
+        cmd += ['-o', opt]
+    cmd.append(SFTP_SERVER)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=batch_cmd,
+            capture_output=True,
+            timeout=SFTP_XFER_TIMEOUT,
+        )
+        output = result.stdout + result.stderr
+        return result.returncode, output.decode(errors='replace')
+    except subprocess.TimeoutExpired:
+        return 1, 'sftp timed out'
+
+
+def _sftp_remove_host_key() -> None:
+    """Remove the SFTP server's entry from known_hosts (handles key rotation)."""
+    host = SFTP_SERVER.split('@')[-1]
+    subprocess.run(['ssh-keygen', '-f',
+                    str(Path.home() / '.ssh' / 'known_hosts'),
+                    '-R', host],
+                   capture_output=True)
+    # Also try removal by IP
+    try:
+        result = subprocess.run(['getent', 'hosts', host],
+                                capture_output=True, text=True, timeout=5)
+        ip = result.stdout.split()[0] if result.stdout.strip() else ''
+        if ip:
+            subprocess.run(['ssh-keygen', '-f',
+                            str(Path.home() / '.ssh' / 'known_hosts'),
+                            '-R', ip],
+                           capture_output=True)
+    except Exception:
+        pass
+
+
+_HOST_KEY_ERR = re.compile(
+    r'REMOTE HOST IDENTIFICATION HAS CHANGED|'
+    r'Host key verification failed|'
+    r'host key.*has changed',
+    re.I,
+)
+
+
+def sftp_put(tar_path: Path, tar_name: str) -> bool:
+    """
+    Upload via SFTP using .part-then-rename convention.
+    Handles host key changes automatically (one retry).
+    Returns True on success, False on failure.
+    """
+    batch = _sftp_batch_cmd(tar_path, tar_name)
+    rc, output = _run_sftp(batch)
+    if rc == 0:
+        return True
+
+    if _HOST_KEY_ERR.search(output):
+        log.warning('SFTP host key changed for %s — removing old key and retrying',
+                    SFTP_SERVER.split('@')[-1])
+        _sftp_remove_host_key()
+        rc, output = _run_sftp(batch, extra_opts=['StrictHostKeyChecking=accept-new'])
+        if rc == 0:
+            log.info('SFTP upload succeeded after host key update')
+            return True
+
+    log.warning('SFTP upload failed (rc=%d): %s', rc, output.strip()[-200:])
+    return False
+
+
+# ---------------------------------------------------------------------------
+# FTP upload (fallback)
+# ---------------------------------------------------------------------------
+
+def ftp_put(tar_path: Path, tar_name: str) -> None:
+    """Upload tar_path to FTP_SERVER/FTP_PATH/tar_name via anonymous-style FTP."""
+    with ftplib.FTP(timeout=FTP_TIMEOUT) as ftp:
+        ftp.connect(FTP_SERVER)
+        ftp.login(user=FTP_USER, passwd=FTP_PASSWORD)
+        ftp.set_pasv(True)
+        with tar_path.open('rb') as f:
+            ftp.storbinary(f'STOR {FTP_PATH}/{tar_name}', f)
+
+
+# ---------------------------------------------------------------------------
+# Upload dispatcher
+# ---------------------------------------------------------------------------
+
+def upload(tar_path: Path, tar_name: str) -> bool:
+    """
+    Try SFTP first (if configured), fall back to FTP.
+    Returns True on success.
+    """
+    if SFTP_SERVER:
+        log.info('attempting SFTP upload to %s', SFTP_SERVER)
+        if sftp_put(tar_path, tar_name):
+            log.info('SFTP upload successful')
+            return True
+        log.warning('SFTP failed — falling back to FTP')
+
+    try:
+        ftp_put(tar_path, tar_name)
+        log.info('FTP upload successful')
+        return True
+    except (ftplib.Error, OSError) as e:
+        log.warning('FTP upload failed: %s', e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+def remove_files(files: list) -> None:
+    """Delete uploaded spot files; prune now-empty directories."""
+    dirs_to_check = set()
+    for f in files:
+        try:
+            f.unlink(missing_ok=True)
+            dirs_to_check.add(f.parent)
+        except OSError as e:
+            log.warning('cannot remove %s: %s', f, e)
+
+    # Prune directories bottom-up (skip UPLOAD_DIR itself)
+    for d in sorted(dirs_to_check, key=lambda p: len(p.parts), reverse=True):
+        if d == UPLOAD_DIR:
+            continue
+        try:
+            d.rmdir()   # only succeeds if empty
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)sZ %(name)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
+    )
+    transport = f'SFTP({SFTP_SERVER})+FTP fallback' if SFTP_SERVER else 'FTP only'
+    log.info('starting: reporter %s  upload_id %s  transport: %s  queue: %s',
+             REPORTER_CALL, UPLOAD_ID, transport, UPLOAD_DIR)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        # Phase 1: wait for any files to appear
+        while not collect_files():
+            time.sleep(10)
+
+        # Phase 2: stability / burst check
+        prev_count = len(collect_files())
+        stable_since = time.monotonic()
+
+        while True:
+            time.sleep(CHECK_INTERVAL)
+            curr_count = len(collect_files())
+            if curr_count >= BURST_THRESHOLD:
+                log.info('burst threshold (%d files) — uploading immediately', curr_count)
+                break
+            if curr_count == prev_count:
+                if time.monotonic() - stable_since >= STABILITY_SECS:
+                    break
+            else:
+                prev_count = curr_count
+                stable_since = time.monotonic()
+
+        # Phase 3: collect files for this batch (up to MAX_FILES)
+        files = collect_files()
+        if len(files) > MAX_FILES:
+            log.info('capping batch: %d → %d files', len(files), MAX_FILES)
+            files = files[:MAX_FILES]
+
+        if not files:
+            time.sleep(10)
+            continue
+
+        # Phase 4: create tar bundle
+        ts = time.strftime('%y%m%d_%H%M_%S', time.gmtime())
+        tar_name = f'{UPLOAD_ID}_{ts}.tbz'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tar_path = Path(tmpdir) / tar_name
+            total_bytes = build_tar(files, tar_path)
+            tar_size = tar_path.stat().st_size
+
+            log.info('uploading %d files / %d spot-bytes → %s (%d tar bytes)',
+                     len(files), total_bytes, tar_name, tar_size)
+
+            # Phase 5: upload (SFTP preferred, FTP fallback)
+            if not upload(tar_path, tar_name):
+                log.warning('all upload methods failed — retrying in %ds', RETRY_SECS)
+                time.sleep(RETRY_SECS)
+                continue
+
+        log.info('upload complete — deleting %d source files', len(files))
+        remove_files(files)
+
+        time.sleep(UPLOAD_INTERVAL)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
