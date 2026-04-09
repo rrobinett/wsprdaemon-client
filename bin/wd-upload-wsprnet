@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""wd-upload-wsprnet — upload WSPR spots to wsprnet.org via MEPT bulk transfer.
+
+One instance per reporter CALL+GRID. Watches the upload queue directory for
+spot files produced by wd-post, batches them (≤999 spots), sorts by
+date/time/freq, and POSTs to http://wsprnet.org/meptspots.php.
+
+On success: deletes processed files, appends to /var/log/wspr.log.
+On failure: leaves files in queue and retries after RETRY_SECS.
+
+Environment variables:
+    WD_UPLOAD_WSPRNET_DIR   Queue directory to watch (e.g. .../wsprnet/AC0G=B1_EM38ww)
+    WD_RECEIVER_CALL        Reporter callsign (e.g. AC0G/B1)
+    WD_RECEIVER_GRID        Reporter grid (e.g. EM38ww)
+    WD_VERSION              Version string embedded in upload (default: 4.0)
+"""
+
+import os
+import sys
+import time
+import re
+import logging
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+for _p in ['/opt/wsprdaemon/lib', str(_HERE.parent / 'lib')]:
+    if Path(_p).exists() and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+log = logging.getLogger('wd-upload-wsprnet')
+
+UPLOAD_DIR     = Path(os.environ['WD_UPLOAD_WSPRNET_DIR'])
+REPORTER_CALL  = os.environ['WD_RECEIVER_CALL']   # e.g. AC0G/B1
+REPORTER_GRID  = os.environ['WD_RECEIVER_GRID']   # e.g. EM38ww
+VERSION        = os.environ.get('WD_VERSION', '4.0')
+
+WSPRNET_URL    = 'http://wsprnet.org/meptspots.php'
+WSPR_LOG       = Path('/var/log/wspr.log')
+MAX_SPOTS      = 999     # wsprnet limit per upload transaction
+DEBOUNCE_SECS  = 5       # wait after first file appears for more to arrive
+RETRY_SECS     = 60      # pause after a network/server error before retrying
+CYCLE_SECS     = 120     # minimum interval between uploads (one per WSPR cycle)
+UPLOAD_TIMEOUT = 300     # seconds before giving up on a POST
+
+
+# ---------------------------------------------------------------------------
+# HTTP multipart POST (stdlib only — no requests/curl dependency)
+# ---------------------------------------------------------------------------
+
+def _mept_post(spots_bytes: bytes) -> str:
+    """POST spots file to wsprnet.org/meptspots.php, return response body."""
+    boundary = b'--------WD4MeptBoundary'
+    crlf = b'\r\n'
+
+    def field(name: str, value: str) -> bytes:
+        return (
+            b'--' + boundary + crlf
+            + b'Content-Disposition: form-data; name="' + name.encode() + b'"' + crlf
+            + crlf
+            + value.encode() + crlf
+        )
+
+    body = (
+        field('version', f'WD_{VERSION}')
+        + field('call', REPORTER_CALL)
+        + field('grid', REPORTER_GRID)
+        + b'--' + boundary + crlf
+        + b'Content-Disposition: form-data; name="allmept"; filename="spots.txt"' + crlf
+        + b'Content-Type: text/plain' + crlf
+        + crlf
+        + spots_bytes + crlf
+        + b'--' + boundary + b'--' + crlf
+    )
+
+    req = urllib.request.Request(
+        WSPRNET_URL,
+        data=body,
+        headers={'Content-Type': 'multipart/form-data; boundary=' + boundary.decode()},
+        method='POST',
+    )
+    with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT) as resp:
+        return resp.read().decode(errors='replace')
+
+
+# ---------------------------------------------------------------------------
+# Spot file handling
+# ---------------------------------------------------------------------------
+
+def collect_files() -> list:
+    """Return spot files in queue sorted oldest-first."""
+    return sorted(UPLOAD_DIR.glob('*_spots.txt'), key=lambda p: p.stat().st_mtime)
+
+
+def _valid_spot(line: str) -> bool:
+    """Return True if line looks like a valid MEPT spot (YYMMDD HHMM ...)."""
+    p = line.split()
+    # Minimum 8 fields; first field must be a 6-digit date, second a 4-digit time
+    return (len(p) >= 8
+            and len(p[0]) == 6 and p[0].isdigit()
+            and len(p[1]) == 4 and p[1].isdigit())
+
+
+def read_batch(files: list) -> tuple:
+    """Read up to MAX_SPOTS valid lines from files. Returns (lines, included_files)."""
+    lines = []
+    included = []
+    for f in files:
+        try:
+            new = [l for l in f.read_text().splitlines()
+                   if l.strip() and _valid_spot(l)]
+        except OSError as e:
+            log.warning('cannot read %s: %s', f.name, e)
+            continue
+        if not new:
+            # File is empty or contains only malformed lines — discard it
+            f.unlink(missing_ok=True)
+            continue
+        if len(lines) + len(new) > MAX_SPOTS:
+            break
+        lines.extend(new)
+        included.append(f)
+    return lines, included
+
+
+def sort_spots(lines: list) -> list:
+    """Sort spots by date (col 1), time (col 2), frequency (col 5)."""
+    def key(line):
+        p = line.split()
+        try:
+            return (p[0], p[1], float(p[4]))
+        except (IndexError, ValueError):
+            return ('', '', 0.0)
+    return sorted(lines, key=key)
+
+
+def parse_response(response: str) -> tuple:
+    """Return (offered, added) from wsprnet response, or (None, None).
+
+    Handles known response formats:
+      "973 out of 995 spot(s) added"
+      "1 spot(s) added to database of 4 spot(s) offered"
+      "X spots added"
+    """
+    # "973 out of 995 spot(s) added"
+    m = re.search(r'(\d+)\s+out\s+of\s+(\d+)\s+spot', response, re.I)
+    if m:
+        return int(m.group(2)), int(m.group(1))
+    # "1 spot(s) added to database of 4 spot(s) offered"
+    m = re.search(r'(\d+)\s+spot.*?added.*?(\d+)\s+spot.*?offered', response, re.I | re.S)
+    if m:
+        return int(m.group(2)), int(m.group(1))
+    # "X spots added"
+    m = re.search(r'(\d+)\s+spots?\s+added', response, re.I)
+    if m:
+        return None, int(m.group(1))
+    return None, None
+
+
+def append_wspr_log(lines: list) -> None:
+    """Append uploaded spots to /var/log/wspr.log (KA9Q standard location)."""
+    try:
+        WSPR_LOG.touch(exist_ok=True)
+        with WSPR_LOG.open('a') as f:
+            f.write('\n'.join(lines) + '\n')
+    except OSError as e:
+        log.warning('cannot write %s: %s', WSPR_LOG, e)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)sZ %(name)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
+    )
+    log.info('starting: reporter %s %s  queue: %s', REPORTER_CALL, REPORTER_GRID, UPLOAD_DIR)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        files = collect_files()
+        if not files:
+            time.sleep(10)
+            continue
+
+        # Debounce — let wd-post finish dropping files for the current cycle
+        time.sleep(DEBOUNCE_SECS)
+        files = collect_files()
+
+        lines, included = read_batch(files)
+        if not lines:
+            time.sleep(10)
+            continue
+
+        sorted_lines = sort_spots(lines)
+        spots_bytes  = ('\n'.join(sorted_lines) + '\n').encode()
+
+        log.info('uploading %d spots from %d files', len(sorted_lines), len(included))
+
+        try:
+            response = _mept_post(spots_bytes)
+        except (urllib.error.URLError, OSError) as e:
+            log.warning('POST failed: %s — retrying in %ds', e, RETRY_SECS)
+            time.sleep(RETRY_SECS)
+            continue
+
+        # Parse and log outcome
+        if re.search(r'[Uu]pload limit.*reached', response):
+            log.warning('wsprnet rejected: upload limit reached — flushing %d files', len(included))
+        else:
+            offered, added = parse_response(response)
+            if offered is None and added is None:
+                log.warning('unparseable wsprnet response (flushing):\n%s', response[-300:])
+            elif added == 0:
+                log.warning('wsprnet accepted 0/%s spots', offered)
+            else:
+                log.info('wsprnet accepted %s/%s spots', added, offered)
+
+        append_wspr_log(sorted_lines)
+
+        for f in included:
+            f.unlink(missing_ok=True)
+
+        # Rate-limit: wsprnet allows one upload per 2-minute WSPR cycle.
+        # Sleep until the next even-UTC-minute + 10s (matches v3 behaviour).
+        now = time.gmtime()
+        secs_into_cycle = (now.tm_min % 2) * 60 + now.tm_sec
+        wait = (CYCLE_SECS - secs_into_cycle + 10) % CYCLE_SECS
+        if wait < 10:
+            wait += CYCLE_SECS
+        log.info('waiting %ds until next upload window', wait)
+        time.sleep(wait)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

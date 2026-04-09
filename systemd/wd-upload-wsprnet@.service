@@ -1,0 +1,29 @@
+# /etc/systemd/system/wd-upload-wsprnet@.service
+# Upload daemon — one instance per reporter CALL+GRID.
+# Batches spot files from the wsprnet upload queue and POSTs them to
+# wsprnet.org/meptspots.php (MEPT bulk transfer).
+#
+# Instance name = safe-call_grid (e.g. wd-upload-wsprnet@AC0G=B1_EM38ww.service)
+
+[Unit]
+Description=wsprdaemon wsprnet uploader for %i
+After=network-online.target
+Wants=network-online.target
+PartOf=wsprdaemon.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=radio
+EnvironmentFile=/etc/wsprdaemon/env/wd-upload-wsprnet@%I.env
+ExecStart=/usr/local/sbin/wd-upload-wsprnet
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-upload-wsprnet@%i
+
+[Install]
+WantedBy=wsprdaemon.target
