@@ -39,7 +39,9 @@ VERSION        = os.environ.get('WD_VERSION', '4.0')
 WSPRNET_URL    = 'http://wsprnet.org/meptspots.php'
 WSPR_LOG       = Path('/var/log/wspr.log')
 MAX_SPOTS      = 999     # wsprnet limit per upload transaction
-DEBOUNCE_SECS  = 5       # wait after first file appears for more to arrive
+STABILITY_SECS = 10      # file count must be stable for this long before uploading
+CHECK_INTERVAL = 2       # polling interval during stability check
+BURST_THRESHOLD = int(os.environ.get('WD_BURST_THRESHOLD', '15'))  # bypass stability if ≥ this many files
 RETRY_SECS     = 60      # pause after a network/server error before retrying
 CYCLE_SECS     = 120     # minimum interval between uploads (one per WSPR cycle)
 UPLOAD_TIMEOUT = 300     # seconds before giving up on a POST
@@ -182,15 +184,31 @@ def main() -> int:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     while True:
-        files = collect_files()
-        if not files:
+        # Phase 1: wait for any files to appear
+        while not collect_files():
             time.sleep(10)
-            continue
 
-        # Debounce — let wd-post finish dropping files for the current cycle
-        time.sleep(DEBOUNCE_SECS)
+        # Phase 2: stability / burst check
+        # Upload immediately if file count >= BURST_THRESHOLD (backlog clearing).
+        # Otherwise wait until file count has been stable for STABILITY_SECS
+        # (ensures all bands' spot files for the current cycle have landed).
+        prev_count = len(collect_files())
+        stable_since = time.monotonic()
+
+        while True:
+            time.sleep(CHECK_INTERVAL)
+            curr_count = len(collect_files())
+            if curr_count >= BURST_THRESHOLD:
+                log.info('burst threshold (%d files) reached — uploading immediately', curr_count)
+                break
+            if curr_count == prev_count:
+                if time.monotonic() - stable_since >= STABILITY_SECS:
+                    break
+            else:
+                prev_count = curr_count
+                stable_since = time.monotonic()
+
         files = collect_files()
-
         lines, included = read_batch(files)
         if not lines:
             time.sleep(10)
