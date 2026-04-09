@@ -166,13 +166,26 @@ decode_window() {
             # plotspec/decdata markers enable extended output to fst4_decodes.dat
             # Basic decoded spots (per run) go to decoded.txt.
             local period_sec=$(( window * 60 ))
+            # Date/time from wav filename for wsprnet format output
+            local spot_date="${wspr_ts:0:6}"   # YYMMDD
+            local spot_time="${wspr_ts:7:4}"   # HHMM
             touch "${WD_RECORDING_DIR}/plotspec" "${WD_RECORDING_DIR}/decdata"
             "${JT9_BIN}" -a "${WD_RECORDING_DIR}" -t "${WD_RECORDING_DIR}" --fst4w \
                 -p "${period_sec}" -f 1500 -F 100 "${concat_wav}" \
                 > "${WD_RECORDING_DIR}/jt9_output.txt" 2>&1 || true
-            # decoded.txt has the basic spot lines from this run
+            # Convert decoded.txt to wsprnet MEPT format.
+            # decoded.txt fields: HHMM ? SNR DT freq_hz ? CALL GRID PWR MODE
+            # Output:  YYMMDD HHMM SNR DT FREQ_MHz CALL GRID PWR 0...0 MODE
+            # RF_MHz = (receiver_center_hz + audio_offset_hz) / 1e6
             if [[ -s "${WD_RECORDING_DIR}/decoded.txt" ]]; then
-                cp "${WD_RECORDING_DIR}/decoded.txt" "${spots_file}"
+                awk -v date="${spot_date}" -v time="${spot_time}" \
+                    -v freq_hz="${WD_RECEIVER_FREQ_HZ}" \
+                    -v mode="${mode}" \
+                    'NF >= 9 {
+                        rf_mhz = (freq_hz + $5) / 1000000
+                        printf "%6s %4s %3d %s %11.6f  %-14s %-4s %2d  0  0.00  0  0    0  0   0     0     0  %s\n",
+                            date, time, $3, $4, rf_mhz, $7, $8, $9, mode
+                    }' "${WD_RECORDING_DIR}/decoded.txt" > "${spots_file}"
             fi
             ;;
         I)
