@@ -197,10 +197,13 @@ decode_window() {
 
             local fst4_dat="${WD_RECORDING_DIR}/fst4_decodes.dat"
 
-            # Record last spot seen in fst4_decodes.dat so we can extract only new spots
-            local last_spot=""
+            # Record the current line count so we can extract only lines jt9 appends.
+            # Using a line count is unambiguous; grep-by-content would match the first
+            # occurrence of an identical line (possible when the same spot recurs across
+            # cycles) and silently drop spots between that match and the true tail.
+            local last_line=0
             if [[ -s "${fst4_dat}" ]]; then
-                last_spot=$(tail -n 1 "${fst4_dat}")
+                last_line=$(wc -l < "${fst4_dat}")
             fi
 
             touch "${WD_RECORDING_DIR}/plotspec" "${WD_RECORDING_DIR}/decdata"
@@ -220,14 +223,9 @@ decode_window() {
                 # Fix lines where the sync field overflows its column width (rare)
                 sed 's/\*\*\*\*\*\*\*\*\*/999999.99/' "${fst4_dat}" > "${fst4_dat}.fixed"
 
-                # Extract only spots added by this decode run
+                # Extract only lines appended by this decode run
                 local new_spots="${WD_RECORDING_DIR}/fst4_new.tmp"
-                if [[ -n "${last_spot}" ]]; then
-                    grep -A 999999 -F "${last_spot}" "${fst4_dat}.fixed" 2>/dev/null \
-                        | tail -n +2 > "${new_spots}" || true
-                else
-                    cp "${fst4_dat}.fixed" "${new_spots}"
-                fi
+                tail -n +"$((last_line + 1))" "${fst4_dat}.fixed" > "${new_spots}" || true
                 rm -f "${fst4_dat}.fixed"
 
                 # Format to 11-field wsprnet MEPT, filtering hashed unknown calls
@@ -310,11 +308,13 @@ run_decode_cycle() {
 if ${use_inotify}; then
     echo "wd-decode: using inotifywait for ${WD_RECEIVER_TYPE} source"
     while true; do
-        # wspr-recorder writes .wav.tmp then renames → MOVED_TO .wav,
-        # then writes a .json sidecar via CLOSE_WRITE. Trigger on either
-        # so the decode fires once the wav is fully in place.
-        inotifywait -q -e moved_to -e close_write -t 120 "${WD_RECORDING_DIR}" \
-            --include '\.(wav|json)$' >/dev/null 2>&1 || true
+        # ka9q-radio writes .wav.tmp then renames → MOVED_TO .wav.
+        # Trigger only on the rename so we fire exactly once per wav file.
+        # Watching json close_write would double-trigger every cycle (wav rename
+        # fires first, then the json sidecar close_write fires a second time),
+        # causing alternate cycles to produce near-zero spots.
+        inotifywait -q -e moved_to -t 120 "${WD_RECORDING_DIR}" \
+            --include '\.wav$' >/dev/null 2>&1 || true
         run_decode_cycle
     done
 else

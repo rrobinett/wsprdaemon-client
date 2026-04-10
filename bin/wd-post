@@ -25,16 +25,28 @@ WSPRDAEMON_DIR="${WD_UPLOAD_WSPRDAEMON_DIR:-}"
 [[ -n "${WSPRDAEMON_DIR}" ]] && mkdir -p "${WSPRDAEMON_DIR}"
 
 while true; do
-    # Watch for spot files using inotifywait
-    inotifywait -q -e close_write -t 120 "${WD_POSTING_DIR}" --include '_spots\.txt$' >/dev/null 2>&1 || true
+    # wd-decode delivers spot files via mv (rename), which generates moved_to,
+    # NOT close_write. Watch moved_to so we wake up immediately when a file lands.
+    # Also watch close_write for any case where files are written directly.
+    # Timeout of 120s ensures we still process files even if inotify misses one.
+    inotifywait -q -e moved_to -e close_write -t 120 "${WD_POSTING_DIR}" \
+        --include '_spots\.txt$' >/dev/null 2>&1 || true
 
-    # Process any spot files in the posting directory
+    # Process all spot files currently in the posting directory
     shopt -s nullglob
     spot_files=("${WD_POSTING_DIR}"/*_spots.txt)
     shopt -u nullglob
 
     for spot_file in "${spot_files[@]}"; do
         if [[ ! -s "${spot_file}" ]]; then
+            rm -f "${spot_file}"
+            continue
+        fi
+
+        # Drop stale files older than 10 minutes — they missed their upload window
+        local_age=$(( $(date -u +%s) - $(stat -c %Y "${spot_file}") ))
+        if (( local_age > 600 )); then
+            echo "wd-post: dropping stale spot file (${local_age}s old): $(basename "${spot_file}")"
             rm -f "${spot_file}"
             continue
         fi
