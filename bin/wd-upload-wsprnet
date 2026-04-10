@@ -8,11 +8,19 @@ date/time/freq, and POSTs to http://wsprnet.org/meptspots.php.
 On success: deletes processed files, appends to /var/log/wspr.log.
 On failure: leaves files in queue and retries after RETRY_SECS.
 
+Polls the queue directory every WD_POLL_INTERVAL seconds (default 10).
+Uploads immediately after WD_STABLE_POLLS consecutive polls with no new files
+(default 2), so upload fires ~20 seconds after the last spot file lands.
+No coupling to the 2-minute WSPR cycle — returns to polling immediately after
+each upload.
+
 Environment variables:
     WD_UPLOAD_WSPRNET_DIR   Queue directory to watch (e.g. .../wsprnet/AC0G=B1_EM38ww)
     WD_RECEIVER_CALL        Reporter callsign (e.g. AC0G/B1)
     WD_RECEIVER_GRID        Reporter grid (e.g. EM38ww)
     WD_VERSION              Version string embedded in upload (default: 4.0)
+    WD_POLL_INTERVAL        Seconds between queue polls (default: 10)
+    WD_STABLE_POLLS         Consecutive no-change polls before upload (default: 2)
 """
 
 import os
@@ -40,11 +48,9 @@ VERSION        = os.environ.get('WD_VERSION', '4.0')
 WSPRNET_URL    = 'http://wsprnet.org/meptspots.php'
 WSPR_LOG       = Path('/var/log/wspr.log')
 MAX_SPOTS      = 999     # wsprnet limit per upload transaction
-STABILITY_SECS = 10      # file count must be stable for this long before uploading
-CHECK_INTERVAL = 2       # polling interval during stability check
-BURST_THRESHOLD = int(os.environ.get('WD_BURST_THRESHOLD', '15'))  # bypass stability if ≥ this many files
+POLL_INTERVAL  = int(os.environ.get('WD_POLL_INTERVAL', '10'))   # seconds between queue polls
+STABLE_POLLS   = int(os.environ.get('WD_STABLE_POLLS', '2'))     # consecutive no-change polls → upload
 RETRY_SECS     = 60      # pause after a network/server error before retrying
-CYCLE_SECS     = 120     # minimum interval between uploads (one per WSPR cycle)
 UPLOAD_TIMEOUT = 300     # seconds before giving up on a POST
 ARCHIVE_DIR    = Path(os.environ.get('WD_UPLOAD_ARCHIVE_DIR',
                        '/var/log/wsprdaemon/wsprnet-uploads'))
@@ -206,35 +212,38 @@ def main() -> int:
     log.info('starting: reporter %s %s  queue: %s', REPORTER_CALL, REPORTER_GRID, UPLOAD_DIR)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+    prev_count = 0
+    stable_count = 0
+
     while True:
-        # Phase 1: wait for any files to appear
-        while not collect_files():
-            time.sleep(10)
+        time.sleep(POLL_INTERVAL)
+        curr_count = len(collect_files())
 
-        # Phase 2: stability / burst check
-        # Upload immediately if file count >= BURST_THRESHOLD (backlog clearing).
-        # Otherwise wait until file count has been stable for STABILITY_SECS
-        # (ensures all bands' spot files for the current cycle have landed).
-        prev_count = len(collect_files())
-        stable_since = time.monotonic()
+        if curr_count == 0:
+            # Nothing in queue — reset and keep polling
+            prev_count = 0
+            stable_count = 0
+            continue
 
-        while True:
-            time.sleep(CHECK_INTERVAL)
-            curr_count = len(collect_files())
-            if curr_count >= BURST_THRESHOLD:
-                log.info('burst threshold (%d files) reached — uploading immediately', curr_count)
-                break
-            if curr_count == prev_count:
-                if time.monotonic() - stable_since >= STABILITY_SECS:
-                    break
-            else:
-                prev_count = curr_count
-                stable_since = time.monotonic()
+        if curr_count == prev_count:
+            stable_count += 1
+            if stable_count < STABLE_POLLS:
+                continue
+            # STABLE_POLLS consecutive polls with no new files → upload now
+        else:
+            # New files arrived — reset stability counter and keep polling
+            log.debug('queue grew %d → %d files, polling', prev_count, curr_count)
+            prev_count = curr_count
+            stable_count = 0
+            continue
 
+        # Queue is stable: collect, batch, upload
         files = collect_files()
         lines, included = read_batch(files)
+        prev_count = 0
+        stable_count = 0
+
         if not lines:
-            time.sleep(10)
             continue
 
         sorted_lines = sort_spots(lines)
@@ -266,16 +275,6 @@ def main() -> int:
 
         for f in included:
             f.unlink(missing_ok=True)
-
-        # Rate-limit: wsprnet allows one upload per 2-minute WSPR cycle.
-        # Sleep until the next even-UTC-minute + 10s (matches v3 behaviour).
-        now = time.gmtime()
-        secs_into_cycle = (now.tm_min % 2) * 60 + now.tm_sec
-        wait = (CYCLE_SECS - secs_into_cycle + 10) % CYCLE_SECS
-        if wait < 10:
-            wait += CYCLE_SECS
-        log.info('waiting %ds until next upload window', wait)
-        time.sleep(wait)
 
 
 if __name__ == '__main__':
