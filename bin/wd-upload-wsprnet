@@ -131,11 +131,13 @@ def read_batch(files: list) -> tuple:
 
 
 def sort_spots(lines: list) -> list:
-    """Sort spots by date (col 1), time (col 2), frequency (col 5)."""
+    """Sort spots by date (col 1), time (col 2), frequency (col 6).
+    11-field wsprnet MEPT format: date time sync snr dt freq call grid power drift ntype
+    """
     def key(line):
         p = line.split()
         try:
-            return (p[0], p[1], float(p[4]))
+            return (p[0], p[1], float(p[5]))
         except (IndexError, ValueError):
             return ('', '', 0.0)
     return sorted(lines, key=key)

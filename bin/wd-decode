@@ -131,6 +131,9 @@ decode_window() {
             local all_wspr="${WD_RECORDING_DIR}/ALL_WSPR.TXT"
             local all_wspr_save="${WD_RECORDING_DIR}/ALL_WSPR.TXT.save"
 
+            # wsprnet ntype for WSPR: window minutes (2 or 15)
+            local wn_type="${window}"
+
             # Ensure the file exists, then sort and save the pre-decode state
             touch "${all_wspr}"
             sort -k1,2 -k5,5 "${all_wspr}" > "${all_wspr_save}"
@@ -145,11 +148,23 @@ decode_window() {
                 -f "${freq_mhz}" "${concat_wav}" \
                 > /dev/null 2>&1 || true
 
-            # Sort updated ALL_WSPR.TXT and diff to find new spots
+            # Sort updated ALL_WSPR.TXT and diff to find new spots, then convert
+            # to 11-field wsprnet MEPT format:
+            #   date time sync snr dt freq call grid power drift ntype
+            # ALL_WSPR.TXT fields (v2.2+ wsprd, 17 fields with grid, 16 without):
+            #   $1=date $2=time $3=snr $4=dt $5=freq $6=call $7=grid $8=pwr $9=drift $10=sync ...
+            #   (no-grid variant: $6=call $7=pwr $8=drift $9=sync — 16 fields)
             sort -k1,2 -k5,5 "${all_wspr}" > "${WD_RECORDING_DIR}/sort.tmp"
             mv "${WD_RECORDING_DIR}/sort.tmp" "${all_wspr}"
             comm --nocheck-order -13 "${all_wspr_save}" "${all_wspr}" \
-                | sort -k1,2 -k5,5 > "${spots_file}" || true
+                | sort -k1,2 -k5,5 \
+                | grep -v '<\.\.\.>' \
+                | awk -v wn_type="${wn_type}" '
+                    NF >= 17 { printf "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d\n",
+                                   $1,$2,$10,$3,$4,$5,$6,$7,$8,$9,wn_type; next }
+                    NF == 16 { printf "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d\n",
+                                   $1,$2,$9,$3,$4,$5,$6,"      ",$7,$8,wn_type; next }
+                ' > "${spots_file}" || true
 
             # Truncate ALL_WSPR.TXT if it exceeds the size limit to prevent unbounded growth
             local all_wspr_size
@@ -163,29 +178,84 @@ decode_window() {
             # jt9 FST4W decoder.
             # -f 1500: audio center frequency offset in Hz (not RF MHz)
             # -F 100: +/- 100 Hz search tolerance
-            # plotspec/decdata markers enable extended output to fst4_decodes.dat
-            # Basic decoded spots (per run) go to decoded.txt.
+            # Presence of plotspec/decdata marker files in working dir instructs jt9
+            # to write high-resolution spot data to fst4_decodes.dat.
             local period_sec=$(( window * 60 ))
-            # Date/time from wav filename for wsprnet format output
             local spot_date="${wspr_ts:0:6}"   # YYMMDD
             local spot_time="${wspr_ts:7:4}"   # HHMM
+
+            # wsprnet ntype for FST4W (v3 convention: window_minutes + 1 except 5→5, 15→15, 30→30)
+            # Specifically: F2→3, F5→5, F15→15, F30→30
+            local wn_type
+            case "${window}" in
+                2)  wn_type=3  ;;
+                5)  wn_type=5  ;;
+                15) wn_type=15 ;;
+                30) wn_type=30 ;;
+                *)  wn_type=3  ;;
+            esac
+
+            local fst4_dat="${WD_RECORDING_DIR}/fst4_decodes.dat"
+
+            # Record last spot seen in fst4_decodes.dat so we can extract only new spots
+            local last_spot=""
+            if [[ -s "${fst4_dat}" ]]; then
+                last_spot=$(tail -n 1 "${fst4_dat}")
+            fi
+
             touch "${WD_RECORDING_DIR}/plotspec" "${WD_RECORDING_DIR}/decdata"
             "${JT9_BIN}" -a "${WD_RECORDING_DIR}" -t "${WD_RECORDING_DIR}" --fst4w \
                 -p "${period_sec}" -f 1500 -F 100 "${concat_wav}" \
                 > "${WD_RECORDING_DIR}/jt9_output.txt" 2>&1 || true
-            # Convert decoded.txt to wsprnet MEPT format.
-            # decoded.txt fields: HHMM ? SNR DT freq_hz ? CALL GRID PWR MODE
-            # Output:  YYMMDD HHMM SNR DT FREQ_MHz CALL GRID PWR 0...0 MODE
-            # RF_MHz = (receiver_center_hz + audio_offset_hz) / 1e6
-            if [[ -s "${WD_RECORDING_DIR}/decoded.txt" ]]; then
-                awk -v date="${spot_date}" -v time="${spot_time}" \
-                    -v freq_hz="${WD_RECEIVER_FREQ_HZ}" \
-                    -v mode="${mode}" \
-                    'NF >= 9 {
-                        rf_mhz = (freq_hz + $5) / 1000000
-                        printf "%6s %4s %3d %s %11.6f  %-14s %-4s %2d  0  0.00  0  0    0  0   0     0     0  %s\n",
-                            date, time, $3, $4, rf_mhz, $7, $8, $9, mode
-                    }' "${WD_RECORDING_DIR}/decoded.txt" > "${spots_file}"
+
+            # Extract new high-resolution spots from fst4_decodes.dat.
+            # fst4_decodes.dat fields (from v3/Gwyn G3ZIL documentation):
+            #   $1=HHMMSS $2=icand $3=itry $4=nsyncoh $5=iaptype $6=ijitter
+            #   $7=npct $8=ntype $9=Keff(66) $10=nsync_qual(sync) $11=nharderrors
+            #   $12=dmin $13=nhp $14=hd $15=sync_power $16=xsnr $17=xdt $18=fsig_hz
+            #   $19=w50 $20=call $21=grid(or power if no grid) $22=power(if grid present)
+            # Output: 11-field wsprnet MEPT format
+            #   date time sync snr dt freq call grid power drift ntype
+            if [[ -s "${fst4_dat}" ]]; then
+                # Fix lines where the sync field overflows its column width (rare)
+                sed 's/\*\*\*\*\*\*\*\*\*/999999.99/' "${fst4_dat}" > "${fst4_dat}.fixed"
+
+                # Extract only spots added by this decode run
+                local new_spots="${WD_RECORDING_DIR}/fst4_new.tmp"
+                if [[ -n "${last_spot}" ]]; then
+                    grep -A 999999 -F "${last_spot}" "${fst4_dat}.fixed" 2>/dev/null \
+                        | tail -n +2 > "${new_spots}" || true
+                else
+                    cp "${fst4_dat}.fixed" "${new_spots}"
+                fi
+                rm -f "${fst4_dat}.fixed"
+
+                # Format to 11-field wsprnet MEPT, filtering hashed unknown calls
+                grep -v '<\.\.\.>' "${new_spots}" 2>/dev/null \
+                    | awk -v date="${spot_date}" -v time="${spot_time}" \
+                          -v freq_hz="${WD_RECEIVER_FREQ_HZ}" \
+                          -v wn_type="${wn_type}" '
+                        NF == 22 {
+                            rf_mhz = (freq_hz + $18) / 1000000
+                            printf "%-6s %4s %5.1f %3.0f %5.2f %12.7f %-14s %-6s %2d  0 %4d\n",
+                                date, time, $10, $16, $17, rf_mhz, $20, $21, $22, wn_type
+                        }
+                        NF == 21 {
+                            # No grid locator: $20=call $21=power
+                            rf_mhz = (freq_hz + $18) / 1000000
+                            printf "%-6s %4s %5.1f %3.0f %5.2f %12.7f %-14s %-6s %2d  0 %4d\n",
+                                date, time, $10, $16, $17, rf_mhz, $20, "      ", $21, wn_type
+                        }
+                    ' > "${spots_file}" || true
+                rm -f "${new_spots}"
+
+                # Truncate fst4_decodes.dat to ~100 KB to prevent unbounded growth
+                local fst4_size
+                fst4_size=$(stat -c%s "${fst4_dat}" 2>/dev/null || echo 0)
+                if (( fst4_size > 100000 )); then
+                    tail -c 100000 "${fst4_dat}" > "${fst4_dat}.tmp"
+                    mv "${fst4_dat}.tmp" "${fst4_dat}"
+                fi
             fi
             ;;
         I)
