@@ -22,6 +22,7 @@ import re
 import logging
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -45,6 +46,9 @@ BURST_THRESHOLD = int(os.environ.get('WD_BURST_THRESHOLD', '15'))  # bypass stab
 RETRY_SECS     = 60      # pause after a network/server error before retrying
 CYCLE_SECS     = 120     # minimum interval between uploads (one per WSPR cycle)
 UPLOAD_TIMEOUT = 300     # seconds before giving up on a POST
+ARCHIVE_DIR    = Path(os.environ.get('WD_UPLOAD_ARCHIVE_DIR',
+                       '/var/log/wsprdaemon/wsprnet-uploads'))
+ARCHIVE_KEEP   = int(os.environ.get('WD_UPLOAD_ARCHIVE_KEEP', '96'))  # ~3.2 hours of cycles
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +164,23 @@ def parse_response(response: str) -> tuple:
     return None, None
 
 
+def archive_batch(spots_bytes: bytes, n_spots: int, n_files: int) -> None:
+    """Save the spot payload to ARCHIVE_DIR for post-hoc inspection, then rotate."""
+    try:
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        archive_file = ARCHIVE_DIR / f'{ts}_{n_spots}spots_{n_files}files.txt'
+        archive_file.write_bytes(spots_bytes)
+        log.info('archived batch to %s', archive_file)
+
+        # Rotate: keep only the newest ARCHIVE_KEEP files
+        archives = sorted(ARCHIVE_DIR.glob('*.txt'))
+        for old in archives[:-ARCHIVE_KEEP]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning('archive failed: %s', e)
+
+
 def append_wspr_log(lines: list) -> None:
     """Append uploaded spots to /var/log/wspr.log (KA9Q standard location)."""
     try:
@@ -218,6 +239,7 @@ def main() -> int:
         spots_bytes  = ('\n'.join(sorted_lines) + '\n').encode()
 
         log.info('uploading %d spots from %d files', len(sorted_lines), len(included))
+        archive_batch(spots_bytes, len(sorted_lines), len(included))
 
         try:
             response = _mept_post(spots_bytes)
