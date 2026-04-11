@@ -105,6 +105,11 @@ decode_window() {
         wspr_ts=$(date -u +%y%m%d_%H%M)
     fi
 
+    # Start timing — logged at the end of the decode so we can see
+    # exactly when each mode finishes and how long it took.
+    local t_decode_start
+    t_decode_start=$(date +%s)
+
     # Concatenate wav files with sox → 16-bit PCM.
     # Write directly into recording dir so wsprd's persistent files (ALL_WSPR.TXT,
     # hashtable.txt, wspr_wisdom.dat) accumulate there across decode cycles — same
@@ -270,7 +275,8 @@ decode_window() {
     # be mistaken for an original KA9Q recording on the next decode cycle.
     rm -f "${concat_wav}"
 
-    # Move spots to posting directory if we got any
+    # Move spots to posting directory; log result either way with elapsed time.
+    local elapsed=$(( $(date +%s) - t_decode_start ))
     if [[ -s "${spots_file}" ]]; then
         local spot_count
         spot_count=$(wc -l < "${spots_file}")
@@ -278,7 +284,9 @@ decode_window() {
         timestamp=$(date -u +%Y%m%d_%H%M%S)
         local dest="${WD_POSTING_DIR}/${WD_RECEIVER_NAME}_${WD_RECEIVER_BAND}_${mode}_${timestamp}_spots.txt"
         mv "${spots_file}" "${dest}"
-        echo "wd-decode: ${mode} → ${spot_count} spots → ${dest}"
+        echo "DECODE DONE  band=${WD_RECEIVER_BAND} mode=${mode} cycle=${wspr_ts} spots=${spot_count} elapsed=${elapsed}s"
+    else
+        echo "DECODE DONE  band=${WD_RECEIVER_BAND} mode=${mode} cycle=${wspr_ts} spots=0 elapsed=${elapsed}s"
     fi
 }
 

@@ -185,7 +185,6 @@ def archive_batch(spots_bytes: bytes, n_spots: int, n_files: int) -> None:
         ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         archive_file = ARCHIVE_DIR / f'{ts}_{n_spots}spots_{n_files}files.txt'
         archive_file.write_bytes(spots_bytes)
-        log.info('archived batch to %s', archive_file)
 
         # Rotate: keep only the newest ARCHIVE_KEEP files
         archives = sorted(ARCHIVE_DIR.glob('*.txt'))
@@ -292,31 +291,33 @@ def main() -> int:
         sorted_lines = sort_spots(lines)
         spots_bytes  = ('\n'.join(sorted_lines) + '\n').encode()
 
-        log.info('uploading %d spots for cycle %s %s (%d files)',
-                 len(sorted_lines), cyc_date, cyc_time, len(included))
+        log.info('UPLOAD START  cycle=%s %s  spots=%d  files=%d',
+                 cyc_date, cyc_time, len(sorted_lines), len(included))
         archive_batch(spots_bytes, len(sorted_lines), len(included))
 
         try:
             response = _mept_post(spots_bytes)
         except (urllib.error.URLError, OSError) as e:
-            log.warning('POST failed: %s — retrying in %ds', e, RETRY_SECS)
+            log.warning('UPLOAD FAILED  cycle=%s %s  error=%s  retry in %ds',
+                        cyc_date, cyc_time, e, RETRY_SECS)
             time.sleep(RETRY_SECS)
             continue
 
         # Parse and log outcome
         if re.search(r'[Uu]pload limit.*reached', response):
-            log.warning('wsprnet rejected: upload limit reached — flushing %d files', len(included))
+            log.warning('UPLOAD REJECTED  cycle=%s %s  reason=upload-limit  flushing %d files',
+                        cyc_date, cyc_time, len(included))
         else:
             offered, added = parse_response(response)
             if offered is None and added is None:
-                log.warning('unparseable wsprnet response for cycle %s %s (flushing):\n%s',
+                log.warning('UPLOAD DONE  cycle=%s %s  unparseable response (flushing):\n%s',
                             cyc_date, cyc_time, response[-300:])
             elif added == 0:
-                log.warning('wsprnet accepted 0/%s spots for cycle %s %s',
-                            offered, cyc_date, cyc_time)
+                log.warning('UPLOAD DONE  cycle=%s %s  accepted=0/%s',
+                            cyc_date, cyc_time, offered)
             else:
-                log.info('wsprnet accepted %s/%s spots for cycle %s %s',
-                         added, offered, cyc_date, cyc_time)
+                log.info('UPLOAD DONE  cycle=%s %s  accepted=%s/%s',
+                         cyc_date, cyc_time, added, offered)
 
         append_wspr_log(sorted_lines)
         for f in included:
