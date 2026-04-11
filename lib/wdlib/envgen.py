@@ -193,12 +193,19 @@ def generate_all_env_files(config: WdConfig, output_dir: Path) -> List[str]:
             rx_name = entry.receiver
             if rx_name not in rx_band_modes:
                 rx_band_modes[rx_name] = {}
-            # Keep the fullest mode list seen
-            existing = rx_band_modes[rx_name].get(entry.band, '')
-            existing_set = set(existing.split(':')) if existing else set()
-            new_set = set(entry.modes.split(':'))
-            combined = existing_set | new_set
-            rx_band_modes[rx_name][entry.band] = ':'.join(sorted(combined))
+            # Merge mode lists across schedule entries, preserving config order.
+            # Use an ordered deduplication: existing modes first (in their order),
+            # then any modes from the new entry not already present.
+            # sorted() must NOT be used here — it alphabetises W2:F2:F5 → F2:F5:W2,
+            # causing W2 (wsprd) to run last instead of first.
+            existing_modes = existing.split(':') if existing else []
+            seen: set = set(existing_modes)
+            combined = existing_modes[:]
+            for m in entry.modes.split(':'):
+                if m and m not in seen:
+                    combined.append(m)
+                    seen.add(m)
+            rx_band_modes[rx_name][entry.band] = ':'.join(combined)
 
     # Expand merge sources: every band assigned to a merge receiver must also
     # be recorded by each component source receiver.  The merge only happens
