@@ -116,9 +116,13 @@ def _valid_spot(line: str) -> bool:
 
 
 def read_batch(files: list) -> tuple:
-    """Read up to MAX_SPOTS valid lines from files. Returns (lines, included_files)."""
+    """Read up to MAX_SPOTS valid lines from files.
+    Returns (lines, included_files, file_lines) where file_lines maps
+    each included file to its list of spot lines.
+    """
     lines = []
     included = []
+    file_lines: dict = {}
     for f in files:
         try:
             new = [l for l in f.read_text().splitlines()
@@ -134,7 +138,8 @@ def read_batch(files: list) -> tuple:
             break
         lines.extend(new)
         included.append(f)
-    return lines, included
+        file_lines[f] = new
+    return lines, included, file_lines
 
 
 def sort_spots(lines: list) -> list:
@@ -253,63 +258,69 @@ def main() -> int:
 
         # Queue is stable: collect, batch, upload
         files = collect_files()
-        lines, included = read_batch(files)
+        lines, included, file_lines = read_batch(files)
         prev_count = 0
         stable_count = 0
 
         if not lines:
             continue
 
+        # Determine each file's WSPR cycle time from its first spot line.
+        def _file_cycle(f):
+            fl = file_lines.get(f, [])
+            p = fl[0].split() if fl else []
+            return (p[0], p[1]) if len(p) >= 2 else ('', '')
+
+        all_cycles = sorted(set(_file_cycle(f) for f in included))
+
+        if len(all_cycles) > 1:
+            # Queue spans multiple WSPR cycles.  Upload only the OLDEST cycle
+            # and leave newer-cycle files in the queue.  They will be picked up
+            # after the next stability window — by which time all slow decoders
+            # for that cycle will have finished, preventing a second rapid upload.
+            # Two POSTs per stability window would bypass the intended pacing.
+            log.warning('MIXED CYCLES: queue has %d files spanning %d windows (%s) '
+                        '— uploading oldest (%s %s) only, leaving %d files',
+                        len(included), len(all_cycles),
+                        ', '.join(f'{d} {t}' for d, t in all_cycles),
+                        all_cycles[0][0], all_cycles[0][1],
+                        sum(1 for f in included if _file_cycle(f) != all_cycles[0]))
+            included = [f for f in included if _file_cycle(f) == all_cycles[0]]
+            lines    = [l for f in included for l in file_lines[f]]
+
+        cyc_date, cyc_time = all_cycles[0] if all_cycles else ('', '')
         sorted_lines = sort_spots(lines)
+        spots_bytes  = ('\n'.join(sorted_lines) + '\n').encode()
 
-        # Group by WSPR cycle time (date col 0 + time col 1).
-        # Each group is POSTed separately so wsprnet never receives spots
-        # from two different WSPR windows in one upload transaction.
-        cycle_groups: dict = {}
-        for line in sorted_lines:
-            p = line.split()
-            key = (p[0], p[1]) if len(p) >= 2 else ('', '')
-            cycle_groups.setdefault(key, []).append(line)
+        log.info('uploading %d spots for cycle %s %s (%d files)',
+                 len(sorted_lines), cyc_date, cyc_time, len(included))
+        archive_batch(spots_bytes, len(sorted_lines), len(included))
 
-        if len(cycle_groups) > 1:
-            log.warning('MIXED CYCLES in queue (%d files): %s — uploading each separately',
-                        len(included),
-                        ', '.join(f'{d} {t}' for d, t in sorted(cycle_groups)))
+        try:
+            response = _mept_post(spots_bytes)
+        except (urllib.error.URLError, OSError) as e:
+            log.warning('POST failed: %s — retrying in %ds', e, RETRY_SECS)
+            time.sleep(RETRY_SECS)
+            continue
 
-        all_ok = True
-        for (cyc_date, cyc_time), group_lines in sorted(cycle_groups.items()):
-            spots_bytes = ('\n'.join(group_lines) + '\n').encode()
-            log.info('uploading %d spots for cycle %s %s (%d queue files)',
-                     len(group_lines), cyc_date, cyc_time, len(included))
-            archive_batch(spots_bytes, len(group_lines), len(included))
-
-            try:
-                response = _mept_post(spots_bytes)
-            except (urllib.error.URLError, OSError) as e:
-                log.warning('POST failed: %s — retrying in %ds', e, RETRY_SECS)
-                time.sleep(RETRY_SECS)
-                all_ok = False
-                break
-
-            # Parse and log outcome
-            if re.search(r'[Uu]pload limit.*reached', response):
-                log.warning('wsprnet rejected: upload limit reached — flushing %d files', len(included))
+        # Parse and log outcome
+        if re.search(r'[Uu]pload limit.*reached', response):
+            log.warning('wsprnet rejected: upload limit reached — flushing %d files', len(included))
+        else:
+            offered, added = parse_response(response)
+            if offered is None and added is None:
+                log.warning('unparseable wsprnet response for cycle %s %s (flushing):\n%s',
+                            cyc_date, cyc_time, response[-300:])
+            elif added == 0:
+                log.warning('wsprnet accepted 0/%s spots for cycle %s %s',
+                            offered, cyc_date, cyc_time)
             else:
-                offered, added = parse_response(response)
-                if offered is None and added is None:
-                    log.warning('unparseable wsprnet response for cycle %s %s (flushing):\n%s',
-                                cyc_date, cyc_time, response[-300:])
-                elif added == 0:
-                    log.warning('wsprnet accepted 0/%s spots for cycle %s %s',
-                                offered, cyc_date, cyc_time)
-                else:
-                    log.info('wsprnet accepted %s/%s spots for cycle %s %s',
-                             added, offered, cyc_date, cyc_time)
+                log.info('wsprnet accepted %s/%s spots for cycle %s %s',
+                         added, offered, cyc_date, cyc_time)
 
-        if all_ok:
-            append_wspr_log(sorted_lines)
-            for f in included:
-                f.unlink(missing_ok=True)
+        append_wspr_log(sorted_lines)
+        for f in included:
+            f.unlink(missing_ok=True)
 
 
 if __name__ == '__main__':
