@@ -261,34 +261,55 @@ def main() -> int:
             continue
 
         sorted_lines = sort_spots(lines)
-        spots_bytes  = ('\n'.join(sorted_lines) + '\n').encode()
 
-        log.info('uploading %d spots from %d files', len(sorted_lines), len(included))
-        archive_batch(spots_bytes, len(sorted_lines), len(included))
+        # Group by WSPR cycle time (date col 0 + time col 1).
+        # Each group is POSTed separately so wsprnet never receives spots
+        # from two different WSPR windows in one upload transaction.
+        cycle_groups: dict = {}
+        for line in sorted_lines:
+            p = line.split()
+            key = (p[0], p[1]) if len(p) >= 2 else ('', '')
+            cycle_groups.setdefault(key, []).append(line)
 
-        try:
-            response = _mept_post(spots_bytes)
-        except (urllib.error.URLError, OSError) as e:
-            log.warning('POST failed: %s — retrying in %ds', e, RETRY_SECS)
-            time.sleep(RETRY_SECS)
-            continue
+        if len(cycle_groups) > 1:
+            log.warning('MIXED CYCLES in queue (%d files): %s — uploading each separately',
+                        len(included),
+                        ', '.join(f'{d} {t}' for d, t in sorted(cycle_groups)))
 
-        # Parse and log outcome
-        if re.search(r'[Uu]pload limit.*reached', response):
-            log.warning('wsprnet rejected: upload limit reached — flushing %d files', len(included))
-        else:
-            offered, added = parse_response(response)
-            if offered is None and added is None:
-                log.warning('unparseable wsprnet response (flushing):\n%s', response[-300:])
-            elif added == 0:
-                log.warning('wsprnet accepted 0/%s spots', offered)
+        all_ok = True
+        for (cyc_date, cyc_time), group_lines in sorted(cycle_groups.items()):
+            spots_bytes = ('\n'.join(group_lines) + '\n').encode()
+            log.info('uploading %d spots for cycle %s %s (%d queue files)',
+                     len(group_lines), cyc_date, cyc_time, len(included))
+            archive_batch(spots_bytes, len(group_lines), len(included))
+
+            try:
+                response = _mept_post(spots_bytes)
+            except (urllib.error.URLError, OSError) as e:
+                log.warning('POST failed: %s — retrying in %ds', e, RETRY_SECS)
+                time.sleep(RETRY_SECS)
+                all_ok = False
+                break
+
+            # Parse and log outcome
+            if re.search(r'[Uu]pload limit.*reached', response):
+                log.warning('wsprnet rejected: upload limit reached — flushing %d files', len(included))
             else:
-                log.info('wsprnet accepted %s/%s spots', added, offered)
+                offered, added = parse_response(response)
+                if offered is None and added is None:
+                    log.warning('unparseable wsprnet response for cycle %s %s (flushing):\n%s',
+                                cyc_date, cyc_time, response[-300:])
+                elif added == 0:
+                    log.warning('wsprnet accepted 0/%s spots for cycle %s %s',
+                                offered, cyc_date, cyc_time)
+                else:
+                    log.info('wsprnet accepted %s/%s spots for cycle %s %s',
+                             added, offered, cyc_date, cyc_time)
 
-        append_wspr_log(sorted_lines)
-
-        for f in included:
-            f.unlink(missing_ok=True)
+        if all_ok:
+            append_wspr_log(sorted_lines)
+            for f in included:
+                f.unlink(missing_ok=True)
 
 
 if __name__ == '__main__':
