@@ -20,7 +20,7 @@ Environment variables:
     WD_RECEIVER_GRID        Reporter grid (e.g. EM38ww)
     WD_VERSION              Version string embedded in upload (default: 4.0)
     WD_POLL_INTERVAL        Seconds between queue polls (default: 10)
-    WD_STABLE_POLLS         Consecutive no-change polls before upload (default: 2)
+    WD_STABLE_POLLS         Consecutive equal-count polls before upload (default: 1)
 """
 
 import os
@@ -30,6 +30,7 @@ import re
 import logging
 import urllib.request
 import urllib.error
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,12 +51,19 @@ WSPR_LOG       = Path('/var/log/wspr.log')
 WSPR_LOG_MAX   = 1_000_000   # 1 MB cap; truncate to 75% when exceeded
 MAX_SPOTS      = 999     # wsprnet limit per upload transaction
 POLL_INTERVAL  = int(os.environ.get('WD_POLL_INTERVAL', '10'))   # seconds between queue polls
-STABLE_POLLS   = int(os.environ.get('WD_STABLE_POLLS', '2'))     # consecutive no-change polls → upload
+STABLE_POLLS   = int(os.environ.get('WD_STABLE_POLLS', '1'))     # consecutive equal-count polls before upload
 RETRY_SECS     = 60      # pause after a network/server error before retrying
 UPLOAD_TIMEOUT = 300     # seconds before giving up on a POST
 ARCHIVE_DIR    = Path(os.environ.get('WD_UPLOAD_ARCHIVE_DIR',
                        '/var/log/wsprdaemon/wsprnet-uploads'))
 ARCHIVE_KEEP   = int(os.environ.get('WD_UPLOAD_ARCHIVE_KEEP', '96'))  # ~3.2 hours of cycles
+PARTIAL_DIR    = Path('/var/log/wsprdaemon/wsprnet-partial')
+PARTIAL_KEEP   = 10   # keep the 10 most recent partial-acceptance dumps
+DIAGNOSTIC_UPLOAD = os.environ.get('WD_DIAGNOSTIC_UPLOAD', '0') == '1'
+
+DEDUP_REJECTED_FILE = PARTIAL_DIR / 'dedup_rejected.txt'
+DEDUP_REJECTED_MAX  = 500_000   # 500 KB rolling cap
+DEDUP_FREQ_KHZ      = 1.0       # near-duplicate frequency window (kHz)
 
 
 # ---------------------------------------------------------------------------
@@ -115,23 +123,47 @@ def _valid_spot(line: str) -> bool:
             and len(p[1]) == 4 and p[1].isdigit())
 
 
+def _has_hash_callsign(line: str) -> bool:
+    """Return True if the callsign field (column 7) is an unresolved hash.
+
+    When jt9 cannot resolve a hash to a real callsign it outputs the raw hash
+    value in angle brackets, e.g. '<A1B2C>'.  These spots are meaningless to
+    wsprnet (no real callsign) and are rejected server-side, so we drop them
+    before uploading.
+    """
+    p = line.split()
+    if len(p) < 7:
+        return False
+    call = p[6]
+    return call.startswith('<') and call.endswith('>')
+
+
 def read_batch(files: list) -> tuple:
     """Read up to MAX_SPOTS valid lines from files.
-    Returns (lines, included_files, file_lines) where file_lines maps
-    each included file to its list of spot lines.
+    Returns (lines, included_files, file_lines, hash_filtered) where
+    file_lines maps each included file to its list of spot lines and
+    hash_filtered is the total count of unresolved-hash spots dropped.
     """
     lines = []
     included = []
     file_lines: dict = {}
+    hash_filtered = 0
     for f in files:
         try:
-            new = [l for l in f.read_text().splitlines()
+            raw = [l for l in f.read_text().splitlines()
                    if l.strip() and _valid_spot(l)]
         except OSError as e:
             log.warning('cannot read %s: %s', f.name, e)
             continue
+        # Split into uploadable spots and unresolved-hash spots
+        new = []
+        for l in raw:
+            if _has_hash_callsign(l):
+                hash_filtered += 1
+            else:
+                new.append(l)
         if not new:
-            # File is empty or contains only malformed lines — discard it
+            # File is empty or contains only malformed/hash lines — discard it
             f.unlink(missing_ok=True)
             continue
         if len(lines) + len(new) > MAX_SPOTS:
@@ -139,7 +171,7 @@ def read_batch(files: list) -> tuple:
         lines.extend(new)
         included.append(f)
         file_lines[f] = new
-    return lines, included, file_lines
+    return lines, included, file_lines, hash_filtered
 
 
 def sort_spots(lines: list) -> list:
@@ -194,6 +226,320 @@ def archive_batch(spots_bytes: bytes, n_spots: int, n_files: int) -> None:
         log.warning('archive failed: %s', e)
 
 
+# Valid WSPR power levels in dBm
+_VALID_POWERS = {0, 3, 7, 10, 13, 17, 20, 23, 27, 30, 33, 37, 40, 43, 47, 50, 53, 57, 60}
+# Maidenhead grid: two letters (A-R) + two digits [+ two letters (A-X)]
+_GRID_RE = re.compile(r'^[A-Ra-r]{2}\d{2}([A-Xa-x]{2})?$')
+
+
+def _analyze_spots(spot_lines: list) -> str:
+    """Examine spot lines and flag anything that might cause server-side rejection.
+
+    Checks each spot for:
+      - Malformed Maidenhead grid (type 1 spots only — callsign has no '/')
+      - Non-standard WSPR power level (type 1 spots only)
+      - Duplicate (date, time, freq, call) within this batch
+
+    Type 2/3 spots (callsign contains '/') use different field encodings for
+    grid and power, so those checks are skipped for them.  SNR is not checked
+    because valid WSPR SNR spans roughly -52 to +50 dB.
+
+    Returns a multi-line string; empty string if nothing suspicious.
+    """
+    flags = []
+    seen: dict = {}   # (date, time, freq, call) → first line index
+
+    for i, line in enumerate(spot_lines):
+        p = line.split()
+        if len(p) < 9:
+            flags.append(f'  [{i+1}] too few fields: {line.rstrip()}')
+            continue
+
+        issues = []
+        call = p[6]
+        type1 = '/' not in call   # type 2/3 extended spots have '/' in callsign
+
+        if type1:
+            # Grid — field 8 (index 7): must be 4 or 6-char Maidenhead
+            grid = p[7]
+            if not _GRID_RE.match(grid):
+                issues.append(f'grid={grid!r} malformed')
+
+            # Power — field 9 (index 8): must be a standard WSPR power level
+            try:
+                pwr = int(p[8])
+                if pwr not in _VALID_POWERS:
+                    issues.append(f'power={pwr} not a standard WSPR level')
+            except ValueError:
+                issues.append(f'non-integer power={p[8]!r}')
+
+        # Duplicate spot within batch: (date, time, freq, call) — applies to all types
+        key = (p[0], p[1], p[5], call)
+        if key in seen:
+            issues.append(f'duplicate of line {seen[key]+1}')
+        else:
+            seen[key] = i
+
+        if issues:
+            flags.append(f'  [{i+1}] {", ".join(issues)}\n      {line.rstrip()}')
+
+    if not flags:
+        return 'no suspicious spots found\n'
+    return f'{len(flags)} potentially suspicious spot(s):\n' + '\n'.join(flags) + '\n'
+
+
+def save_upload_dump(spots_bytes: bytes, cyc_date: str, cyc_time: str,
+                     offered: int, added: int, response: str,
+                     spot_lines: list) -> None:
+    """Save every upload — spots + server response + spot analysis — to PARTIAL_DIR.
+
+    Filename encodes offered/accepted counts; when all are accepted the numbers
+    are equal and the file is still written so you can compare against partial
+    uploads side-by-side.
+
+    File sections:
+        --- SPOTS OFFERED ---       one spot per line
+        --- WSPRNET RESPONSE ---    full verbatim server reply
+        --- SPOT ANALYSIS ---       automated checks on the spot lines
+
+    Keeps only the PARTIAL_KEEP most recent files.
+    Partial uploads (accepted < offered) are logged at WARNING so they appear
+    in wdwatch; full-acceptance dumps are logged at DEBUG (quiet).
+    """
+    try:
+        PARTIAL_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        fname = PARTIAL_DIR / (
+            f'{ts}_cycle{cyc_date}{cyc_time}'
+            f'_offered{offered}_accepted{added}.txt'
+        )
+
+        analysis = _analyze_spots(spot_lines)
+        content = (
+            b'--- SPOTS OFFERED ---\n'
+            + spots_bytes
+            + b'\n--- WSPRNET RESPONSE ---\n'
+            + response.encode(errors='replace')
+            + b'\n--- SPOT ANALYSIS ---\n'
+            + analysis.encode()
+        )
+        fname.write_bytes(content)
+
+        partial = (added is not None and offered is not None and added < offered)
+        if partial:
+            log.warning('PARTIAL DUMP  cycle=%s %s  accepted=%s/%s  → %s',
+                        cyc_date, cyc_time, added, offered, fname)
+        else:
+            log.debug('upload dump   cycle=%s %s  accepted=%s/%s  → %s',
+                      cyc_date, cyc_time, added, offered, fname)
+
+        # Rotate: keep only the PARTIAL_KEEP newest files
+        existing = sorted(PARTIAL_DIR.glob('*.txt'))
+        for old in existing[:-PARTIAL_KEEP]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning('upload dump failed: %s', e)
+
+
+def diagnostic_upload(cyc_lines: list, cyc_date: str, cyc_time: str) -> None:
+    """Upload each spot one at a time so we can identify which ones wsprnet rejects.
+
+    When DIAGNOSTIC_UPLOAD=True this IS the primary upload (bulk POST is skipped).
+    When triggered automatically after a partial bulk acceptance it is secondary
+    (those spots are already uploaded; re-uploading individually lets us identify
+    the bad ones, though wsprnet may also say '0 added' for duplicates).
+
+    Logging:
+      - DIAG REJECT logged immediately for each rejected spot
+      - DIAG DONE logged once at the end with the summary
+      - individual accepted spots are NOT logged
+
+    Saves a timestamped report to PARTIAL_DIR.
+    """
+    log.info('DIAG START    cycle=%s %s  spots=%d',
+             cyc_date, cyc_time, len(cyc_lines))
+
+    accepted_lines = []
+    rejected_lines = []
+    error_lines    = []
+
+    for line in cyc_lines:
+        spot_bytes = (line + '\n').encode()
+        try:
+            resp = _mept_post(spot_bytes)
+        except (urllib.error.URLError, OSError) as e:
+            error_lines.append((line, f'network error: {e}'))
+            continue
+
+        offered, added = parse_response(resp)
+        if added == 1:
+            accepted_lines.append(line)
+        else:
+            rejected_lines.append((line, resp.strip()))
+            log.warning('DIAG REJECT   cycle=%s %s  server=%s  spot: %s',
+                        cyc_date, cyc_time, resp.strip()[:120], line.rstrip())
+
+    n_ok  = len(accepted_lines)
+    n_bad = len(rejected_lines)
+    n_err = len(error_lines)
+    n_tot = len(cyc_lines)
+
+    if n_bad or n_err:
+        log.warning('DIAG DONE     cycle=%s %s  accepted=%d/%d  rejected=%d  errors=%d',
+                    cyc_date, cyc_time, n_ok, n_tot, n_bad, n_err)
+    else:
+        log.info('DIAG DONE     cycle=%s %s  accepted=%d/%d',
+                 cyc_date, cyc_time, n_ok, n_tot)
+
+    # Save report to PARTIAL_DIR
+    try:
+        PARTIAL_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        fname = PARTIAL_DIR / (
+            f'{ts}_cycle{cyc_date}{cyc_time}'
+            f'_diag_accepted{n_ok}_rejected{n_bad}.txt'
+        )
+        parts = [f'--- DIAGNOSTIC UPLOAD cycle={cyc_date} {cyc_time} ---\n',
+                 f'tested:   {n_tot}\n',
+                 f'accepted: {n_ok}\n',
+                 f'rejected: {n_bad}\n',
+                 f'errors:   {n_err}\n']
+        if rejected_lines:
+            parts.append('\n--- REJECTED SPOTS ---\n')
+            for spot, resp in rejected_lines:
+                parts.append(f'{spot.rstrip()}\n  server: {resp[:200]}\n')
+        if error_lines:
+            parts.append('\n--- NETWORK ERRORS ---\n')
+            for spot, err in error_lines:
+                parts.append(f'{spot.rstrip()}\n  error: {err}\n')
+        if accepted_lines:
+            parts.append('\n--- ACCEPTED SPOTS ---\n')
+            parts.extend(l + '\n' for l in accepted_lines)
+        fname.write_text(''.join(parts))
+        if n_bad or n_err:
+            log.warning('DIAG REPORT   → %s', fname)
+
+        existing = sorted(PARTIAL_DIR.glob('*.txt'))
+        for old in existing[:-PARTIAL_KEEP]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning('diag report write failed: %s', e)
+
+
+def _dedup_spots(lines: list) -> tuple:
+    """Remove near-duplicate spots before upload.
+
+    A near-duplicate is defined as two spots sharing the same callsign
+    and WSPR cycle (date + time) whose frequencies are within
+    DEDUP_FREQ_KHZ of each other.  When duplicates are found the spot
+    with the best (highest / least-negative) SNR is kept; the rest are
+    dropped.
+
+    Uses union-find so that chains of overlapping near-duplicates are
+    collapsed into a single cluster correctly.
+
+    Returns:
+        (kept_lines, dropped_pairs) where dropped_pairs is a list of
+        (dropped_line, kept_line) 2-tuples.
+    """
+    FREQ_TOL_MHZ = DEDUP_FREQ_KHZ / 1000.0
+
+    # Parse spots into structured form
+    parsed = []
+    for line in lines:
+        p = line.split()
+        if len(p) < 8:
+            parsed.append({'line': line, 'date': '', 'time': '',
+                           'snr': -99, 'freq_mhz': 0.0, 'call': ''})
+            continue
+        try:
+            freq_mhz = float(p[5])
+        except ValueError:
+            freq_mhz = 0.0
+        try:
+            snr = int(p[3])
+        except ValueError:
+            snr = -99
+        parsed.append({
+            'line': line,
+            'date': p[0],
+            'time': p[1],
+            'snr': snr,
+            'freq_mhz': freq_mhz,
+            'call': p[6],
+        })
+
+    # Group indices by (date, time, callsign)
+    groups: dict = defaultdict(list)
+    for i, sp in enumerate(parsed):
+        groups[(sp['date'], sp['time'], sp['call'])].append(i)
+
+    keep_set: set = set()
+    dropped_pairs: list = []
+
+    for indices in groups.values():
+        if len(indices) == 1:
+            keep_set.add(indices[0])
+            continue
+
+        # Union-find over this group
+        parent = {i: i for i in indices}
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for a in range(len(indices)):
+            for b in range(a + 1, len(indices)):
+                ia, ib = indices[a], indices[b]
+                if abs(parsed[ia]['freq_mhz'] - parsed[ib]['freq_mhz']) <= FREQ_TOL_MHZ:
+                    ra, rb = _find(ia), _find(ib)
+                    if ra != rb:
+                        parent[ra] = rb
+
+        # Collect clusters
+        clusters: dict = defaultdict(list)
+        for i in indices:
+            clusters[_find(i)].append(i)
+
+        for cluster in clusters.values():
+            best = max(cluster, key=lambda i: parsed[i]['snr'])
+            keep_set.add(best)
+            for i in cluster:
+                if i != best:
+                    dropped_pairs.append((parsed[i]['line'], parsed[best]['line']))
+
+    kept = [lines[i] for i in range(len(lines)) if i in keep_set]
+    return kept, dropped_pairs
+
+
+def _log_dedup_rejected(dropped_pairs: list, cyc_date: str, cyc_time: str) -> None:
+    """Append dedup-dropped spots to the rolling rejected log in PARTIAL_DIR."""
+    if not dropped_pairs:
+        return
+    try:
+        PARTIAL_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        out = [f'\n# dedup  cycle={cyc_date} {cyc_time}  at={ts}  dropped={len(dropped_pairs)}\n']
+        for dropped, kept in dropped_pairs:
+            out.append(f'DROPPED  {dropped.rstrip()}\n')
+            out.append(f'KEPT     {kept.rstrip()}\n')
+        with DEDUP_REJECTED_FILE.open('a') as f:
+            f.writelines(out)
+        # Rolling cap
+        size = DEDUP_REJECTED_FILE.stat().st_size
+        if size > DEDUP_REJECTED_MAX:
+            data = DEDUP_REJECTED_FILE.read_bytes()
+            keep_from = len(data) - int(DEDUP_REJECTED_MAX * 0.75)
+            nl = data.find(b'\n', keep_from)
+            trimmed = data[nl + 1:] if nl != -1 else data[keep_from:]
+            DEDUP_REJECTED_FILE.write_bytes(trimmed)
+    except OSError as e:
+        log.warning('dedup reject log failed: %s', e)
+
+
 def append_wspr_log(lines: list) -> None:
     """Append uploaded spots to /var/log/wspr.log (KA9Q standard location).
     Caps the file at WSPR_LOG_MAX bytes by discarding the oldest 25% when exceeded.
@@ -218,6 +564,28 @@ def append_wspr_log(lines: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cycle timing helpers
+# ---------------------------------------------------------------------------
+
+def _cycle_end_epoch(cyc_date: str, cyc_time: str) -> float:
+    """Return Unix timestamp when this 2-minute WSPR cycle ends.
+
+    cyc_date = YYMMDD, cyc_time = HHMM (from spot line columns 1 & 2).
+    Returns 0.0 for unparseable input so those files upload immediately.
+    """
+    try:
+        dt = datetime(2000 + int(cyc_date[:2]),
+                      int(cyc_date[2:4]),
+                      int(cyc_date[4:6]),
+                      int(cyc_time[:2]),
+                      int(cyc_time[2:4]),
+                      tzinfo=timezone.utc)
+        return dt.timestamp() + 120  # WSPR cycle is 2 minutes long
+    except (ValueError, IndexError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -227,10 +595,11 @@ def main() -> int:
         format='%(asctime)sZ %(name)s %(levelname)s %(message)s',
         datefmt='%Y-%m-%dT%H:%M:%S',
     )
-    log.info('starting: reporter %s %s  queue: %s', REPORTER_CALL, REPORTER_GRID, UPLOAD_DIR)
+    log.info('starting: reporter %s %s  queue: %s  poll=%ds stable=%d',
+             REPORTER_CALL, REPORTER_GRID, UPLOAD_DIR, POLL_INTERVAL, STABLE_POLLS)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    prev_count = 0
+    prev_count   = 0
     stable_count = 0
 
     while True:
@@ -238,33 +607,31 @@ def main() -> int:
         curr_count = len(collect_files())
 
         if curr_count == 0:
-            # Nothing in queue — reset and keep polling
-            prev_count = 0
+            prev_count   = 0
             stable_count = 0
             continue
 
-        if curr_count == prev_count:
-            stable_count += 1
-            if stable_count < STABLE_POLLS:
-                continue
-            # STABLE_POLLS consecutive polls with no new files → upload now
-        else:
-            # New files arrived — reset stability counter and keep polling
-            log.debug('queue grew %d → %d files, polling', prev_count, curr_count)
-            prev_count = curr_count
+        if curr_count != prev_count:
+            # Queue changed — reset stability and keep polling
+            log.debug('queue %d → %d files', prev_count, curr_count)
+            prev_count   = curr_count
             stable_count = 0
             continue
 
-        # Queue is stable: collect, batch, upload
-        files = collect_files()
-        lines, included, file_lines = read_batch(files)
-        prev_count = 0
+        # Count is unchanged and > 0
+        stable_count += 1
+        if stable_count < STABLE_POLLS:
+            continue
+
+        # STABLE_POLLS consecutive equal polls → upload everything queued
+        prev_count   = 0
         stable_count = 0
 
+        files = collect_files()
+        lines, included, file_lines, hash_filtered = read_batch(files)
         if not lines:
             continue
 
-        # Determine each file's WSPR cycle time from its first spot line.
         def _file_cycle(f):
             fl = file_lines.get(f, [])
             p = fl[0].split() if fl else []
@@ -273,55 +640,86 @@ def main() -> int:
         all_cycles = sorted(set(_file_cycle(f) for f in included))
 
         if len(all_cycles) > 1:
-            # Queue spans multiple WSPR cycles.  Upload only the OLDEST cycle
-            # and leave newer-cycle files in the queue.  They will be picked up
-            # after the next stability window — by which time all slow decoders
-            # for that cycle will have finished, preventing a second rapid upload.
-            # Two POSTs per stability window would bypass the intended pacing.
-            log.warning('MIXED CYCLES: queue has %d files spanning %d windows (%s) '
-                        '— uploading oldest (%s %s) only, leaving %d files',
-                        len(included), len(all_cycles),
-                        ', '.join(f'{d} {t}' for d, t in all_cycles),
-                        all_cycles[0][0], all_cycles[0][1],
-                        sum(1 for f in included if _file_cycle(f) != all_cycles[0]))
-            included = [f for f in included if _file_cycle(f) == all_cycles[0]]
-            lines    = [l for f in included for l in file_lines[f]]
+            log.info('MULTI CYCLE   queued %d cycles (%s) — uploading all',
+                     len(all_cycles),
+                     ', '.join(f'{d} {t}' for d, t in all_cycles))
 
-        cyc_date, cyc_time = all_cycles[0] if all_cycles else ('', '')
-        sorted_lines = sort_spots(lines)
-        spots_bytes  = ('\n'.join(sorted_lines) + '\n').encode()
+        if hash_filtered:
+            log.info('hash filtered  total=%d unresolved-hash spots dropped before upload',
+                     hash_filtered)
 
-        log.info('UPLOAD START  cycle=%s %s  spots=%d  files=%d',
-                 cyc_date, cyc_time, len(sorted_lines), len(included))
-        archive_batch(spots_bytes, len(sorted_lines), len(included))
+        # Upload one cycle at a time, oldest first.
+        # In diagnostic mode each spot is posted individually (no bulk POST).
+        # In normal mode a single bulk MEPT POST is used; if it has partial
+        # acceptance a secondary diagnostic run fires to identify bad spots.
+        # On network failure stop immediately and retry after RETRY_SECS.
+        upload_failed = False
+        for cyc_date, cyc_time in all_cycles:
+            cyc_files = [f for f in included if _file_cycle(f) == (cyc_date, cyc_time)]
+            cyc_lines_raw = [l for f in cyc_files for l in file_lines[f]]
+            cyc_lines_raw, dedup_dropped = _dedup_spots(cyc_lines_raw)
+            if dedup_dropped:
+                log.info('dedup          cycle=%s %s  dropped=%d near-duplicate spot(s)',
+                         cyc_date, cyc_time, len(dedup_dropped))
+                _log_dedup_rejected(dedup_dropped, cyc_date, cyc_time)
+            cyc_lines = sort_spots(cyc_lines_raw)
+            spots_bytes = ('\n'.join(cyc_lines) + '\n').encode()
 
-        try:
-            response = _mept_post(spots_bytes)
-        except (urllib.error.URLError, OSError) as e:
-            log.warning('UPLOAD FAILED  cycle=%s %s  error=%s  retry in %ds',
-                        cyc_date, cyc_time, e, RETRY_SECS)
-            time.sleep(RETRY_SECS)
-            continue
+            log.info('UPLOAD START  cycle=%s %s  spots=%d  files=%d',
+                     cyc_date, cyc_time, len(cyc_lines), len(cyc_files))
 
-        # Parse and log outcome
-        if re.search(r'[Uu]pload limit.*reached', response):
-            log.warning('UPLOAD REJECTED  cycle=%s %s  reason=upload-limit  flushing %d files',
-                        cyc_date, cyc_time, len(included))
-        else:
-            offered, added = parse_response(response)
-            if offered is None and added is None:
-                log.warning('UPLOAD DONE  cycle=%s %s  unparseable response (flushing):\n%s',
-                            cyc_date, cyc_time, response[-300:])
-            elif added == 0:
-                log.warning('UPLOAD DONE  cycle=%s %s  accepted=0/%s',
-                            cyc_date, cyc_time, offered)
+            if DIAGNOSTIC_UPLOAD:
+                # Diagnostic mode: one MEPT POST per spot — this IS the upload.
+                diagnostic_upload(cyc_lines, cyc_date, cyc_time)
             else:
-                log.info('UPLOAD DONE  cycle=%s %s  accepted=%s/%s',
-                         cyc_date, cyc_time, added, offered)
+                # Normal mode: bulk MEPT POST.
+                archive_batch(spots_bytes, len(cyc_lines), len(cyc_files))
+                try:
+                    response = _mept_post(spots_bytes)
+                except (urllib.error.URLError, OSError) as e:
+                    log.warning('UPLOAD FAILED  cycle=%s %s  error=%s  retry in %ds',
+                                cyc_date, cyc_time, e, RETRY_SECS)
+                    upload_failed = True
+                    break
 
-        append_wspr_log(sorted_lines)
-        for f in included:
-            f.unlink(missing_ok=True)
+                run_diagnostic = False
+                if re.search(r'[Uu]pload limit.*reached', response):
+                    log.warning('UPLOAD REJECTED  cycle=%s %s  reason=upload-limit  flushing %d files',
+                                cyc_date, cyc_time, len(cyc_files))
+                    save_upload_dump(spots_bytes, cyc_date, cyc_time,
+                                     len(cyc_lines), 0, response, cyc_lines)
+                    run_diagnostic = True
+                else:
+                    offered, added = parse_response(response)
+                    if offered is None and added is None:
+                        log.warning('UPLOAD DONE   cycle=%s %s  unparseable response (flushing):\n%s',
+                                    cyc_date, cyc_time, response[-300:])
+                        save_upload_dump(spots_bytes, cyc_date, cyc_time,
+                                         len(cyc_lines), 0, response, cyc_lines)
+                        run_diagnostic = True
+                    elif added == 0:
+                        log.warning('UPLOAD DONE   cycle=%s %s  accepted=0/%s',
+                                    cyc_date, cyc_time, offered)
+                        save_upload_dump(spots_bytes, cyc_date, cyc_time,
+                                         offered, 0, response, cyc_lines)
+                        run_diagnostic = True
+                    else:
+                        log.info('UPLOAD DONE   cycle=%s %s  accepted=%s/%s',
+                                 cyc_date, cyc_time, added, offered)
+                        save_upload_dump(spots_bytes, cyc_date, cyc_time,
+                                         offered, added, response, cyc_lines)
+                        if offered is not None and added < offered:
+                            run_diagnostic = True
+
+                if run_diagnostic:
+                    diagnostic_upload(cyc_lines, cyc_date, cyc_time)
+
+            append_wspr_log(cyc_lines)
+            for f in cyc_files:
+                f.unlink(missing_ok=True)
+
+        if upload_failed:
+            time.sleep(RETRY_SECS)
 
 
 if __name__ == '__main__':
