@@ -667,6 +667,7 @@ def main() -> int:
 
             log.info('UPLOAD START  cycle=%s %s  spots=%d  files=%d',
                      cyc_date, cyc_time, len(cyc_lines), len(cyc_files))
+            t_upload_start = time.monotonic()
 
             if DIAGNOSTIC_UPLOAD:
                 # Diagnostic mode: one MEPT POST per spot — this IS the upload.
@@ -677,38 +678,42 @@ def main() -> int:
                 try:
                     response = _mept_post(spots_bytes)
                 except (urllib.error.URLError, OSError) as e:
-                    log.warning('UPLOAD FAILED  cycle=%s %s  error=%s  retry in %ds',
-                                cyc_date, cyc_time, e, RETRY_SECS)
+                    elapsed = int(time.monotonic() - t_upload_start)
+                    log.warning('UPLOAD FAILED  cycle=%s %s  elapsed=%ds  error=%s  retry in %ds',
+                                cyc_date, cyc_time, elapsed, e, RETRY_SECS)
                     upload_failed = True
                     break
 
+                elapsed = int(time.monotonic() - t_upload_start)
                 run_diagnostic = False
                 if re.search(r'[Uu]pload limit.*reached', response):
-                    log.warning('UPLOAD REJECTED  cycle=%s %s  reason=upload-limit  flushing %d files',
-                                cyc_date, cyc_time, len(cyc_files))
+                    log.warning('UPLOAD REJECTED  cycle=%s %s  elapsed=%ds  reason=upload-limit  flushing %d files',
+                                cyc_date, cyc_time, elapsed, len(cyc_files))
                     save_upload_dump(spots_bytes, cyc_date, cyc_time,
                                      len(cyc_lines), 0, response, cyc_lines)
                     run_diagnostic = True
                 else:
                     offered, added = parse_response(response)
                     if offered is None and added is None:
-                        log.warning('UPLOAD DONE   cycle=%s %s  unparseable response (flushing):\n%s',
-                                    cyc_date, cyc_time, response[-300:])
+                        log.warning('UPLOAD DONE   cycle=%s %s  elapsed=%ds  unparseable response (flushing):\n%s',
+                                    cyc_date, cyc_time, elapsed, response[-300:])
                         save_upload_dump(spots_bytes, cyc_date, cyc_time,
                                          len(cyc_lines), 0, response, cyc_lines)
                         run_diagnostic = True
                     elif added == 0:
-                        log.warning('UPLOAD DONE   cycle=%s %s  accepted=0/%s',
-                                    cyc_date, cyc_time, offered)
+                        log.warning('UPLOAD DONE   cycle=%s %s  elapsed=%ds  accepted=0/%s',
+                                    cyc_date, cyc_time, elapsed, offered)
                         save_upload_dump(spots_bytes, cyc_date, cyc_time,
                                          offered, 0, response, cyc_lines)
                         run_diagnostic = True
                     else:
-                        log.info('UPLOAD DONE   cycle=%s %s  accepted=%s/%s',
-                                 cyc_date, cyc_time, added, offered)
+                        partial = (offered is not None and added < offered)
+                        lvl = log.warning if partial else log.info
+                        lvl('UPLOAD DONE   cycle=%s %s  elapsed=%ds  accepted=%s/%s',
+                            cyc_date, cyc_time, elapsed, added, offered)
                         save_upload_dump(spots_bytes, cyc_date, cyc_time,
                                          offered, added, response, cyc_lines)
-                        if offered is not None and added < offered:
+                        if partial:
                             run_diagnostic = True
 
                 if run_diagnostic:
