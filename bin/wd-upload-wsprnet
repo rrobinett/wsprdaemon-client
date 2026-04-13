@@ -19,7 +19,7 @@ Environment variables:
     WD_RECEIVER_CALL        Reporter callsign (e.g. AC0G/B1)
     WD_RECEIVER_GRID        Reporter grid (e.g. EM38ww)
     WD_VERSION              Version string embedded in upload (default: 4.0)
-    WD_POLL_INTERVAL        Seconds between queue polls (default: 10)
+    WD_POLL_INTERVAL        Seconds between queue polls (default: 5)
     WD_STABLE_POLLS         Consecutive equal-count polls before upload (default: 1)
 """
 
@@ -50,7 +50,7 @@ WSPRNET_URL    = 'http://wsprnet.org/meptspots.php'
 WSPR_LOG       = Path('/var/log/wspr.log')
 WSPR_LOG_MAX   = 1_000_000   # 1 MB cap; truncate to 75% when exceeded
 MAX_SPOTS      = 999     # wsprnet limit per upload transaction
-POLL_INTERVAL  = int(os.environ.get('WD_POLL_INTERVAL', '10'))   # seconds between queue polls
+POLL_INTERVAL  = int(os.environ.get('WD_POLL_INTERVAL', '5'))    # seconds between queue polls
 STABLE_POLLS   = int(os.environ.get('WD_STABLE_POLLS', '1'))     # consecutive equal-count polls before upload
 RETRY_SECS     = 60      # pause after a network/server error before retrying
 UPLOAD_TIMEOUT = 300     # seconds before giving up on a POST
