@@ -182,14 +182,18 @@ decode_window() {
             sort -k1,2 -k5,5 "${all_wspr}" > "${all_wspr_save}"
             cp -p "${all_wspr_save}" "${all_wspr}"
 
-            # Run wsprd — appends new spots to ALL_WSPR.TXT
+            # Run wsprd — appends new spots to ALL_WSPR.TXT; capture stdout for
+            # diagnostic comparison.  Spot lines in stdout look like:
+            #   "  -3  0.3  14.097107  KD9LVN EN61  33   0  0"
+            # (no date/time prefix — those are added only in ALL_WSPR.TXT)
             # -c: write .c2 file (first-pass subtraction aid)
             # -C 500: max decoder cycles/bit (v3 default, faster than 10000)
             # -o 4: OSD decoding depth 4 (v3 default)
             # -d: deeper search for weak signals
+            local wsprd_stdout="${WD_RECORDING_DIR}/wsprd_stdout.txt"
             "${WSPRD_BIN}" -a "${WD_RECORDING_DIR}" -c -C 500 -o 4 -d \
                 -f "${freq_mhz}" "${concat_wav}" \
-                > /dev/null 2>&1 || true
+                > "${wsprd_stdout}" 2>&1 || true
 
             # Sort updated ALL_WSPR.TXT and diff to find new spots, then convert
             # to 11-field wsprnet MEPT format:
@@ -217,6 +221,23 @@ decode_window() {
                     NF == 16 { printf "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d\n",
                                    $1,$2,$9,$3,$4,$5,$6,"      ",$7,$8,wn_type; next }
                 ' <<< "${new_spots}" > "${spots_file}" || true
+
+            # Diagnostic: verify stdout spot count matches ALL_WSPR.TXT extraction.
+            # wsprd stdout spot lines start with optional whitespace then SNR (a signed integer).
+            # Non-spot lines (blank, "<DecodeFinished>", timing) do not match this pattern.
+            local stdout_count extracted_count
+            stdout_count=$(grep -cE '^\s*[+-]?[0-9]' "${wsprd_stdout}" 2>/dev/null || echo 0)
+            if [[ -n "${new_spots}" ]]; then
+                extracted_count=$(wc -l <<< "${new_spots}")
+            else
+                extracted_count=0
+            fi
+            if [[ "${stdout_count}" -ne "${extracted_count}" ]]; then
+                echo "DIAG MISMATCH band=${WD_RECEIVER_BAND} mode=${mode} cycle=${wspr_ts} stdout=${stdout_count} extracted=${extracted_count}"
+            else
+                echo "DIAG MATCH    band=${WD_RECEIVER_BAND} mode=${mode} cycle=${wspr_ts} spots=${extracted_count}"
+            fi
+            rm -f "${wsprd_stdout}"
 
             # Truncate ALL_WSPR.TXT if it exceeds the size limit to prevent unbounded growth
             local all_wspr_size
