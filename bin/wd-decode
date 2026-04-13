@@ -170,7 +170,11 @@ decode_window() {
             local all_wspr_size
             all_wspr_size=$(stat -c%s "${all_wspr}" 2>/dev/null || echo 0)
             if (( all_wspr_size > MAX_ALL_WSPR_SIZE )); then
-                tail -c "${MAX_ALL_WSPR_SIZE}" "${all_wspr}" > "${WD_RECORDING_DIR}/trunc.tmp"
+                # tail -c cuts at a byte boundary, which may split the first surviving
+                # line. Drop that partial line with tail -n +2 so ALL_WSPR.TXT always
+                # contains only complete records (partial lines confuse the sort/diff).
+                tail -c "${MAX_ALL_WSPR_SIZE}" "${all_wspr}" \
+                    | tail -n +2 > "${WD_RECORDING_DIR}/trunc.tmp"
                 mv "${WD_RECORDING_DIR}/trunc.tmp" "${all_wspr}"
             fi
             ;;
