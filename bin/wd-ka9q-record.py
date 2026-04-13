@@ -104,7 +104,7 @@ status_file = "{stat_file}"
 [channel_defaults]
 sample_rate = 12000
 mode        = "usb"
-encoding    = "float"
+encoding    = "f32"
 agc         = false
 gain        = {GAIN_DB}
 low         = 1300
