@@ -8,6 +8,15 @@
 
 set -euo pipefail
 
+# Contract §11 log-level resolution + SIGHUP handler.
+for _d in /opt/wsprdaemon/lib /usr/local/share/wsprdaemon/lib; do
+    if [[ -r "${_d}/wd-loglevel.sh" ]]; then
+        # shellcheck source=/dev/null
+        . "${_d}/wd-loglevel.sh"
+        break
+    fi
+done
+
 # Resolve decoder binaries from the project's decoders directory.
 # Never rely on PATH — these are versioned project binaries.
 _DECODER_DIR="/opt/wsprdaemon/bin/decoders"

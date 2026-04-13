@@ -26,6 +26,12 @@ kind = "copy"
 src  = "lib/wdlib"
 dst  = "/opt/wsprdaemon/lib/wdlib"
 
+# --- Shared bash lib (contract §11 log-level helper) ---
+[[install.steps]]
+kind = "copy"
+src  = "lib/wd-loglevel.sh"
+dst  = "/opt/wsprdaemon/lib/wd-loglevel.sh"
+
 # --- Executables to /usr/local/sbin/ ---
 [[install.steps]]
 kind = "link"
