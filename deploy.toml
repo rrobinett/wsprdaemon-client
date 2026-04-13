@@ -1,0 +1,165 @@
+# deploy.toml — HamSCI client contract §5 deploy manifest for wsprdaemon-client.
+#
+# This file is the authoritative mapping from repo-tree code to production
+# location. Sigmond reads [install.steps] / [systemd] to install and manage
+# the wsprdaemon v4 service set without bespoke per-client adapter code.
+# install.sh ships the same layout for standalone installs.
+#
+# See /home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md §5 for the schema.
+
+[package]
+name    = "wsprdaemon"
+version = "4.0.0-dev"
+
+[build]
+# Pure-Python core plus bundled decoder binaries in bin/decoders/. No build.
+steps    = []
+produces = []
+
+[install]
+# kind = "link" | "copy" | "render"
+# src paths are relative to the repo root; dst paths are absolute.
+
+# --- Python library ---
+[[install.steps]]
+kind = "copy"
+src  = "lib/wdlib"
+dst  = "/opt/wsprdaemon/lib/wdlib"
+
+# --- Executables to /usr/local/sbin/ ---
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-ctl"
+dst  = "/usr/local/sbin/wd-ctl"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-ka9q-record"
+dst  = "/usr/local/sbin/wd-ka9q-record"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-ka9q-record.py"
+dst  = "/usr/local/sbin/wd-ka9q-record.py"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-kiwi-record"
+dst  = "/usr/local/sbin/wd-kiwi-record"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-kiwi-cleanup"
+dst  = "/usr/local/sbin/wd-kiwi-cleanup"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-decode"
+dst  = "/usr/local/sbin/wd-decode"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-post"
+dst  = "/usr/local/sbin/wd-post"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-upload-wsprnet"
+dst  = "/usr/local/sbin/wd-upload-wsprnet"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-upload-wsprdaemon"
+dst  = "/usr/local/sbin/wd-upload-wsprdaemon"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-spool-clean"
+dst  = "/usr/local/sbin/wd-spool-clean"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wdwatch"
+dst  = "/usr/local/sbin/wdwatch"
+
+# --- Decoder binaries (arch-specific, bundled in repo) ---
+[[install.steps]]
+kind = "copy"
+src  = "bin/decoders"
+dst  = "/opt/wsprdaemon/bin/decoders"
+
+# --- Systemd units ---
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-ka9q-record@.service"
+dst  = "/etc/systemd/system/wd-ka9q-record@.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-ka9q-web@.service"
+dst  = "/etc/systemd/system/wd-ka9q-web@.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-kiwi-record@.service"
+dst  = "/etc/systemd/system/wd-kiwi-record@.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-decode@.service"
+dst  = "/etc/systemd/system/wd-decode@.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-post@.service"
+dst  = "/etc/systemd/system/wd-post@.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-upload-wsprnet@.service"
+dst  = "/etc/systemd/system/wd-upload-wsprnet@.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-upload-wsprdaemon@.service"
+dst  = "/etc/systemd/system/wd-upload-wsprdaemon@.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-spool-clean.service"
+dst  = "/etc/systemd/system/wd-spool-clean.service"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wd-spool-clean.timer"
+dst  = "/etc/systemd/system/wd-spool-clean.timer"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wsprdaemon.target"
+dst  = "/etc/systemd/system/wsprdaemon.target"
+
+# --- deps.conf copied to install root so wd-ctl can find it ---
+[[install.steps]]
+kind = "copy"
+src  = "deps.conf"
+dst  = "/opt/wsprdaemon/deps.conf"
+
+[systemd]
+# Unit set sigmond enumerates for start/stop/status. Templated units use
+# @-suffix form; sigmond expands them by reading wd-ctl inventory --json.
+units = [
+    "wsprdaemon.target",
+    "wd-ka9q-record@.service",
+    "wd-ka9q-web@.service",
+    "wd-kiwi-record@.service",
+    "wd-decode@.service",
+    "wd-post@.service",
+    "wd-upload-wsprnet@.service",
+    "wd-upload-wsprdaemon@.service",
+    "wd-spool-clean.service",
+    "wd-spool-clean.timer",
+]
+
+# [deps] — the authoritative pins live in deps.conf to avoid duplication.
+# Sigmond reads deps.conf directly (same format hf-timestd uses).
