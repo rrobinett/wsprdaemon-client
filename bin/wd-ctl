@@ -1512,44 +1512,111 @@ def cmd_status(args):
 
 def cmd_validate(args):
     """Validate config without applying."""
-    conf_path = args.config or '/etc/wsprdaemon/wsprdaemon.conf'
+    from wdlib import contract
+
+    conf_path = args.config or contract.DEFAULT_CONFIG_PATH
     if not Path(conf_path).exists():
+        if args.json:
+            import json
+            json.dump({
+                "ok": False,
+                "config_path": str(Path(conf_path).resolve()),
+                "contract_version": contract.CONTRACT_VERSION,
+                "issues": [{"severity": "error",
+                            "message": f"config not found: {conf_path}"}],
+            }, sys.stdout)
+            sys.stdout.write("\n")
+            return 1
         print(f'Error: config not found: {conf_path}', file=sys.stderr)
         return 1
+
+    if args.json:
+        import json
+        with contract.StderrRedirect():
+            try:
+                config = parse_v4_config(conf_path)
+                payload = contract.build_validate(config, conf_path, _SOURCE_ROOT)
+            except Exception as e:
+                payload = {
+                    "ok": False,
+                    "config_path": str(Path(conf_path).resolve()),
+                    "contract_version": contract.CONTRACT_VERSION,
+                    "issues": [{"severity": "error",
+                                "message": f"parse error: {e}"}],
+                }
+        json.dump(payload, sys.stdout)
+        sys.stdout.write("\n")
+        return 0 if payload.get("ok") else 1
 
     print(f'Validating: {conf_path}')
     try:
         config = parse_v4_config(conf_path)
         print(f'  Receivers: {len(config.receivers)}')
         print(f'  Schedule slots: {len(config.schedule_slots)}')
-
-        # Check for schedule errors
-        errors = []
-        for slot in config.schedule_slots:
-            for entry in slot.entries:
-                rx = config.receivers.get(entry.receiver)
-                if not rx:
-                    errors.append(f'Schedule references unknown receiver: {entry.receiver}')
-                    continue
-                # KA9Q receivers must not appear in schedule transitions
-                if rx.receiver_type == 'ka9q' and slot.time != '00:00':
-                    errors.append(
-                        f'KA9Q receiver {entry.receiver} in time-based schedule '
-                        f'at {slot.time} — KA9Q recorders run continuously and '
-                        f'must not be schedule-toggled'
-                    )
-
+        payload = contract.build_validate(config, conf_path, _SOURCE_ROOT)
+        errors = [i for i in payload["issues"] if i.get("severity") == "error"]
+        warns  = [i for i in payload["issues"] if i.get("severity") == "warn"]
         if errors:
             print(f'\n  ERRORS ({len(errors)}):')
             for e in errors:
-                print(f'    ! {e}')
-            return 1
-        else:
+                print(f'    ! {e["message"]}')
+        if warns:
+            print(f'\n  WARNINGS ({len(warns)}):')
+            for w in warns:
+                print(f'    ~ {w["message"]}')
+        if not errors:
             print('  Config is valid.')
             return 0
+        return 1
     except Exception as e:
         print(f'  Parse error: {e}', file=sys.stderr)
         return 1
+
+
+def cmd_inventory(args):
+    """Emit contract v0.4 inventory JSON on stdout."""
+    import json
+    from wdlib import contract
+
+    conf_path = args.config or contract.DEFAULT_CONFIG_PATH
+    with contract.StderrRedirect():
+        try:
+            if Path(conf_path).exists():
+                config = parse_v4_config(conf_path)
+            else:
+                from wdlib.config import WdConfig
+                config = WdConfig()
+            payload = contract.build_inventory(config, conf_path, _SOURCE_ROOT)
+            if not Path(conf_path).exists():
+                payload["issues"].append({
+                    "severity": "warn",
+                    "message":  f"config not found at {conf_path}; instances list is empty",
+                })
+        except Exception as e:
+            payload = {
+                "client":           contract.CLIENT_NAME,
+                "contract_version": contract.CONTRACT_VERSION,
+                "config_path":      str(Path(conf_path).resolve()),
+                "instances":        [],
+                "issues":           [{"severity": "error",
+                                      "message": f"inventory failed: {e}"}],
+            }
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_version(args):
+    """Emit contract-version JSON."""
+    import json
+    from wdlib import contract
+    json.dump({
+        "client":           contract.CLIENT_NAME,
+        "version":          contract.package_version(_SOURCE_ROOT),
+        "contract_version": contract.CONTRACT_VERSION,
+    }, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
 
 
 def cmd_verbosity(args):
@@ -1741,6 +1808,17 @@ def main():
     # validate
     p_val = sub.add_parser('validate', help='Validate config')
     p_val.add_argument('-c', '--config', help='Config file path')
+    p_val.add_argument('--json', action='store_true',
+                       help='Emit validate output as contract v0.4 JSON on stdout')
+
+    # inventory (contract §3)
+    p_inv = sub.add_parser('inventory', help='Emit contract v0.4 inventory JSON on stdout')
+    p_inv.add_argument('-c', '--config', help='Config file path')
+    p_inv.add_argument('--json', action='store_true', default=True,
+                       help='(default) Emit JSON on stdout')
+
+    # version (contract §3 companion)
+    sub.add_parser('version', help='Emit client/contract version JSON on stdout')
 
     # verbosity
     p_verb = sub.add_parser('verbosity', help='Change log verbosity')
@@ -1763,6 +1841,8 @@ def main():
         'teardown': cmd_teardown,
         'status': cmd_status,
         'validate': cmd_validate,
+        'inventory': cmd_inventory,
+        'version': cmd_version,
         'verbosity': cmd_verbosity,
         'install-deps': cmd_install_deps,
     }
