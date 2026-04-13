@@ -156,15 +156,24 @@ decode_window() {
             #   (no-grid variant: $6=call $7=pwr $8=drift $9=sync — 16 fields)
             sort -k1,2 -k5,5 "${all_wspr}" > "${WD_RECORDING_DIR}/sort.tmp"
             mv "${WD_RECORDING_DIR}/sort.tmp" "${all_wspr}"
-            comm --nocheck-order -13 "${all_wspr_save}" "${all_wspr}" \
+            local new_spots
+            new_spots=$(comm --nocheck-order -13 "${all_wspr_save}" "${all_wspr}" \
                 | sort -k1,2 -k5,5 \
-                | grep -v '<\.\.\.>' \
-                | awk -v wn_type="${wn_type}" '
+                | grep -v '<\.\.\.>')
+
+            # Log hash-resolved spots (<CALLSIGN>) to a separate file for review
+            local hash_log="${WD_LOG_DIR}/hash_spots.log"
+            grep '<' <<< "${new_spots}" \
+                | awk -v band="${WD_RECEIVER_BAND}" \
+                    '{ print strftime("%Y-%m-%dT%H:%M:%SZ"), band, $0 }' \
+                >> "${hash_log}" || true
+
+            awk -v wn_type="${wn_type}" '
                     NF >= 17 { printf "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d\n",
                                    $1,$2,$10,$3,$4,$5,$6,$7,$8,$9,wn_type; next }
                     NF == 16 { printf "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d\n",
                                    $1,$2,$9,$3,$4,$5,$6,"      ",$7,$8,wn_type; next }
-                ' > "${spots_file}" || true
+                ' <<< "${new_spots}" > "${spots_file}" || true
 
             # Truncate ALL_WSPR.TXT if it exceeds the size limit to prevent unbounded growth
             local all_wspr_size
