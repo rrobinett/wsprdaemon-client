@@ -16,6 +16,7 @@ PartOf=wsprdaemon.target
 Type=simple
 User=wsprdaemon
 Group=radio
+EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=/etc/wsprdaemon/env/wd-ka9q-record@%i.env
 ExecStart=/usr/local/sbin/wd-ka9q-record
 WorkingDirectory=/var/spool/wsprdaemon/recording/%i

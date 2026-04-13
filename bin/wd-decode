@@ -8,6 +8,15 @@
 
 set -euo pipefail
 
+# Contract §11 log-level resolution + SIGHUP handler.
+for _d in /opt/wsprdaemon/lib /usr/local/share/wsprdaemon/lib; do
+    if [[ -r "${_d}/wd-loglevel.sh" ]]; then
+        # shellcheck source=/dev/null
+        . "${_d}/wd-loglevel.sh"
+        break
+    fi
+done
+
 # Resolve decoder binaries from the project's decoders directory.
 # Never rely on PATH — these are versioned project binaries.
 _DECODER_DIR="/opt/wsprdaemon/bin/decoders"
@@ -54,6 +63,36 @@ if [[ "${WD_RECEIVER_TYPE}" == "ka9q" || "${WD_RECEIVER_TYPE}" == "ka9q_wwv" ]];
     use_inotify=true
 fi
 
+# Sidecar gate: if a wspr-recorder JSON sidecar exists next to the WAV,
+# honor its authoritative decode_modes / period_seconds. Return 0 if the
+# WAV should be decoded for this mode, 1 if the sidecar explicitly excludes
+# it. Absent or unparseable sidecars are treated as "no opinion" (return 0)
+# so the Kiwi path (which emits no sidecar) still works unchanged.
+sidecar_permits_mode() {
+    local wav_file="$1"
+    local mode="$2"
+    local window="${mode:1}"
+    local expected_period=$(( window * 60 ))
+    local sidecar="${wav_file%.wav}.json"
+    [[ -r "${sidecar}" ]] || return 0
+    python3 - "${sidecar}" "${mode}" "${expected_period}" <<'PY' || return 1
+import json, sys
+path, mode, expected_period = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    with open(path) as f:
+        meta = json.load(f)
+except Exception:
+    sys.exit(0)
+modes = meta.get("decode_modes")
+if isinstance(modes, list) and mode not in modes:
+    sys.exit(1)
+period = meta.get("period_seconds")
+if isinstance(period, int) and period != expected_period:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
 decode_window() {
     # $1 = mode string (e.g., W2, F2, F5)
     local mode="$1"
@@ -71,6 +110,10 @@ decode_window() {
 
     if [[ -z "${wav_file}" ]]; then
         return 0  # No period-length WAV ready yet
+    fi
+
+    if ! sidecar_permits_mode "${wav_file}" "${mode}"; then
+        return 0  # wspr-recorder sidecar says this mode is not for this WAV
     fi
 
     # Check that the file starts on the correct UTC minute boundary for this mode:

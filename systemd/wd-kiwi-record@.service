@@ -18,6 +18,7 @@ PartOf=wsprdaemon.target
 Type=simple
 User=wsprdaemon
 Group=radio
+EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=/etc/wsprdaemon/env/wd-kiwi-record@%i.env
 ExecStart=/usr/local/sbin/wd-kiwi-record
 ExecStopPost=/usr/local/sbin/wd-kiwi-cleanup %i

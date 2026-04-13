@@ -14,6 +14,7 @@ PartOf=wsprdaemon.target
 Type=simple
 User=wsprdaemon
 Group=radio
+EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=/etc/wsprdaemon/env/wd-post@%i.env
 ExecStart=/usr/local/sbin/wd-post
 WorkingDirectory=/var/spool/wsprdaemon/posting

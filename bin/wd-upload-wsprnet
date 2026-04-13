@@ -24,6 +24,7 @@ Environment variables:
 """
 
 import os
+import signal
 import sys
 import time
 import re
@@ -591,12 +592,37 @@ def _cycle_end_epoch(cyc_date: str, cyc_time: str) -> float:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _resolve_log_level() -> int:
+    """Contract §11: CLI > WSPRDAEMON_LOG_LEVEL > CLIENT_LOG_LEVEL > INFO."""
+    for var in ('WSPRDAEMON_LOG_LEVEL', 'CLIENT_LOG_LEVEL'):
+        val = os.environ.get(var, '').strip().upper()
+        if val in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
+            return getattr(logging, val)
+    return logging.INFO
+
+
+def _sighup_handler(_signum, _frame):
+    """Re-read log level on SIGHUP (§11)."""
+    coord = '/etc/sigmond/coordination.env'
+    if os.path.isfile(coord):
+        with open(coord) as f:
+            for line in f:
+                line = line.strip()
+                if '=' not in line or line.startswith('#'):
+                    continue
+                k, v = line.split('=', 1)
+                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+    logging.getLogger().setLevel(_resolve_log_level())
+    log.info('SIGHUP: log level now %s', logging.getLevelName(logging.getLogger().level))
+
+
 def main() -> int:
     logging.basicConfig(
-        level=logging.INFO,
+        level=_resolve_log_level(),
         format='%(asctime)sZ %(name)s %(levelname)s %(message)s',
         datefmt='%Y-%m-%dT%H:%M:%S',
     )
+    signal.signal(signal.SIGHUP, _sighup_handler)
     log.info('starting: reporter %s %s  queue: %s  poll=%ds stable=%d',
              REPORTER_CALL, REPORTER_GRID, UPLOAD_DIR, POLL_INTERVAL, STABLE_POLLS)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)

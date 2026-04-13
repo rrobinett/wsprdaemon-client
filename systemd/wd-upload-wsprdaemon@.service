@@ -15,6 +15,7 @@ PartOf=wsprdaemon.target
 Type=simple
 User=wsprdaemon
 Group=radio
+EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=/etc/wsprdaemon/env/wd-upload-wsprdaemon@%I.env
 ExecStart=/usr/local/sbin/wd-upload-wsprdaemon
 
