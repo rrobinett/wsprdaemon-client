@@ -124,18 +124,20 @@ def _valid_spot(line: str) -> bool:
 
 
 def _has_hash_callsign(line: str) -> bool:
-    """Return True if the callsign field (column 7) is an unresolved hash.
+    """Return True if the callsign field (column 7) is an UNRESOLVED hash.
 
-    When jt9 cannot resolve a hash to a real callsign it outputs the raw hash
-    value in angle brackets, e.g. '<A1B2C>'.  These spots are meaningless to
-    wsprnet (no real callsign) and are rejected server-side, so we drop them
-    before uploading.
+    wsprd outputs '<...>' (literal three dots) when it cannot resolve a
+    22-bit hash to a real callsign.  These are meaningless and dropped.
+
+    Hash-RESOLVED callsigns like '<AC6NN>' (angle brackets around a real
+    callsign) are valid WSPR type-3 spots — wsprnet.org accepts them —
+    and must NOT be filtered.
     """
     p = line.split()
     if len(p) < 7:
         return False
     call = p[6]
-    return call.startswith('<') and call.endswith('>')
+    return call == '<...>'
 
 
 def read_batch(files: list) -> tuple:
@@ -155,7 +157,7 @@ def read_batch(files: list) -> tuple:
         except OSError as e:
             log.warning('cannot read %s: %s', f.name, e)
             continue
-        # Split into uploadable spots and unresolved-hash spots
+        # Drop only truly unresolved hashes (<...>); resolved <CALL> spots pass through
         new = []
         for l in raw:
             if _has_hash_callsign(l):
