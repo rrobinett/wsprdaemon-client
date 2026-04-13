@@ -77,7 +77,9 @@ lib/wdlib/
 - `apply` — Parse config, generate env files, reconcile running services
 - `teardown` — Stop and disable all services
 - `status` — Show service status
-- `validate` — Check config for errors
+- `validate [--json]` — Check config for errors (contract §12)
+- `inventory` — Emit contract v0.4 inventory JSON (§3)
+- `version` — Emit client/contract version JSON
 - `verbosity up|down SERVICE|all` — Dynamic log verbosity via USR1/USR2
 
 ## Key collaborator
