@@ -1,0 +1,49 @@
+#!/bin/bash
+# wdwatch — monitor the wsprdaemon decode→upload pipeline with clean timestamps
+#
+# Usage: wdwatch [BAND [MODE]]
+#   BAND  filter decode lines to this band (e.g. 20, 40, 2200) — optional
+#   MODE  filter decode lines to this mode (e.g. W2, F2, F5)  — optional
+#
+# Upload lines are always shown regardless of filters.
+# Timestamps are reformatted from ISO-8601 to YYMMDD HHMM (spot file format).
+#
+# Examples:
+#   wdwatch           # all bands, all modes
+#   wdwatch 20        # 20m only (all modes)
+#   wdwatch 20 W2     # 20m W2 mode only
+
+BAND="${1:-}"
+MODE="${2:-}"
+
+sudo journalctl -f \
+        -u 'wd-decode@*' \
+        -u 'wd-upload-wsprnet@*' \
+        --output=short-iso \
+    | grep --line-buffered -E 'DECODE START|DECODE DONE|UPLOAD START|UPLOAD DONE|UPLOAD FAILED|MULTI CYCLE|PARTIAL DUMP|DIAG START|DIAG DONE|DIAG REJECT|DIAG REPORT' \
+    | awk -v band="${BAND}" -v mode="${MODE}" '
+        {
+            # Reformat  2026-04-11T20:57:57+0000  →  260411 20:57:57
+            ts     = $1
+            new_ts = substr(ts,3,2) substr(ts,6,2) substr(ts,9,2) \
+                     " " substr(ts,12,2) ":" substr(ts,15,2) ":" substr(ts,18,2)
+
+            # Extract the keyword and everything after it.
+            # Works for both bash (keyword at field 4) and Python logger
+            # (Python prepends its own timestamp before the keyword).
+            if (!match($0, /DECODE START|DECODE DONE|UPLOAD START|UPLOAD DONE|UPLOAD FAILED|MULTI CYCLE|PARTIAL DUMP|DIAG START|DIAG DONE|DIAG REJECT|DIAG REPORT/))
+                next
+            msg = substr($0, RSTART)
+
+            # Upload / multi-cycle / partial-dump / diagnostic lines always pass through.
+            if (msg ~ /^UPLOAD|^MULTI|^PARTIAL|^DIAG/) { print new_ts "  " msg; next }
+
+            # Decode lines: band filter (exact number, not a prefix of a longer number)
+            if (band != "" && msg !~ ("band=" band "( |$)")) next
+
+            # Decode lines: mode filter — case-insensitive (accept w2 or W2)
+            if (mode != "" && tolower(msg) !~ ("mode=" tolower(mode) "( |$)")) next
+
+            print new_ts "  " msg
+        }
+    '

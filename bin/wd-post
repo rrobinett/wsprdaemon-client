@@ -28,8 +28,8 @@ while true; do
     # wd-decode delivers spot files via mv (rename), which generates moved_to,
     # NOT close_write. Watch moved_to so we wake up immediately when a file lands.
     # Also watch close_write for any case where files are written directly.
-    # Timeout of 120s ensures we still process files even if inotify misses one.
-    inotifywait -q -e moved_to -e close_write -t 120 "${WD_POSTING_DIR}" \
+    # Timeout of 5s ensures we still process files even if inotify misses one.
+    inotifywait -q -e moved_to -e close_write -t 5 "${WD_POSTING_DIR}" \
         --include '_spots\.txt$' >/dev/null 2>&1 || true
 
     # Process all spot files currently in the posting directory

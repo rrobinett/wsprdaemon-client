@@ -2,7 +2,7 @@
 # /usr/local/sbin/wd-ka9q-record
 # Thin wrapper — validates env vars and execs the Python recorder.
 # Channel creation and wav recording are handled by wd-ka9q-record.py
-# using ka9q-python (RadiodControl + ManagedStream).
+# using ka9q-python (RadiodControl + MultiStream).
 
 set -euo pipefail
 
