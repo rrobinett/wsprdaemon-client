@@ -107,14 +107,14 @@ decode_window() {
     local t_decode_start
     t_decode_start=$(date +%s)
 
-    # Normalise to -1 dBFS peak and write as 16-bit PCM with the WSPR timestamp
-    # filename so wsprd embeds the correct date/time in ALL_WSPR.TXT.
-    # wspr-recorder already delivers int16 WAV; sox here only normalises.
+    # wspr-recorder already delivers a normalized (-1 dBFS peak) int16 WAV.
+    # Just copy it to the WSPR timestamp filename so wsprd embeds the correct
+    # date/time in ALL_WSPR.TXT. No sox normalization needed or wanted.
     local concat_wav="${WD_RECORDING_DIR}/${wspr_ts}.wav"
-    sox "${wav_file}" -b 16 -e signed-integer "${concat_wav}" norm -1 2>/dev/null
+    cp "${wav_file}" "${concat_wav}"
 
     if [[ ! -s "${concat_wav}" ]]; then
-        echo "wd-decode: sox concatenation failed for mode ${mode}"
+        echo "wd-decode: cp failed for mode ${mode}"
         return 1
     fi
 
