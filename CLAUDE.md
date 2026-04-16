@@ -1,5 +1,59 @@
 # CLAUDE.md — wsprdaemon v4 Development Briefing
 
+## Generic Workflow Orchestration
+
+### 1. Plan Mode Default
+- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- If something goes sideways, STOP and re-plan immediately — don't keep pushing
+- Use plan mode for verification steps, not just building
+- Write detailed specs upfront to reduce ambiguity
+
+### 2. Subagent Strategy
+- Use subagents liberally to keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, throw more compute at it via subagents
+- One task per subagent for focused execution
+
+### 3. Self-Improvement Loop
+- After ANY correction from the user: update `tasks/lessons.md` with the pattern
+- Write rules for yourself that prevent the same mistake
+- Ruthlessly iterate on these lessons until mistake rate drops
+- Review lessons at session start for relevant project
+
+### 4. Verification Before Done
+- Never mark a task complete without proving it works
+- Diff behavior between main and your changes when relevant
+- Ask yourself: "Would a staff engineer approve this?"
+- Run tests, check logs, demonstrate correctness
+
+### 5. Demand Elegance (Balanced)
+- For non-trivial changes: pause and ask "is there a more elegant way?"
+- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
+- Skip this for simple, obvious fixes — don't over-engineer
+- Challenge your own work before presenting it
+
+### 6. Autonomous Bug Fixing
+- When given a bug report: just fix it. Don't ask for hand-holding
+- Point at logs, errors, failing tests — then resolve them
+- Zero context switching required from the user
+- Go fix failing CI tests without being told how
+
+## Task Management
+
+1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
+2. **Verify Plan**: Check in before starting implementation
+3. **Track Progress**: Mark items complete as you go
+4. **Explain Changes**: High-level summary at each step
+5. **Document Results**: Add review section to `tasks/todo.md`
+6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+
+## Core Principles
+
+- **Simplicity First**: Make every change as simple as possible. Impact minimal code.
+- **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
+- **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
+
 ## What this project is
 
 wsprdaemon is a Linux system that decodes WSPR and FST4W weak-signal radio
@@ -89,13 +143,29 @@ as an external dependency.
 
 ## Testing
 
-Run tests: `python3 -m unittest tests.test_migration -v`
-Currently 57 tests, 56 pass, 1 skip (merge env naming edge case).
+`tests/` currently holds only a sample `wsprdaemon.conf` used as the canonical
+minimal config. The Python unittest suite referenced in earlier drafts of this
+briefing is not in the tree. New tests should land in `tests/` and be runnable
+with `python3 -m unittest discover tests`.
 
-## What's next
+## Documentation layout
 
-1. `wd-ctl apply` implementation (compute desired service set, diff with running)
-2. BindsTo= drop-in generation for KA9Q decoder→recorder dependency
-3. Schedule evaluation (Kiwi channel management)
-4. tmpfs sizing calculator in the installer
-5. Upload daemons (wd-upload-wsprnet, wd-upload-wsprdaemon)
+- `README.md` — project entry point, install, quick start
+- `docs/OPERATIONS.md` — operator runbook
+- `docs/CONFIGURATION.md` — INI config reference
+- `docs/SERVICES.md` — per-systemd-unit reference
+- `docs/CLI_REFERENCE.md` — `wd-ctl` and `wd-*` script reference
+- `docs/INTEGRATION.md` — relationships with wspr-recorder, ka9q-python, hf-timestd, radiod
+- `docs/SIGMOND.md` — coordinator integration, contract v0.4 conformance
+- `wd-v4-architecture.md` — v0.10 design spec (some sections spec-only)
+- `deploy.toml`, `deps.conf` — contract §5 manifest and pinned dependency list
+
+## What's next (open work, 2026-04-15)
+
+1. `wd-hftime@INSTANCE.service` — no unit in `systemd/` yet; integration with
+   hf-timestd is spec-only (see arch §3.2).
+2. `wsprdaemon.target` exists; `wsprdaemon.service`/`.timer` orchestrator
+   (arch §3.7) still to land.
+3. tmpfs sizing calculator in the installer.
+4. `wd-upload-grape` daemon (arch §3.6) — optional, not started.
+5. Python test suite for wdlib (parsers, envgen, contract surfaces).

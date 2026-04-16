@@ -1,5 +1,34 @@
 # wsprdaemon v4 — Service-Oriented Architecture Specification (v0.10, 2026-03-31)
 
+> **Reading this document.** This is the design spec, not an implementation
+> status page. Some sections describe pieces already in the tree; others
+> describe intended behavior that has not yet landed. Running-code references
+> below track the state as of 2026-04-15.
+>
+> **Implemented:** §2.1 service taxonomy (units present in [systemd/](systemd/)),
+> §2.2 instance naming, §2.3 env/config passing (see [lib/wdlib/envgen.py](lib/wdlib/envgen.py)),
+> §2.4 INI format (see [lib/wdlib/v4_parser.py](lib/wdlib/v4_parser.py) and
+> [tests/wsprdaemon.conf](tests/wsprdaemon.conf)), §3.1 `wd-kiwi-record@`,
+> §3.3 `wd-ka9q-record@`, §3.4 `wd-decode@`, §3.5 `wd-post@` including
+> best-SNR merging, §3.6 `wd-upload-wsprnet`/`wd-upload-wsprdaemon`,
+> housekeeping via `wd-spool-clean.service`/`.timer`, §4 `wd-ctl` orchestrator
+> verbs (`apply`/`teardown`/`status`/`validate`/`inventory`/`version`/
+> `verbosity`/`migrate-config`), §10 log paths, §11 SIGHUP log-level re-read,
+> §12 validate hardening.
+>
+> **Spec-only (not yet in `systemd/` or implemented):**
+>
+> - §3.2 `wd-hftime@INSTANCE.service` — hf-timestd integration; no unit file yet.
+> - §3.6 `wd-upload-grape.service` — optional GRAPE uploader; not started.
+> - §3.7 `wsprdaemon.service` + `wsprdaemon.timer` orchestrator — `wsprdaemon.target`
+>   exists, but the schedule-evaluator service/timer pair is not in the tree.
+> - §2.1.2 SDRplay API auto-install path — the Fobos/RX888 paths are defined,
+>   but SDRplay (closed-source) requires manual setup at this time.
+>
+> For operator-facing walkthroughs, see [README.md](README.md) and
+> [docs/](docs/). This spec is referenced from those docs but is not the
+> place to start reading.
+
 ## 1. Current Architecture Summary
 
 wsprdaemon today is a ~15,700-line monolithic bash program. All `.sh` files are `source`'d
