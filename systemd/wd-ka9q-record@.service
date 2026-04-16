@@ -23,6 +23,11 @@ WorkingDirectory=/var/spool/wsprdaemon/recording/%i
 
 Restart=always
 RestartSec=5
+# wspr-recorder accumulates memory over time (unprocessed ring buffer samples),
+# causing processing lag to grow until WAV files contain stale audio.
+# Force a periodic restart before drift becomes large enough to corrupt decodes.
+# At observed growth rates (~3s/min), 45 minutes keeps cumulative drift under 135s.
+RuntimeMaxSec=45min
 
 StandardOutput=journal
 StandardError=journal

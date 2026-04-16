@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+wd-extend-spots -- transform ALL_WSPR.TXT new-spot lines into the 34-field
+extended wsprdaemon.org upload format.
+
+Usage:
+    wd-extend-spots <rms_noise> <fft_noise> <overloads> <rx_call> <rx_grid> < new_spots.txt
+
+Reads raw ALL_WSPR.TXT lines from stdin (17–19 fields for type-1/type-3).
+Writes one 34-field extended line per spot to stdout.
+
+Extended field order (matches wsprdaemon v3 server expectation):
+  1  spot_date          2  spot_time          3  spot_sync_quality
+  4  spot_snr           5  spot_dt            6  spot_freq
+  7  spot_call          8  spot_grid          9  spot_pwr
+ 10  spot_drift        11  spot_cycles       12  spot_jitter
+ 13  spot_blocksize    14  spot_metric (spreading*1000)
+ 15  spot_decodetype   16  spot_ipass        17  spot_nhardmin
+ 18  spot_pkt_mode     19  rms_noise         20  fft_noise
+ 21  band              22  rx_grid           23  rx_call
+ 24  km                25  rx_az             26  rx_lat
+ 27  rx_lon            28  tx_az             29  tx_lat
+ 30  tx_lon            31  v_lat             32  v_lon
+ 33  overloads_count   34  proxy_upload_flag
+"""
+
+import sys
+import math
+
+ABSENT = -999.0
+
+# Output format string — 34 fields
+_FMT = (
+    "%6s %4s %5.2f %6.2f %5.2f %12.7f %-14s %-6s "
+    "%2d %2d %4d %4d %4d %4d %2d %3d %3d %2d "
+    "%6.1f %6.1f %4d %6s %12s "
+    "%5d %6.1f %6.1f %6.1f %6.1f %6.1f %6.1f %6.1f %6.1f "
+    "%4d %4d"
+)
+
+
+def _loc_to_lat_lon(locator: str):
+    """Convert 4 or 6-char Maidenhead locator to (lat, lon) degrees."""
+    d = list(locator.strip())
+    lat = ((ord(d[1]) - 65) * 10) + (ord(d[3]) - 48) + 0.5 - 90.0
+    lon = ((ord(d[0]) - 65) * 20) + ((ord(d[2]) - 48) * 2) + 1.0 - 180.0
+    if len(locator.strip()) == 6:
+        base = 96 if ord(d[4]) > 88 else 64
+        lat = lat - 0.5 + (ord(d[5]) - base) / 24.0 - 1.0/48.0
+        lon = lon - 1.0 + (ord(d[4]) - base) / 12.0 - 1.0/24.0
+    return lat, lon
+
+
+def _freq_to_band(freq_mhz: float) -> int:
+    freq10 = int(10 * freq_mhz)
+    return {
+        1: 2200, 4: 630, 18: 160, 35: 80, 52: 60, 53: 60,
+        70: 40, 101: 30, 140: 20, 181: 17, 210: 15, 249: 12,
+        281: 10, 502: 6, 700: 4, 1444: 2, 4323: 70, 12965: 23,
+    }.get(freq10, 9999)
+
+
+def _derive_geo(tx_grid: str, rx_grid: str, freq_mhz: float):
+    """Return (band, km, rx_az, rx_lat, rx_lon, tx_az, tx_lat, tx_lon, v_lat, v_lon)."""
+    band = _freq_to_band(freq_mhz)
+    ab = ABSENT
+    if tx_grid.lower() == "none" or len(tx_grid.strip()) < 4:
+        return band, ab, ab, ab, ab, ab, ab, ab, ab, ab
+
+    try:
+        tx_lat, tx_lon = _loc_to_lat_lon(tx_grid)
+        rx_lat, rx_lon = _loc_to_lat_lon(rx_grid)
+    except Exception:
+        return band, ab, ab, ab, ab, ab, ab, ab, ab, ab
+
+    phi_tx = math.radians(tx_lat)
+    lam_tx = math.radians(tx_lon)
+    phi_rx = math.radians(rx_lat)
+    lam_rx = math.radians(rx_lon)
+    d_phi = phi_tx - phi_rx
+    d_lam = lam_tx - lam_rx
+
+    # rx azimuth (bearing from rx toward tx)
+    y = math.sin(d_lam) * math.cos(phi_tx)
+    x = math.cos(phi_rx)*math.sin(phi_tx) - math.sin(phi_rx)*math.cos(phi_tx)*math.cos(d_lam)
+    rx_azi = math.degrees(math.atan2(y, x)) % 360
+
+    # tx azimuth (bearing from tx toward rx)
+    y2 = math.sin(-d_lam) * math.cos(phi_rx)
+    x2 = math.cos(phi_tx)*math.sin(phi_rx) - math.sin(phi_tx)*math.cos(phi_rx)*math.cos(-d_lam)
+    tx_azi = math.degrees(math.atan2(y2, x2)) % 360
+
+    # great-circle distance (km)
+    a = (math.sin(d_phi/2)**2
+         + math.cos(phi_rx) * math.cos(phi_tx) * math.sin(d_lam/2)**2)
+    c = 2 * math.atan2(math.sqrt(max(0.0, a)), math.sqrt(max(0.0, 1-a)))
+    km = 6371.0 * c
+
+    # path vertex (highest-latitude point on great circle)
+    try:
+        v_lat_rad = math.acos(
+            math.cos(phi_rx) * math.cos(phi_tx)
+            * abs(math.sin(d_lam/2)) / math.sin(c/2)
+        ) if c > 1e-9 else phi_rx
+        v_lat = math.degrees(v_lat_rad) * (1 if tx_lat > rx_lat else -1)
+        v_lon = (tx_lon + rx_lon) / 2.0
+    except Exception:
+        v_lat = ab
+        v_lon = ab
+
+    return band, km, rx_azi, rx_lat, rx_lon, tx_azi, tx_lat, tx_lon, v_lat, v_lon
+
+
+def main():
+    if len(sys.argv) < 6:
+        print(
+            f"Usage: {sys.argv[0]} rms_noise fft_noise overloads rx_call rx_grid",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    rms_noise = float(sys.argv[1])
+    fft_noise = float(sys.argv[2])
+    overloads = int(float(sys.argv[3]))
+    rx_call   = sys.argv[4]
+    rx_grid   = sys.argv[5]
+
+    for raw in sys.stdin:
+        line = raw.rstrip()
+        if not line:
+            continue
+        fields = line.split()
+        n = len(fields)
+
+        # ALL_WSPR.TXT field layout (wsprd v2.2+, 19 fields with grid):
+        #  1=date  2=time  3=snr  4=dt  5=freq  6=call  7=grid  8=pwr  9=drift
+        # 10=sync  11=ipass  12=blocksize  13=jitter  14=decodetype
+        # 15=nhardmin  16=cycles  17=metric  18=spreading  19=pkt_mode
+        # Without grid (18 fields): grid absent, same otherwise.
+        # Older wsprd (17 fields with grid): no spreading/pkt_mode fields.
+
+        if n >= 19:
+            (date_, time_, snr, dt, freq, call_, grid_tx,
+             pwr, drift, sync_, ipass, blocksize, jitter, decodetype,
+             nhardmin, cycles, metric_raw, spreading, pkt_mode) = fields[:19]
+        elif n == 18:
+            # no grid
+            (date_, time_, snr, dt, freq, call_,
+             pwr, drift, sync_, ipass, blocksize, jitter, decodetype,
+             nhardmin, cycles, metric_raw, spreading, pkt_mode) = fields[:18]
+            grid_tx = "none"
+        elif n == 17:
+            # older wsprd with grid, no spreading/pkt_mode
+            (date_, time_, snr, dt, freq, call_, grid_tx,
+             pwr, drift, sync_, ipass, blocksize, jitter, decodetype,
+             nhardmin, cycles, metric_raw) = fields[:17]
+            spreading = "0.0"
+            pkt_mode  = "0"
+        elif n == 16:
+            # older wsprd without grid
+            (date_, time_, snr, dt, freq, call_,
+             pwr, drift, sync_, ipass, blocksize, jitter, decodetype,
+             nhardmin, cycles, metric_raw) = fields[:16]
+            grid_tx   = "none"
+            spreading = "0.0"
+            pkt_mode  = "0"
+        else:
+            print(f"wd-extend-spots: skip line with {n} fields: {line}", file=sys.stderr)
+            continue
+
+        # spreading metric: fractional digits * 1000 (avoid float multiply)
+        try:
+            if '.' in spreading:
+                spreading_metric = int(spreading.split('.', 1)[1].ljust(3, '0')[:3])
+            else:
+                spreading_metric = 0
+        except Exception:
+            spreading_metric = 0
+
+        freq_mhz = float(freq)
+        band, km, rx_azi, rx_lat, rx_lon, tx_azi, tx_lat, tx_lon, v_lat, v_lon = \
+            _derive_geo(grid_tx, rx_grid, freq_mhz)
+
+        grid_out = grid_tx if grid_tx.lower() != "none" else "      "
+        km_int   = int(round(km))  if km   != ABSENT else -999
+        rx_az_f  = rx_azi          if rx_azi  != ABSENT else ABSENT
+        tx_az_f  = tx_azi          if tx_azi  != ABSENT else ABSENT
+
+        try:
+            print(_FMT % (
+                date_, time_,
+                float(sync_), float(snr), float(dt), freq_mhz,
+                call_, grid_out,
+                int(pwr), int(drift),
+                int(cycles), int(jitter), int(blocksize), spreading_metric,
+                int(decodetype), int(ipass), int(nhardmin), int(pkt_mode),
+                rms_noise, fft_noise,
+                band, rx_grid, rx_call,
+                km_int, rx_az_f, rx_lat if rx_lat != ABSENT else ABSENT,
+                rx_lon if rx_lon != ABSENT else ABSENT,
+                tx_az_f, tx_lat if tx_lat != ABSENT else ABSENT,
+                tx_lon if tx_lon != ABSENT else ABSENT,
+                v_lat, v_lon,
+                overloads, 0,
+            ))
+        except Exception as e:
+            print(f"wd-extend-spots: format error on line: {line!r}: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

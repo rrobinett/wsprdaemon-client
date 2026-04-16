@@ -1,10 +1,17 @@
 #!/bin/bash
 # /usr/local/sbin/wd-post
-# Posting daemon — collects decoded spot files from the posting directory,
-# performs best-SNR merging across receivers (for merge sources),
-# and queues spots for upload:
-#   - wsprnet.org: merged best-SNR union per transmitter (by reporter call+grid)
-#   - wsprdaemon.org: per-receiver spot sets (by reporter+receiver name)
+# Posting daemon — collects decoded spot files from the posting directory
+# and queues them for upload:
+#   - wsprnet.org:      short 11-field spots (all modes, merged by uploader)
+#   - wsprdaemon.org:   extended 34-field _wd_spots.txt (W-modes)
+#                       short _spots.txt (F-modes, no extended version)
+#                       noise/_noise.txt (per-cycle noise measurements, W-modes)
+#
+# File naming from wd-decode:
+#   RECV_BAND_W2_TS_spots.txt      → wsprnet only  (W-mode short)
+#   RECV_BAND_W2_TS_wd_spots.txt   → wsprdaemon    (W-mode extended)
+#   RECV_BAND_W2_TS_noise.txt      → wsprdaemon noise/ (W-mode noise)
+#   RECV_BAND_F2_TS_spots.txt      → both          (F-mode, no extended version)
 
 set -euo pipefail
 
@@ -29,48 +36,62 @@ echo "  posting dir: ${WD_POSTING_DIR}"
 # Upload directories
 WSPRNET_DIR="${WD_UPLOAD_WSPRNET_DIR:-}"
 WSPRDAEMON_DIR="${WD_UPLOAD_WSPRDAEMON_DIR:-}"
+# Noise files go into a noise/ subdirectory under the wsprdaemon upload tree
+# so the uploader bundles them in the same .tbz archive as spots.
+WSPRDAEMON_NOISE_DIR=""
+[[ -n "${WSPRDAEMON_DIR}" ]] && WSPRDAEMON_NOISE_DIR="${WSPRDAEMON_DIR}/noise"
 
-[[ -n "${WSPRNET_DIR}" ]] && mkdir -p "${WSPRNET_DIR}"
-[[ -n "${WSPRDAEMON_DIR}" ]] && mkdir -p "${WSPRDAEMON_DIR}"
+[[ -n "${WSPRNET_DIR}" ]]          && mkdir -p "${WSPRNET_DIR}"
+[[ -n "${WSPRDAEMON_DIR}" ]]       && mkdir -p "${WSPRDAEMON_DIR}"
+[[ -n "${WSPRDAEMON_NOISE_DIR}" ]] && mkdir -p "${WSPRDAEMON_NOISE_DIR}"
 
 while true; do
-    # wd-decode delivers spot files via mv (rename), which generates moved_to,
-    # NOT close_write. Watch moved_to so we wake up immediately when a file lands.
-    # Also watch close_write for any case where files are written directly.
-    # Timeout of 5s ensures we still process files even if inotify misses one.
     inotifywait -q -e moved_to -e close_write -t 5 "${WD_POSTING_DIR}" \
-        --include '_spots\.txt$' >/dev/null 2>&1 || true
+        --include '(wd_spots|_spots|_noise)\.txt$' >/dev/null 2>&1 || true
 
-    # Process all spot files currently in the posting directory
     shopt -s nullglob
-    spot_files=("${WD_POSTING_DIR}"/*_spots.txt)
+    pending=(
+        "${WD_POSTING_DIR}"/*_wd_spots.txt
+        "${WD_POSTING_DIR}"/*_noise.txt
+        "${WD_POSTING_DIR}"/*_spots.txt
+    )
     shopt -u nullglob
 
-    for spot_file in "${spot_files[@]}"; do
-        if [[ ! -s "${spot_file}" ]]; then
-            rm -f "${spot_file}"
-            continue
+    for f in "${pending[@]}"; do
+        [[ -s "${f}" ]] || { rm -f "${f}"; continue; }
+
+        bn=$(basename "${f}")
+        age=$(( $(date -u +%s) - $(stat -c %Y "${f}") ))
+        if (( age > 600 )); then
+            echo "wd-post: dropping stale (${age}s): ${bn}"
+            rm -f "${f}"; continue
         fi
 
-        # Drop stale files older than 10 minutes — they missed their upload window
-        local_age=$(( $(date -u +%s) - $(stat -c %Y "${spot_file}") ))
-        if (( local_age > 600 )); then
-            echo "wd-post: dropping stale spot file (${local_age}s old): $(basename "${spot_file}")"
-            rm -f "${spot_file}"
-            continue
+        if [[ "${bn}" == *_wd_spots.txt ]]; then
+            # Extended W-mode spots → wsprdaemon only
+            [[ -n "${WSPRDAEMON_DIR}" ]] && cp "${f}" "${WSPRDAEMON_DIR}/"
+
+        elif [[ "${bn}" == *_noise.txt ]]; then
+            # Noise measurement → wsprdaemon noise subdir only
+            [[ -n "${WSPRDAEMON_NOISE_DIR}" ]] && cp "${f}" "${WSPRDAEMON_NOISE_DIR}/"
+
+        else
+            # Short spots file (_spots.txt).
+            # W-mode: wsprnet only (extended version handles wsprdaemon).
+            # F-mode: both queues (no extended version exists for F-modes).
+            # Distinguish by mode field in filename: RECV_BAND_MODE_TS_spots.txt
+            # Mode field contains W or F as first character.
+            local_mode=""
+            if [[ "${bn}" =~ _([WF][0-9]+)_ ]]; then
+                local_mode="${BASH_REMATCH[1]}"
+            fi
+
+            [[ -n "${WSPRNET_DIR}" ]] && cp "${f}" "${WSPRNET_DIR}/"
+            if [[ -n "${WSPRDAEMON_DIR}" && "${local_mode:0:1}" != "W" ]]; then
+                cp "${f}" "${WSPRDAEMON_DIR}/"
+            fi
         fi
 
-        # Queue for wsprdaemon.org upload (per-receiver, unmerged)
-        if [[ -n "${WSPRDAEMON_DIR}" ]]; then
-            cp "${spot_file}" "${WSPRDAEMON_DIR}/"
-        fi
-
-        # Queue for wsprnet.org upload (will be merged by upload daemon)
-        if [[ -n "${WSPRNET_DIR}" ]]; then
-            cp "${spot_file}" "${WSPRNET_DIR}/"
-        fi
-
-        # Remove processed spot file
-        rm -f "${spot_file}"
+        rm -f "${f}"
     done
 done

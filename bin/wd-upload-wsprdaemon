@@ -86,8 +86,19 @@ UPLOAD_INTERVAL = 10          # minimum seconds between successful uploads
 # ---------------------------------------------------------------------------
 
 def collect_files() -> list:
-    """Return all spot files in queue tree, sorted oldest-first."""
-    return sorted(UPLOAD_DIR.rglob('*_spots.txt'), key=lambda p: p.stat().st_mtime)
+    """Return all uploadable files in queue tree, sorted oldest-first.
+
+    The wsprdaemon queue directory receives three file types from wd-post:
+      *_wd_spots.txt   — extended 34-field spots (W-mode)
+      *_spots.txt      — short 11-field spots (F-mode only; W-mode goes to wsprnet queue)
+      noise/*_noise.txt — 15-field per-cycle noise measurements (W-mode)
+    """
+    candidates = (
+        list(UPLOAD_DIR.rglob('*_wd_spots.txt'))
+        + list(UPLOAD_DIR.rglob('*_spots.txt'))
+        + list(UPLOAD_DIR.rglob('*_noise.txt'))
+    )
+    return sorted(set(candidates), key=lambda p: p.stat().st_mtime)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +110,7 @@ def _config_bytes() -> bytes:
     lines = [
         f'CLIENT_VERSION={VERSION}',
         'UPLOADS_WSPRNET_LINE_FORMAT_VERSION=1',
-        'UPLOADS_WSPRDAEMON_SPOT_LINE_FORMAT_VERSION=2',
+        'UPLOADS_WSPRDAEMON_SPOT_LINE_FORMAT_VERSION=3',
         'SIGNAL_LEVEL_UPLOAD=yes',
     ]
     return '\n'.join(lines).encode() + b'\n'
@@ -348,6 +359,15 @@ def main() -> int:
 
             log.info('uploading %d files / %d spot-bytes → %s (%d tar bytes)',
                      len(files), total_bytes, tar_name, tar_size)
+            for f in files:
+                try:
+                    tag = 'noise' if '_noise.txt' in f.name else \
+                          'wd'    if '_wd_spots.txt' in f.name else 'spot'
+                    for line in f.read_text().splitlines():
+                        if line.strip():
+                            log.info('%s  [%s]  %s', tag, f.parent.name, line)
+                except OSError:
+                    pass
 
             # Phase 5: upload (SFTP preferred, FTP fallback)
             if not upload(tar_path, tar_name):

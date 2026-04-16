@@ -45,6 +45,67 @@ fi
 : "${WD_POSTING_DIR:?}"
 : "${WD_RUN_DIR:?}"
 
+# Optional — present in all current env files; default gracefully if absent.
+WD_RECEIVER_CALL="${WD_RECEIVER_CALL:-UNKNOWN}"
+WD_RECEIVER_GRID="${WD_RECEIVER_GRID:-AA00}"
+
+# Extended-spot tooling
+_C2_NOISE_PY="/opt/wsprdaemon/bin/c2_noise.py"
+_WD_EXTEND_SPOTS="/usr/local/sbin/wd-extend-spots"
+# Pre-TX / post-TX time windows used to sample background noise from the wav.
+# Units: seconds from wav start.  WSPR-2 wav = 120 s total.
+#   Pre-TX  : 0.25 – 0.75 s  (before beacon starts at ~1 s)
+#   TX      : 1    – 110 s   (the beacon transmission window)
+#   Post-TX : 113  – 118 s   (after beacon ends)
+_NOISE_PRE_START=0.25;  _NOISE_PRE_LEN=0.5
+_NOISE_TX_START=1;      _NOISE_TX_LEN=109
+_NOISE_POST_START=113;  _NOISE_POST_LEN=5
+
+# Extract 4 dB stats (Pk, RMS, RMSpk, RMStr) from one time window of a wav.
+_wav_window_stats() {
+    local wav=$1 start=$2 len=$3
+    sox "${wav}" -t wav - trim "${start}" "${len}" 2>/dev/null \
+        | sox - -n stats 2>&1 \
+        | awk '/dB/{printf "%s ", $NF}'
+    echo
+}
+
+# Compute the 15-field noise line for a decoded wav+c2 pair.
+# Outputs nothing (and returns 1) on failure.
+_compute_noise_line() {
+    local wav=$1 c2=$2
+    local pre tx post
+    pre=$(_wav_window_stats "${wav}" "${_NOISE_PRE_START}"  "${_NOISE_PRE_LEN}")
+    tx=$( _wav_window_stats "${wav}" "${_NOISE_TX_START}"   "${_NOISE_TX_LEN}")
+    post=$(_wav_window_stats "${wav}" "${_NOISE_POST_START}" "${_NOISE_POST_LEN}")
+
+    local pre_list=( ${pre} )
+    local tx_list=(  ${tx}  )
+    local post_list=( ${post} )
+
+    if (( ${#pre_list[@]} != 4 || ${#tx_list[@]} != 4 || ${#post_list[@]} != 4 )); then
+        echo "wd-decode noise: unexpected sox field count pre=${#pre_list[@]} tx=${#tx_list[@]} post=${#post_list[@]}" >&2
+        return 1
+    fi
+
+    # rms_noise = min(pre RMS Tr dB [field 4], post RMS Tr dB [field 4])
+    local pre_rms="${pre_list[3]}"
+    local post_rms="${post_list[3]}"
+    local rms_noise
+    if (( $(echo "${pre_rms} < ${post_rms}" | bc -l) )); then
+        rms_noise="${pre_rms}"
+    else
+        rms_noise="${post_rms}"
+    fi
+
+    local fft_noise="0.00"
+    if [[ -f "${c2}" && -x "${_C2_NOISE_PY}" ]] || python3 -c "" 2>/dev/null; then
+        fft_noise=$(python3 "${_C2_NOISE_PY}" "${c2}" 2>/dev/null | tr -d ' ') || fft_noise="0.00"
+    fi
+
+    echo "${pre} ${tx} ${post} ${rms_noise} ${fft_noise} 0"
+}
+
 mkdir -p "${WD_POSTING_DIR}"
 
 readonly MAX_ALL_WSPR_SIZE=200000   # ~200KB — truncate when exceeded (v3 uses same limit)
@@ -215,6 +276,7 @@ decode_window() {
                     '{ print strftime("%Y-%m-%dT%H:%M:%SZ"), band, $0 }' \
                 >> "${hash_log}" || true
 
+            # wsprnet short format (11 fields) — used by wd-upload-wsprnet
             awk -v wn_type="${wn_type}" '
                     NF >= 17 { printf "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d\n",
                                    $1,$2,$10,$3,$4,$5,$6,$7,$8,$9,wn_type; next }
@@ -222,11 +284,36 @@ decode_window() {
                                    $1,$2,$9,$3,$4,$5,$6,"      ",$7,$8,wn_type; next }
                 ' <<< "${new_spots}" > "${spots_file}" || true
 
+            # --- wsprdaemon extended format (34 fields) + noise file ---
+            # Find the .c2 file written by wsprd -c (named after the wspr timestamp)
+            local c2_file
+            c2_file=$(find "${WD_RECORDING_DIR}" -maxdepth 1 -name "*.c2" \
+                      -newer "${all_wspr_save}" 2>/dev/null | head -1)
+            [[ -z "${c2_file}" ]] && \
+                c2_file=$(find "${WD_RECORDING_DIR}" -maxdepth 1 -name "*.c2" \
+                          2>/dev/null | head -1)
+
+            local noise_line=""
+            if [[ -f "${concat_wav}" ]]; then
+                noise_line=$(_compute_noise_line "${concat_wav}" "${c2_file:-/dev/null}") || true
+            fi
+
+            if [[ -n "${new_spots}" && -x "${_WD_EXTEND_SPOTS}" ]]; then
+                local noise_vals=( ${noise_line} )
+                local rms_noise="${noise_vals[12]:-0.0}"
+                local fft_noise="${noise_vals[13]:-0.0}"
+                local overloads="${noise_vals[14]:-0}"
+                local wd_spots_file="${WD_RECORDING_DIR}/wd_spots.txt"
+                "${_WD_EXTEND_SPOTS}" "${rms_noise}" "${fft_noise}" "${overloads}" \
+                    "${WD_RECEIVER_CALL}" "${WD_RECEIVER_GRID}" \
+                    <<< "${new_spots}" > "${wd_spots_file}" 2>/dev/null || true
+            fi
+
             # Diagnostic: verify stdout spot count matches ALL_WSPR.TXT extraction.
             # wsprd stdout spot lines start with optional whitespace then SNR (a signed integer).
             # Non-spot lines (blank, "<DecodeFinished>", timing) do not match this pattern.
             local stdout_count extracted_count
-            stdout_count=$(grep -cE '^\s*[+-]?[0-9]' "${wsprd_stdout}" 2>/dev/null || echo 0)
+            stdout_count=$(grep -cE '^\s*[+-]?[0-9]' "${wsprd_stdout}" 2>/dev/null) || stdout_count=0
             if [[ -n "${new_spots}" ]]; then
                 extracted_count=$(wc -l <<< "${new_spots}")
             else
@@ -357,6 +444,19 @@ decode_window() {
         local dest="${WD_POSTING_DIR}/${WD_RECEIVER_NAME}_${WD_RECEIVER_BAND}_${mode}_${timestamp}_spots.txt"
         mv "${spots_file}" "${dest}"
         echo "DECODE DONE  band=${WD_RECEIVER_BAND} mode=${mode} cycle=${wspr_ts} spots=${spot_count} elapsed=${elapsed}s"
+
+        # Move extended wsprdaemon spot file if produced
+        local wd_spots_file="${WD_RECORDING_DIR}/wd_spots.txt"
+        if [[ -s "${wd_spots_file}" ]]; then
+            local wd_dest="${WD_POSTING_DIR}/${WD_RECEIVER_NAME}_${WD_RECEIVER_BAND}_${mode}_${timestamp}_wd_spots.txt"
+            mv "${wd_spots_file}" "${wd_dest}"
+        fi
+
+        # Write noise file if noise line was computed (only for W modes)
+        if [[ "${prefix}" == "W" && -n "${noise_line:-}" ]]; then
+            local noise_dest="${WD_POSTING_DIR}/${WD_RECEIVER_NAME}_${WD_RECEIVER_BAND}_${mode}_${timestamp}_noise.txt"
+            echo "${noise_line}" > "${noise_dest}"
+        fi
     else
         echo "DECODE DONE  band=${WD_RECEIVER_BAND} mode=${mode} cycle=${wspr_ts} spots=0 elapsed=${elapsed}s"
     fi

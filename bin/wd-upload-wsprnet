@@ -382,6 +382,46 @@ def diagnostic_upload(cyc_lines: list, cyc_date: str, cyc_time: str) -> None:
             log.warning('DIAG REJECT   cycle=%s %s  server=%s  spot: %s',
                         cyc_date, cyc_time, resp.strip()[:120], line.rstrip())
 
+            # Search the batch for similar spots to help diagnose why this one failed.
+            # wsprnet MEPT format: date time sync snr dt freq call [grid] pwr drift ...
+            #   idx:                0    1    2    3   4    5    6
+            rej_fields = line.split()
+            rej_call  = rej_fields[6] if len(rej_fields) > 6 else ''
+            try:
+                rej_freq = float(rej_fields[5]) if len(rej_fields) > 5 else None
+            except ValueError:
+                rej_freq = None
+
+            same_call = [
+                l for l in cyc_lines
+                if l is not line and len(l.split()) > 6 and l.split()[6] == rej_call
+            ]
+            if same_call:
+                log.warning('DIAG SIMILAR  same-call %s (%d match%s):',
+                            rej_call, len(same_call),
+                            'es' if len(same_call) != 1 else '')
+                for sl in same_call:
+                    log.warning('DIAG SIMILAR    %s', sl.rstrip())
+
+            if rej_freq is not None:
+                freq_matches = []
+                for l in cyc_lines:
+                    if l is line:
+                        continue
+                    lf = l.split()
+                    if len(lf) > 5:
+                        try:
+                            if abs(float(lf[5]) - rej_freq) <= 0.001:   # ±1 kHz
+                                freq_matches.append(l)
+                        except ValueError:
+                            pass
+                if freq_matches:
+                    log.warning('DIAG SIMILAR  near-freq %.7f (%d match%s):',
+                                rej_freq, len(freq_matches),
+                                'es' if len(freq_matches) != 1 else '')
+                    for fl in freq_matches:
+                        log.warning('DIAG SIMILAR    %s', fl.rstrip())
+
     n_ok  = len(accepted_lines)
     n_bad = len(rejected_lines)
     n_err = len(error_lines)
@@ -741,8 +781,11 @@ def main() -> int:
                             cyc_date, cyc_time, elapsed, added, offered)
                         save_upload_dump(spots_bytes, cyc_date, cyc_time,
                                          offered, added, response, cyc_lines)
-                        if partial:
-                            run_diagnostic = True
+                        # Do NOT run the diagnostic for partial acceptance:
+                        # wsprnet already processed the whole batch, so individual
+                        # re-submissions come back as "0 added" (duplicates) for every
+                        # spot — including the rejected one — giving no useful signal
+                        # and flooding the logs with false DIAG REJECT warnings.
 
                 if run_diagnostic:
                     diagnostic_upload(cyc_lines, cyc_date, cyc_time)
