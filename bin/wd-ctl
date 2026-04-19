@@ -1195,6 +1195,15 @@ WantedBy=local-fs.target
     else:
         print('  tmpfs already mounted at /var/spool/wsprdaemon')
 
+    # --- Ensure runtime directory exists (tmpfiles.d handles reboots) ---
+    run_dir = Path('/run/wsprdaemon')
+    if not run_dir.exists():
+        run_dir.mkdir(mode=0o755)
+        try:
+            shutil.chown(str(run_dir), user='wsprdaemon', group='radio')
+        except Exception:
+            pass
+
     # --- Create spool subdirectories (tmpfs is now mounted) ---
     spool = Path('/var/spool/wsprdaemon/recording')
     spool.mkdir(parents=True, exist_ok=True)
