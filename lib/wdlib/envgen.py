@@ -176,6 +176,32 @@ def generate_post_env(receiver: Receiver,
     return '\n'.join(lines) + '\n'
 
 
+def generate_upload_wsprnet_env(call: str, grid: str) -> str:
+    """Generate env file for a wsprnet upload service instance (one per call+grid)."""
+    safe_call = call.replace('/', '=')
+    lines = [_env_header()]
+    lines.append(f'WD_RECEIVER_CALL={call}')
+    lines.append(f'WD_RECEIVER_GRID={grid}')
+    lines.append(f'WD_UPLOAD_WSPRNET_DIR={paths.upload_dir("wsprnet", call, grid)}')
+    lines.append(f'WD_VERSION=4.0')
+    lines.append(f'WD_LOG_DIR={paths.LOG_DIR}')
+    lines.append(f'WD_DIAGNOSTIC_UPLOAD=1')
+    return '\n'.join(lines) + '\n'
+
+
+def generate_upload_wsprdaemon_env(call: str, grid: str) -> str:
+    """Generate env file for a wsprdaemon upload service instance (one per call+grid)."""
+    safe_call = call.replace('/', '=')
+    base_upload_dir = paths.POSTING_DIR / 'uploads' / 'wsprdaemon' / safe_call
+    lines = [_env_header()]
+    lines.append(f'WD_RECEIVER_CALL={call}')
+    lines.append(f'WD_RECEIVER_GRID={grid}')
+    lines.append(f'WD_UPLOAD_WSPRDAEMON_BASE_DIR={base_upload_dir}')
+    lines.append(f'WD_VERSION=4.0')
+    lines.append(f'WD_LOG_DIR={paths.LOG_DIR}')
+    return '\n'.join(lines) + '\n'
+
+
 def generate_all_env_files(config: WdConfig, output_dir: Path) -> List[str]:
     """Generate all environment files from a parsed v3 config.
 
@@ -198,6 +224,7 @@ def generate_all_env_files(config: WdConfig, output_dir: Path) -> List[str]:
             # then any modes from the new entry not already present.
             # sorted() must NOT be used here — it alphabetises W2:F2:F5 → F2:F5:W2,
             # causing W2 (wsprd) to run last instead of first.
+            existing = rx_band_modes[rx_name].get(entry.band)
             existing_modes = existing.split(':') if existing else []
             seen: set = set(existing_modes)
             combined = existing_modes[:]
@@ -295,5 +322,27 @@ def generate_all_env_files(config: WdConfig, output_dir: Path) -> List[str]:
                 env_path = output_dir / f'wd-post@{inst}.env'
                 env_path.write_text(generate_post_env(rx, band, modes))
                 written.append(str(env_path))
+
+    # --- Upload env files: one per unique (call, grid) pair ---
+    seen_uploaders: set = set()
+    for rx in config.receivers.values():
+        if rx.receiver_type not in ('ka9q', 'ka9q_wwv', 'kiwi', 'merge'):
+            continue
+        if not rx.call or not rx.grid:
+            continue
+        key = (rx.call, rx.grid)
+        if key in seen_uploaders:
+            continue
+        seen_uploaders.add(key)
+        safe_call = rx.call.replace('/', '=')
+        instance = f'{safe_call}_{rx.grid}'
+
+        env_path = output_dir / f'wd-upload-wsprnet@{instance}.env'
+        env_path.write_text(generate_upload_wsprnet_env(rx.call, rx.grid))
+        written.append(str(env_path))
+
+        env_path = output_dir / f'wd-upload-wsprdaemon@{instance}.env'
+        env_path.write_text(generate_upload_wsprdaemon_env(rx.call, rx.grid))
+        written.append(str(env_path))
 
     return written

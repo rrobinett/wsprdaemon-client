@@ -106,6 +106,7 @@ _compute_noise_line() {
     echo "${pre} ${tx} ${post} ${rms_noise} ${fft_noise} 0"
 }
 
+mkdir -p "${WD_RECORDING_DIR}"
 mkdir -p "${WD_POSTING_DIR}"
 
 readonly MAX_ALL_WSPR_SIZE=200000   # ~200KB — truncate when exceeded (v3 uses same limit)

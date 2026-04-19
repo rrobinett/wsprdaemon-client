@@ -44,46 +44,6 @@ from wdlib.v3_parser import parse_v3_config
 from wdlib.ini_writer import write_v4_ini
 
 
-def _parse_cpu_list(s: str) -> tuple:
-    """Parse a Linux CPU list string ('0-1', '0,8', '0-1,8-9') into a sorted tuple."""
-    cpus = []
-    for part in s.split(','):
-        part = part.strip()
-        if '-' in part:
-            lo, hi = part.split('-', 1)
-            cpus.extend(range(int(lo), int(hi) + 1))
-        elif part:
-            cpus.append(int(part))
-    return tuple(sorted(cpus))
-
-
-def _get_ht_pairs() -> list:
-    """Return sorted list of hyperthreading sibling groups from the OS.
-
-    Each element is a tuple of CPU IDs that share a physical core.
-    On non-HT systems each tuple has one element.
-    Sorted by lowest CPU ID in the group.
-    """
-    import glob as _glob
-    seen: set = set()
-    pairs: list = []
-    cpu_dirs = sorted(
-        _glob.glob('/sys/devices/system/cpu/cpu[0-9]*'),
-        key=lambda p: int(re.sub(r'.*cpu', '', p))
-    )
-    for d in cpu_dirs:
-        try:
-            raw = Path(f'{d}/topology/thread_siblings_list').read_text().strip()
-            group = _parse_cpu_list(raw)
-        except (OSError, ValueError):
-            cpu_id = int(re.sub(r'.*cpu', '', d))
-            group = (cpu_id,)
-        key = frozenset(group)
-        if key not in seen:
-            seen.add(key)
-            pairs.append(group)
-    return sorted(pairs, key=lambda g: g[0])
-
 
 def _get_radiod_cpu_assignments() -> dict:
     """Return {radiod_name: frozenset(cpus)} from all existing cpu-affinity.conf drop-ins."""
@@ -104,22 +64,6 @@ def _get_radiod_cpu_assignments() -> dict:
     return result
 
 
-def _apply_radiod_cpu_affinity(radiod_name: str, cpus: tuple) -> None:
-    """Write (or update) the cpu-affinity.conf drop-in for radiod@<radiod_name>."""
-    drop_in_dir = Path(f'/etc/systemd/system/radiod@{radiod_name}.service.d')
-    drop_in_dir.mkdir(parents=True, exist_ok=True)
-    conf_path = drop_in_dir / 'cpu-affinity.conf'
-    cpu_str = ' '.join(str(c) for c in cpus)
-    lines = ['[Service]', f'CPUAffinity={cpu_str}']
-    # Only add pin script line if it exists on this host
-    pin_script = Path('/usr/local/bin/pin-radiod-threads.sh')
-    if pin_script.exists():
-        pin_args = ' '.join(str(c) for c in cpus)
-        lines.append(f'ExecStartPost={pin_script} $MAINPID {pin_args}')
-    conf_path.write_text('\n'.join(lines) + '\n')
-    print(f'  radiod@{radiod_name}: CPUAffinity={cpu_str}')
-
-
 def _all_cpus() -> list:
     """Return sorted list of all logical CPU IDs on this host."""
     import glob as _glob2
@@ -135,11 +79,12 @@ def _all_cpus() -> list:
 def _apply_worker_cpu_affinity(reserved: set) -> None:
     """Write 99-wdctl-cpu-affinity.conf drop-ins for all wd-ctl-managed services.
 
-    Worker CPUs = all CPUs minus the reserved set (wd-ctl radiod + user-specified).
+    Worker CPUs = all CPUs minus the reserved set (hf-timestd radiod + user-specified).
     Writes drop-ins for:
       - wd-* template service families
       - timestd-* pipeline services
-    Also disables hf-timestd's own affinity watcher so it can't override us.
+    radiod CPU affinity is managed by hf-timestd (timestd-radiod-affinity.path),
+    not by wd-ctl.
     """
     import subprocess
 
@@ -181,14 +126,6 @@ def _apply_worker_cpu_affinity(reserved: set) -> None:
 
     print(f'  Worker CPUs: {cpu_str}  (reserved: {sorted(reserved)})')
     print(f'  CPU affinity drop-ins written for {len(units)} service units')
-
-    # Disable hf-timestd's affinity watcher — wd-ctl owns all affinity now.
-    affinity_watcher = Path('/etc/systemd/system/timestd-radiod-affinity.path')
-    if affinity_watcher.exists():
-        subprocess.run(['systemctl', 'disable', '--now',
-                        'timestd-radiod-affinity.path'],
-                       capture_output=True)
-        print('  Disabled timestd-radiod-affinity.path (wd-ctl owns affinity)')
 
 
 def _load_deps():
@@ -1115,16 +1052,19 @@ def cmd_apply(args):
     if unit_src.is_dir():
         for unit_file in unit_src.glob('*.service'):
             dst = unit_dst / unit_file.name
-            shutil.copy2(unit_file, dst)
-            installed_units.append(unit_file.name)
+            if not dst.exists() or unit_file.resolve() != dst.resolve():
+                shutil.copy2(unit_file, dst)
+                installed_units.append(unit_file.name)
         for unit_file in unit_src.glob('*.target'):
             dst = unit_dst / unit_file.name
-            shutil.copy2(unit_file, dst)
-            installed_units.append(unit_file.name)
+            if not dst.exists() or unit_file.resolve() != dst.resolve():
+                shutil.copy2(unit_file, dst)
+                installed_units.append(unit_file.name)
         for unit_file in unit_src.glob('*.timer'):
             dst = unit_dst / unit_file.name
-            shutil.copy2(unit_file, dst)
-            installed_units.append(unit_file.name)
+            if not dst.exists() or unit_file.resolve() != dst.resolve():
+                shutil.copy2(unit_file, dst)
+                installed_units.append(unit_file.name)
     if installed_units:
         print(f'  Units installed: {", ".join(sorted(installed_units))}')
     else:
@@ -1335,6 +1275,24 @@ WantedBy=local-fs.target
         else:
             print(f'  Failed to start {svc}: {result.stderr.strip()}')
 
+    # --- Start upload services ---
+    for svc_prefix in ('wd-upload-wsprnet', 'wd-upload-wsprdaemon'):
+        instances = [
+            Path(f).stem.split('@')[1]
+            for f in written
+            if f'{svc_prefix}@' in Path(f).name
+        ]
+        for instance in sorted(instances):
+            svc = f'{svc_prefix}@{instance}.service'
+            result = subprocess.run(
+                ['systemctl', 'enable', '--now', svc],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f'  Started: {svc}')
+            else:
+                print(f'  Failed to start {svc}: {result.stderr.strip()}')
+
     # --- Enable spool janitor timer ---
     subprocess.run(['systemctl', 'enable', '--now', 'wd-spool-clean.timer'],
                    capture_output=True)
@@ -1356,41 +1314,28 @@ WantedBy=local-fs.target
     for radiod_name in local_radiods:
         _manage_radiod(radiod_name)
 
-    # --- Assign CPU affinity to local radiod instances ---
-    # Skip HT pairs already used by manually-managed (non-local) radiod instances.
-    # This ensures wd-ctl-managed radiods don't conflict with user-managed ones.
+    # --- Read radiod CPU assignments (managed by hf-timestd, not wd-ctl) ---
+    # wd-ctl does NOT write radiod cpu-affinity.conf drop-ins.
+    # hf-timestd's timestd-radiod-affinity.path owns radiod CPU pinning.
+    # We read the existing assignments here only to know which CPUs to exclude
+    # from the worker affinity set.
     print('\n--- CPU affinity ---')
-    ht_pairs = _get_ht_pairs()
     all_assignments = _get_radiod_cpu_assignments()
-    local_radiod_set = set(local_radiods)
-    print(f'  HT pairs: {[list(p) for p in ht_pairs]}')
 
-    affinity_changed = False
-    for i, radiod_name in enumerate(local_radiods):
-        if i >= len(ht_pairs):
-            print(f'  WARNING: no CPU pair for radiod@{radiod_name} '
-                  f'(only {len(ht_pairs)} pairs on this host)', file=sys.stderr)
-            continue
-        pair = ht_pairs[i]   # local radiods own pairs 0, 1, 2 ... in name order
-        current = all_assignments.get(radiod_name)
-        if current == frozenset(pair):
-            print(f'  radiod@{radiod_name}: CPUAffinity already {list(pair)} — no change')
+    for radiod_name in local_radiods:
+        cpus = sorted(all_assignments.get(radiod_name) or [])
+        if cpus:
+            print(f'  radiod@{radiod_name}: CPUAffinity={cpus} (set by hf-timestd)')
         else:
-            _apply_radiod_cpu_affinity(radiod_name, pair)
-            affinity_changed = True
+            print(f'  radiod@{radiod_name}: no cpu-affinity.conf found — hf-timestd not configured')
 
     if not local_radiods:
         print('  No local radiod instances configured')
 
-    # --- Build reserved CPU set: wd-ctl radiods + user-specified extras ---
+    # --- Build reserved CPU set: hf-timestd radiod assignments + user-specified extras ---
     reserved_cpus: set = set()
     for radiod_name in local_radiods:
         assigned = all_assignments.get(radiod_name) or frozenset()
-        # If just assigned this session, get from ht_pairs
-        if not assigned:
-            idx = local_radiods.index(radiod_name)
-            if idx < len(ht_pairs):
-                assigned = frozenset(ht_pairs[idx])
         reserved_cpus |= set(assigned)
 
     # Add any CPUs reserved by the user for manually-managed services
@@ -1406,16 +1351,7 @@ WantedBy=local-fs.target
     # --- Write worker CPU affinity drop-ins for all managed services ---
     _apply_worker_cpu_affinity(reserved_cpus)
 
-    # --- Reload and restart radiod if affinity changed ---
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
-    if affinity_changed:
-        for radiod_name in local_radiods:
-            result = subprocess.run(
-                ['systemctl', 'restart', f'radiod@{radiod_name}.service'],
-                capture_output=True, text=True
-            )
-            status = 'restarted' if result.returncode == 0 else f'restart failed: {result.stderr.strip()}'
-            print(f'  radiod@{radiod_name}: {status}')
 
     print('\nApply complete. Check status with: wd-ctl status')
     return 0
