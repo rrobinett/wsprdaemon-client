@@ -109,6 +109,16 @@ _compute_noise_line() {
 mkdir -p "${WD_RECORDING_DIR}"
 mkdir -p "${WD_POSTING_DIR}"
 
+# Prevent two instances of this decoder from running concurrently for the same
+# receiver+band.  A second instance (e.g. from an accidental manual start)
+# races on ALL_WSPR.TXT, doubles every spot file, and floods the uploader.
+_LOCK_FILE="${WD_RECORDING_DIR}/.wd-decode.lock"
+exec 9>"${_LOCK_FILE}"
+if ! flock -n 9; then
+    echo "wd-decode: another instance is already running for ${WD_RECEIVER_NAME}/${WD_RECEIVER_BAND} — exiting" >&2
+    exit 1
+fi
+
 readonly MAX_ALL_WSPR_SIZE=200000   # ~200KB — truncate when exceeded (v3 uses same limit)
 
 # Track last-decoded wav file per mode to prevent re-decoding the same file
@@ -277,10 +287,18 @@ decode_window() {
             #   (no-grid variant: $6=call $7=pwr $8=drift $9=sync — 16 fields)
             sort -k1,2 -k5,5n -k6,6 "${all_wspr}" > "${WD_RECORDING_DIR}/sort.tmp"
             mv "${WD_RECORDING_DIR}/sort.tmp" "${all_wspr}"
+            # Extract only spots from the current WSPR cycle.
+            # wsprd silently appends hash-resolved entries from previous cycles
+            # to ALL_WSPR.TXT (old timestamps, no stdout output). Without this
+            # filter those old-cycle spots create spurious spot files that the
+            # uploader re-uploads as duplicates for already-processed cycles.
+            local wspr_date="${wspr_ts:0:6}"
+            local wspr_time="${wspr_ts:7:4}"
             local new_spots
             new_spots=$(comm --nocheck-order -13 "${all_wspr_save}" "${all_wspr}" \
                 | sort -k1,2 -k5,5n -k6,6 \
-                | grep -v '<\.\.\.>')
+                | grep -v '<\.\.\.>' \
+                | awk -v d="${wspr_date}" -v t="${wspr_time}" '$1==d && $2==t')
 
             # Log hash-resolved spots (<CALLSIGN>) to a separate file for review
             local hash_log="${WD_LOG_DIR}/hash_spots.log"
