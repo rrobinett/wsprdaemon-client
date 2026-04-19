@@ -20,14 +20,20 @@ Environment variables:
     WD_VERSION                 Version string embedded in config (default: 4.0)
     WD_BURST_THRESHOLD         File count for immediate upload (default: 15)
 
-    SFTP (primary — set WD_SFTP_SERVER to enable):
-    WD_SFTP_SERVER             user@host for SFTP upload (e.g. AC0G_B1@logs.wsprdaemon.org)
+    SFTP (primary — set WD_SFTP_SERVERS to enable):
+    WD_SFTP_SERVERS            Comma-separated user@host list, tried in order.
+                               Falls back to WD_SFTP_SERVER if not set.
+                               e.g. wsprdaemon@gw1.wsprdaemon.org,wsprdaemon@gw2.wsprdaemon.org
+    WD_SFTP_SERVER             Single user@host (legacy; used if WD_SFTP_SERVERS not set)
     WD_SFTP_PATH               Remote directory for uploads (default: uploads)
     WD_SFTP_CONNECT_TIMEOUT    Connection timeout seconds (default: 10)
     WD_SFTP_XFER_TIMEOUT       Transfer timeout seconds (default: 90)
 
-    FTP (fallback when SFTP not configured or fails):
-    WD_FTP_SERVER              FTP hostname (default: graphs.wsprdaemon.org)
+    FTP (fallback when all SFTP attempts fail or SFTP not configured):
+    WD_FTP_SERVERS             Comma-separated hostname list, tried in order.
+                               Falls back to WD_FTP_SERVER if not set.
+                               e.g. gw1.wsprdaemon.org,gw2.wsprdaemon.org
+    WD_FTP_SERVER              Single hostname (legacy; used if WD_FTP_SERVERS not set)
     WD_FTP_USER                FTP username (default: noisegraphs)
     WD_FTP_PASSWORD            FTP password (default: xahFie6g)
     WD_FTP_PATH                FTP upload path (default: upload)
@@ -60,14 +66,26 @@ UPLOAD_ID       = os.environ.get('WD_UPLOAD_ID',
                       REPORTER_CALL.replace('/', '_'))  # e.g. AC0G_B1
 VERSION         = os.environ.get('WD_VERSION', '4.0')
 
-# SFTP (primary, optional)
-SFTP_SERVER         = os.environ.get('WD_SFTP_SERVER', '')  # user@host; empty = disabled
+# SFTP servers — tried in order until one succeeds.
+# WD_SFTP_SERVERS / WD_SFTP_SERVER contain hostnames only (no user@).
+# The SFTP login user is derived from the reporter call (AC0G/B1 → AC0G_B1).
+def _parse_servers(multi_var: str, single_var: str, default: str = '') -> list[str]:
+    raw = os.environ.get(multi_var) or os.environ.get(single_var, default)
+    return [s.strip() for s in raw.split(',') if s.strip()]
+
+def _host_only(s: str) -> str:
+    """Strip user@ prefix if present, returning just the hostname."""
+    return s.split('@')[-1]
+
+SFTP_USER           = os.environ.get('WD_SFTP_USER', UPLOAD_ID)  # e.g. AC0G_B1
+SFTP_SERVERS        = [_host_only(h) for h in _parse_servers('WD_SFTP_SERVERS', 'WD_SFTP_SERVER')]
 SFTP_PATH           = os.environ.get('WD_SFTP_PATH', 'uploads')
 SFTP_CONNECT_TIMEOUT = int(os.environ.get('WD_SFTP_CONNECT_TIMEOUT', '10'))
 SFTP_XFER_TIMEOUT   = int(os.environ.get('WD_SFTP_XFER_TIMEOUT', '90'))
 
-# FTP (fallback)
-FTP_SERVER      = os.environ.get('WD_FTP_SERVER', 'graphs.wsprdaemon.org')
+# FTP servers — tried in order after all SFTP attempts fail.
+# FTP (noisegraphs legacy) only exists on gw2; gw1 has no FTP listener.
+FTP_SERVERS     = _parse_servers('WD_FTP_SERVERS', 'WD_FTP_SERVER', 'gw2.wsprdaemon.org')
 FTP_USER        = os.environ.get('WD_FTP_USER', 'noisegraphs')
 FTP_PASSWORD    = os.environ.get('WD_FTP_PASSWORD', 'xahFie6g')
 FTP_PATH        = os.environ.get('WD_FTP_PATH', 'upload')
@@ -116,20 +134,62 @@ def _config_bytes() -> bytes:
     return '\n'.join(lines).encode() + b'\n'
 
 
-def build_tar(files: list, tar_path: Path) -> int:
+def get_or_create_ssh_pubkey() -> str:
+    """Return the wsprdaemon user's SSH public key, generating one if needed."""
+    ssh_dir = Path.home() / '.ssh'
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+
+    for candidate in ('id_ed25519', 'id_rsa', 'id_ecdsa'):
+        pub = ssh_dir / f'{candidate}.pub'
+        if pub.exists():
+            return pub.read_text().strip()
+
+    # No key found — generate ed25519
+    key = ssh_dir / 'id_ed25519'
+    log.info('no SSH key found — generating %s', key)
+    subprocess.run(
+        ['ssh-keygen', '-t', 'ed25519', '-f', str(key), '-N', '', '-C',
+         f'wsprdaemon@{REPORTER_CALL.replace("/", "_")}'],
+        check=True, capture_output=True,
+    )
+    return (ssh_dir / 'id_ed25519.pub').read_text().strip()
+
+
+def _client_info_bytes() -> bytes:
+    """Build client_upload_info.txt content: reporter_id + SSH public key."""
+    try:
+        pubkey = get_or_create_ssh_pubkey()
+    except Exception as e:
+        log.warning('could not get SSH public key: %s', e)
+        pubkey = ''
+    lines = [
+        f'reporter_id={REPORTER_CALL}',
+        f'ssh_public_key={pubkey}',
+    ]
+    return '\n'.join(lines).encode() + b'\n'
+
+
+def _tar_add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes) -> None:
+    ti = tarfile.TarInfo(name=arcname)
+    ti.size = len(data)
+    ti.mtime = int(time.time())
+    tf.addfile(ti, io.BytesIO(data))
+
+
+def build_tar(files: list, tar_path: Path, include_client_info: bool = False) -> int:
     """
     Create a bzip2 tar at tar_path containing the given spot files.
     Paths inside the tar are prefixed with 'wsprdaemon/' relative to UPLOAD_DIR.
+    When include_client_info is True, adds client_upload_info.txt so the server
+    can provision SFTP access for this reporter.
     Returns the total bytes of spot data included.
     """
     total_bytes = 0
     with tarfile.open(tar_path, 'w:bz2') as tf:
-        # Include a minimal config file (matches v3 tar content)
-        cfg = _config_bytes()
-        ti = tarfile.TarInfo(name='wsprdaemon/uploads_config.txt')
-        ti.size = len(cfg)
-        ti.mtime = int(time.time())
-        tf.addfile(ti, io.BytesIO(cfg))
+        _tar_add_bytes(tf, 'wsprdaemon/uploads_config.txt', _config_bytes())
+
+        if include_client_info:
+            _tar_add_bytes(tf, 'wsprdaemon/client_upload_info.txt', _client_info_bytes())
 
         for f in files:
             try:
@@ -157,7 +217,16 @@ def _sftp_batch_cmd(tar_path: Path, tar_name: str) -> bytes:
     return f'put {tar_path} {part}\nrename {part} {dest}\n'.encode()
 
 
-def _run_sftp(batch_cmd: bytes, extra_opts: list = None) -> tuple:
+def _port_open(host: str, port: int, timeout: int = 3) -> bool:
+    """Return True if host:port accepts a TCP connection within timeout seconds."""
+    result = subprocess.run(
+        ['nc', '-z', '-w', str(timeout), host, str(port)],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _run_sftp(server: str, batch_cmd: bytes, extra_opts: list = None) -> tuple:
     """
     Run sftp in batch mode. Returns (returncode, combined_output).
     extra_opts: additional -o options (list of strings).
@@ -170,7 +239,7 @@ def _run_sftp(batch_cmd: bytes, extra_opts: list = None) -> tuple:
     ]
     for opt in opts:
         cmd += ['-o', opt]
-    cmd.append(SFTP_SERVER)
+    cmd.append(f'{SFTP_USER}@{server}')
 
     try:
         result = subprocess.run(
@@ -185,9 +254,9 @@ def _run_sftp(batch_cmd: bytes, extra_opts: list = None) -> tuple:
         return 1, 'sftp timed out'
 
 
-def _sftp_remove_host_key() -> None:
+def _sftp_remove_host_key(server: str) -> None:
     """Remove the SFTP server's entry from known_hosts (handles key rotation)."""
-    host = SFTP_SERVER.split('@')[-1]
+    host = server  # server is already host-only
     subprocess.run(['ssh-keygen', '-f',
                     str(Path.home() / '.ssh' / 'known_hosts'),
                     '-R', host],
@@ -214,22 +283,22 @@ _HOST_KEY_ERR = re.compile(
 )
 
 
-def sftp_put(tar_path: Path, tar_name: str) -> bool:
+def sftp_put(server: str, tar_path: Path, tar_name: str) -> bool:
     """
-    Upload via SFTP using .part-then-rename convention.
+    Upload to server via SFTP using .part-then-rename convention.
     Handles host key changes automatically (one retry).
     Returns True on success, False on failure.
     """
     batch = _sftp_batch_cmd(tar_path, tar_name)
-    rc, output = _run_sftp(batch)
+    rc, output = _run_sftp(server, batch)
     if rc == 0:
         return True
 
     if _HOST_KEY_ERR.search(output):
         log.warning('SFTP host key changed for %s — removing old key and retrying',
-                    SFTP_SERVER.split('@')[-1])
-        _sftp_remove_host_key()
-        rc, output = _run_sftp(batch, extra_opts=['StrictHostKeyChecking=accept-new'])
+                    server.split('@')[-1])
+        _sftp_remove_host_key(server)
+        rc, output = _run_sftp(server, batch, extra_opts=['StrictHostKeyChecking=accept-new'])
         if rc == 0:
             log.info('SFTP upload succeeded after host key update')
             return True
@@ -242,10 +311,13 @@ def sftp_put(tar_path: Path, tar_name: str) -> bool:
 # FTP upload (fallback)
 # ---------------------------------------------------------------------------
 
-def ftp_put(tar_path: Path, tar_name: str) -> None:
-    """Upload tar_path to FTP_SERVER/FTP_PATH/tar_name via anonymous-style FTP."""
+def ftp_put(server: str, tar_path: Path, tar_name: str) -> None:
+    """Upload tar_path to server/FTP_PATH/tar_name via FTP.
+    Raises OSError immediately if port 21 is closed."""
+    if not _port_open(server, 21):
+        raise OSError(f'FTP port 21 closed on {server}')
     with ftplib.FTP(timeout=FTP_TIMEOUT) as ftp:
-        ftp.connect(FTP_SERVER)
+        ftp.connect(server)
         ftp.login(user=FTP_USER, passwd=FTP_PASSWORD)
         ftp.set_pasv(True)
         with tar_path.open('rb') as f:
@@ -256,25 +328,31 @@ def ftp_put(tar_path: Path, tar_name: str) -> None:
 # Upload dispatcher
 # ---------------------------------------------------------------------------
 
-def upload(tar_path: Path, tar_name: str) -> bool:
-    """
-    Try SFTP first (if configured), fall back to FTP.
-    Returns True on success.
-    """
-    if SFTP_SERVER:
-        log.info('attempting SFTP upload to %s', SFTP_SERVER)
-        if sftp_put(tar_path, tar_name):
-            log.info('SFTP upload successful')
+def try_sftp(tar_path: Path, tar_name: str) -> bool:
+    """Try each SFTP server in order. Returns True on first success."""
+    for server in SFTP_SERVERS:
+        log.info('attempting SFTP upload to %s', server)
+        if sftp_put(server, tar_path, tar_name):
+            log.info('SFTP upload successful to %s', server)
             return True
-        log.warning('SFTP failed — falling back to FTP')
+        log.warning('SFTP to %s failed — trying next', server)
+    if SFTP_SERVERS:
+        log.warning('all SFTP servers failed')
+    return False
 
-    try:
-        ftp_put(tar_path, tar_name)
-        log.info('FTP upload successful')
-        return True
-    except (ftplib.Error, OSError) as e:
-        log.warning('FTP upload failed: %s', e)
-        return False
+
+def try_ftp(tar_path: Path, tar_name: str) -> bool:
+    """Try each FTP server in order. Returns True on first success."""
+    for server in FTP_SERVERS:
+        try:
+            log.info('attempting FTP upload to %s', server)
+            ftp_put(server, tar_path, tar_name)
+            log.info('FTP upload successful to %s', server)
+            return True
+        except (ftplib.Error, OSError) as e:
+            log.warning('FTP to %s failed: %s — trying next', server, e)
+    log.warning('all FTP servers failed')
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +389,8 @@ def main() -> int:
         format='%(asctime)sZ %(name)s %(levelname)s %(message)s',
         datefmt='%Y-%m-%dT%H:%M:%S',
     )
-    transport = f'SFTP({SFTP_SERVER})+FTP fallback' if SFTP_SERVER else 'FTP only'
+    transport = (f'SFTP{SFTP_SERVERS}→FTP{FTP_SERVERS}' if SFTP_SERVERS
+                 else f'FTP{FTP_SERVERS}')
     log.info('starting: reporter %s  upload_id %s  transport: %s  queue: %s',
              REPORTER_CALL, UPLOAD_ID, transport, UPLOAD_DIR)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -348,7 +427,7 @@ def main() -> int:
             time.sleep(10)
             continue
 
-        # Phase 4: create tar bundle
+        # Phase 4: create tar bundle and upload
         ts = time.strftime('%y%m%d_%H%M_%S', time.gmtime())
         tar_name = f'{UPLOAD_ID}_{ts}.tbz'
 
@@ -369,8 +448,18 @@ def main() -> int:
                 except OSError:
                     pass
 
-            # Phase 5: upload (SFTP preferred, FTP fallback)
-            if not upload(tar_path, tar_name):
+            # Phase 5: try SFTP first (no client_info needed — SSH key is the identity)
+            success = try_sftp(tar_path, tar_name)
+
+            # Phase 6: SFTP failed — rebuild tar with client_upload_info and try FTP.
+            # client_upload_info lets the server provision SFTP access for this reporter.
+            if not success and FTP_SERVERS:
+                log.info('rebuilding tar with client_upload_info for FTP upload')
+                ftp_tar_path = Path(tmpdir) / f'ftp_{tar_name}'
+                build_tar(files, ftp_tar_path, include_client_info=True)
+                success = try_ftp(ftp_tar_path, tar_name)
+
+            if not success:
                 log.warning('all upload methods failed — retrying in %ds', RETRY_SECS)
                 time.sleep(RETRY_SECS)
                 continue

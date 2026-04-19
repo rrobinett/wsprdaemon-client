@@ -1362,6 +1362,16 @@ WantedBy=local-fs.target
 
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
 
+    # --- Install bash completion ---
+    completion_dir = Path('/etc/bash_completion.d')
+    if completion_dir.is_dir():
+        comp_dst = completion_dir / 'wd-ctl'
+        try:
+            comp_dst.write_text(_COMPLETION_SCRIPT)
+            print(f'  Bash completion: {comp_dst}')
+        except OSError:
+            pass
+
     print('\nApply complete. Check status with: wd-ctl status')
     return 0
 
@@ -1726,6 +1736,216 @@ def cmd_migrate_config(args) -> int:
     return 0
 
 
+_COMPLETION_SCRIPT = '''\
+# bash completion for wd-ctl
+# Install:  wd-ctl completion | sudo tee /etc/bash_completion.d/wd-ctl
+
+_wd_ctl_complete() {
+    local cur prev words cword
+    _init_completion || return
+
+    local subcommands="apply completion diag-upload install-deps inventory \
+migrate-config status teardown validate verbosity version"
+
+    if [[ $cword -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "$subcommands" -- "$cur") )
+        return
+    fi
+
+    local subcmd="${words[1]}"
+    case "$subcmd" in
+        validate|inventory)
+            case "$prev" in
+                -c|--config) _filedir; return ;;
+            esac
+            COMPREPLY=( $(compgen -W "--config --json" -- "$cur") )
+            ;;
+        migrate-config)
+            case "$prev" in
+                -o|--output-dir) _filedir -d; return ;;
+                --hostname) return ;;
+            esac
+            case "$cword" in
+                2) _filedir; return ;;
+                *) COMPREPLY=( $(compgen -W "--output-dir --hostname --force" -- "$cur") ) ;;
+            esac
+            ;;
+        verbosity)
+            case "$cword" in
+                2) COMPREPLY=( $(compgen -W "up down" -- "$cur") ) ;;
+                3)
+                    local svcs
+                    svcs=$(systemctl list-units \'wd-*\' --no-legend --plain \
+                           --no-pager 2>/dev/null | awk \'{print $1}\')
+                    COMPREPLY=( $(compgen -W "all $svcs" -- "$cur") )
+                    ;;
+            esac
+            ;;
+        diag-upload)
+            case "$prev" in
+                --instance)
+                    local insts
+                    insts=$(ls /etc/wsprdaemon/env/wd-upload-wsprdaemon@*.env 2>/dev/null \
+                            | sed \'s|.*@||;s|\\.env$||\')
+                    COMPREPLY=( $(compgen -W "$insts" -- "$cur") )
+                    return
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "--instance" -- "$cur") )
+            ;;
+    esac
+}
+
+complete -F _wd_ctl_complete wd-ctl
+'''
+
+
+def cmd_completion(args):
+    """Print a bash completion script for wd-ctl."""
+    sys.stdout.write(_COMPLETION_SCRIPT)
+    return 0
+
+
+def cmd_diag_upload(args):
+    """Test SFTP and FTP upload connectivity for configured upload instances."""
+    import ftplib
+    import io
+    import subprocess
+    import tarfile
+    import tempfile
+
+    env_dir = Path('/etc/wsprdaemon/env')
+    upload_envs = sorted(env_dir.glob('wd-upload-wsprdaemon@*.env'))
+
+    if not upload_envs:
+        print('No wd-upload-wsprdaemon env files found in /etc/wsprdaemon/env/')
+        return 1
+
+    if args.instance:
+        upload_envs = [e for e in upload_envs if args.instance in e.name]
+        if not upload_envs:
+            print(f'No upload env matching: {args.instance}')
+            return 1
+
+    def _load_env(path: Path) -> dict:
+        env = {}
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, _, v = line.partition('=')
+                env[k.strip()] = v.strip()
+        return env
+
+    def _parse_servers(raw: str) -> list:
+        return [s.strip() for s in raw.split(',') if s.strip()]
+
+    def _make_test_tbz(path: Path) -> None:
+        data = b'wd-ctl diag-upload connectivity test\n'
+        with tarfile.open(str(path), 'w:bz2') as tf:
+            info = tarfile.TarInfo(name='diag-test.txt')
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+    failures = 0
+
+    for env_file in upload_envs:
+        print(f'\n=== {env_file.name} ===')
+        env = _load_env(env_file)
+
+        reporter_call = env.get('WD_RECEIVER_CALL', '')
+        if not reporter_call:
+            print('  SKIP: WD_RECEIVER_CALL not set')
+            continue
+
+        sftp_user = env.get('WD_SFTP_USER') or re.sub(r'[^a-zA-Z0-9_]', '_', reporter_call)
+        sftp_servers = _parse_servers(
+            env.get('WD_SFTP_SERVERS') or env.get('WD_SFTP_SERVER', ''))
+        sftp_path = env.get('WD_SFTP_PATH', 'uploads')
+
+        ftp_servers = _parse_servers(
+            env.get('WD_FTP_SERVERS') or env.get('WD_FTP_SERVER', ''))
+        ftp_user     = env.get('WD_FTP_USER', 'noisegraphs')
+        ftp_password = env.get('WD_FTP_PASSWORD', '')
+        ftp_path     = env.get('WD_FTP_PATH', 'upload')
+
+        print(f'  Reporter:     {reporter_call}')
+        print(f'  SFTP user:    {sftp_user}')
+        print(f'  SFTP servers: {sftp_servers or "(none)"}')
+        print(f'  FTP  servers: {ftp_servers or "(none)"}')
+
+        with tempfile.NamedTemporaryFile(suffix='.tbz', delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            _make_test_tbz(tmp_path)
+            tar_name = f'diag-test-{sftp_user}.tbz'
+
+            # ── SFTP tests ──────────────────────────────────────────────────
+            for server in sftp_servers:
+                print(f'\n  SFTP  {sftp_user}@{server}:{sftp_path}/')
+                upload_batch = (
+                    f'put {tmp_path} {sftp_path}/{tar_name}.part\n'
+                    f'rename {sftp_path}/{tar_name}.part {sftp_path}/{tar_name}\n'
+                ).encode()
+                result = subprocess.run(
+                    ['sftp', '-b', '-', '-o', 'BatchMode=yes',
+                     '-o', 'ConnectTimeout=10',
+                     '-o', 'StrictHostKeyChecking=accept-new',
+                     f'{sftp_user}@{server}'],
+                    input=upload_batch,
+                    capture_output=True,
+                    timeout=30,
+                )
+                if result.returncode == 0:
+                    print(f'    upload: OK')
+                    # cleanup — separate invocation so failure doesn't mask upload result
+                    cleanup = subprocess.run(
+                        ['sftp', '-b', '-', '-o', 'BatchMode=yes',
+                         '-o', 'ConnectTimeout=10',
+                         f'{sftp_user}@{server}'],
+                        input=f'rm {sftp_path}/{tar_name}\n'.encode(),
+                        capture_output=True,
+                        timeout=15,
+                    )
+                    if cleanup.returncode != 0:
+                        print(f'    cleanup: WARNING — could not remove test file '
+                              f'(rc={cleanup.returncode})')
+                else:
+                    out = (result.stdout + result.stderr).decode(errors='replace').strip()
+                    print(f'    upload: FAIL (rc={result.returncode})')
+                    if out:
+                        for line in out.splitlines()[-5:]:
+                            print(f'      {line}')
+                    failures += 1
+
+            # ── FTP tests ───────────────────────────────────────────────────
+            for server in ftp_servers:
+                print(f'\n  FTP   {ftp_user}@{server}:{ftp_path}/')
+                try:
+                    with ftplib.FTP(timeout=15) as ftp:
+                        ftp.connect(server)
+                        ftp.login(user=ftp_user, passwd=ftp_password)
+                        ftp.set_pasv(True)
+                        with open(tmp_path, 'rb') as f:
+                            ftp.storbinary(f'STOR {ftp_path}/{tar_name}', f)
+                        print(f'    upload: OK')
+                        try:
+                            ftp.delete(f'{ftp_path}/{tar_name}')
+                        except Exception:
+                            print(f'    cleanup: WARNING — delete not permitted (file left on server)')
+                except Exception as exc:
+                    print(f'    upload: FAIL — {exc}')
+                    failures += 1
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    print()
+    if failures:
+        print(f'diag-upload: {failures} failure(s) — see above')
+        return 1
+    print('diag-upload: all checks passed')
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='wd-ctl',
@@ -1774,6 +1994,16 @@ def main():
     sub.add_parser('install-deps',
                    help='Install or verify external dependencies from deps.conf')
 
+    # diag-upload
+    p_diag = sub.add_parser('diag-upload',
+                             help='Test SFTP and FTP upload connectivity')
+    p_diag.add_argument('--instance', metavar='INSTANCE',
+                        help='Limit test to this upload instance (substring match on env filename)')
+
+    # completion
+    sub.add_parser('completion',
+                   help='Print bash completion script (pipe to /etc/bash_completion.d/wd-ctl)')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1790,6 +2020,8 @@ def main():
         'version': cmd_version,
         'verbosity': cmd_verbosity,
         'install-deps': cmd_install_deps,
+        'diag-upload': cmd_diag_upload,
+        'completion': cmd_completion,
     }
 
     return dispatch[args.command](args)
