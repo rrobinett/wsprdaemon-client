@@ -253,7 +253,7 @@ decode_window() {
 
             # Ensure the file exists, then sort and save the pre-decode state
             touch "${all_wspr}"
-            sort -k1,2 -k5,5 "${all_wspr}" > "${all_wspr_save}"
+            sort -k1,2 -k5,5n -k6,6 "${all_wspr}" > "${all_wspr_save}"
             cp -p "${all_wspr_save}" "${all_wspr}"
 
             # Run wsprd — appends new spots to ALL_WSPR.TXT; capture stdout for
@@ -275,11 +275,11 @@ decode_window() {
             # ALL_WSPR.TXT fields (v2.2+ wsprd, 17 fields with grid, 16 without):
             #   $1=date $2=time $3=snr $4=dt $5=freq $6=call $7=grid $8=pwr $9=drift $10=sync ...
             #   (no-grid variant: $6=call $7=pwr $8=drift $9=sync — 16 fields)
-            sort -k1,2 -k5,5 "${all_wspr}" > "${WD_RECORDING_DIR}/sort.tmp"
+            sort -k1,2 -k5,5n -k6,6 "${all_wspr}" > "${WD_RECORDING_DIR}/sort.tmp"
             mv "${WD_RECORDING_DIR}/sort.tmp" "${all_wspr}"
             local new_spots
             new_spots=$(comm --nocheck-order -13 "${all_wspr_save}" "${all_wspr}" \
-                | sort -k1,2 -k5,5 \
+                | sort -k1,2 -k5,5n -k6,6 \
                 | grep -v '<\.\.\.>')
 
             # Log hash-resolved spots (<CALLSIGN>) to a separate file for review
