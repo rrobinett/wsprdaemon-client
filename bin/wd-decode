@@ -111,6 +111,11 @@ mkdir -p "${WD_POSTING_DIR}"
 
 readonly MAX_ALL_WSPR_SIZE=200000   # ~200KB — truncate when exceeded (v3 uses same limit)
 
+# Track last-decoded wav file per mode to prevent re-decoding the same file
+# when inotifywait fires for a different period's wav (e.g. _300.wav triggering
+# a re-run of W2 on the unchanged _120.wav).
+declare -A _last_decoded_wav
+
 # Parse mode list (colon-separated: W2:F2:F5)
 IFS=':' read -ra MODES <<< "${WD_RECEIVER_MODES}"
 
@@ -174,6 +179,10 @@ decode_window() {
         return 0  # No period-length WAV ready yet
     fi
 
+    if [[ "${wav_file}" == "${_last_decoded_wav[$mode]:-}" ]]; then
+        return 0  # Already decoded this file for this mode; skip duplicate trigger
+    fi
+
     if ! sidecar_permits_mode "${wav_file}" "${mode}"; then
         return 0  # wspr-recorder sidecar says this mode is not for this WAV
     fi
@@ -204,6 +213,9 @@ decode_window() {
     else
         wspr_ts=$(date -u +%y%m%d_%H%M)
     fi
+
+    # Mark this wav as decoded for this mode before running the decoder.
+    _last_decoded_wav[$mode]="${wav_file}"
 
     # Log start — period-length WAV file, no concatenation needed.
     echo "DECODE START band=${WD_RECEIVER_BAND} mode=${mode} cycle=${wspr_ts} files=1"
