@@ -7,3 +7,4 @@ wspr_timer.out
 wspr_wisdom.dat
 jt9_wisdom.dat
 .wsprd_result
+*.c2
