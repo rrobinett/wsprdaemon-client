@@ -49,6 +49,11 @@ while true; do
     inotifywait -q -e moved_to -e close_write -t 5 "${WD_POSTING_DIR}" \
         --include '(wd_spots|_spots|_noise)\.txt$' >/dev/null 2>&1 || true
 
+    # Re-create upload dirs each cycle — the uploader prunes empty dirs after upload.
+    [[ -n "${WSPRNET_DIR}" ]]          && mkdir -p "${WSPRNET_DIR}"
+    [[ -n "${WSPRDAEMON_DIR}" ]]       && mkdir -p "${WSPRDAEMON_DIR}"
+    [[ -n "${WSPRDAEMON_NOISE_DIR}" ]] && mkdir -p "${WSPRDAEMON_NOISE_DIR}"
+
     shopt -s nullglob
     pending=(
         "${WD_POSTING_DIR}"/*_wd_spots.txt

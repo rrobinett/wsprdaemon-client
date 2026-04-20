@@ -64,6 +64,11 @@ UPLOAD_DIR      = Path(os.environ['WD_UPLOAD_WSPRDAEMON_DIR'])
 REPORTER_CALL   = os.environ['WD_RECEIVER_CALL']       # e.g. AC0G/B1
 UPLOAD_ID       = os.environ.get('WD_UPLOAD_ID',
                       REPORTER_CALL.replace('/', '_'))  # e.g. AC0G_B1
+RECEIVER_GRID   = os.environ.get('WD_RECEIVER_GRID', '')
+# RX_SITE is the top-level directory inside the tbz expected by the server:
+#   {call_with_slash_replaced_by_equals}_{grid}  e.g. AC0G=B1_EM38ww
+RX_SITE         = f"{REPORTER_CALL.replace('/', '=')}_{RECEIVER_GRID}" if RECEIVER_GRID \
+                  else REPORTER_CALL.replace('/', '=')
 VERSION         = os.environ.get('WD_VERSION', '4.0')
 
 # SFTP servers — tried in order until one succeeds.
@@ -176,13 +181,47 @@ def _tar_add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes) -> None:
     tf.addfile(ti, io.BytesIO(data))
 
 
-def build_tar(files: list, tar_path: Path, include_client_info: bool = False) -> int:
+_NOISE_TS_RE = re.compile(r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})\d{2}_noise\.txt$')
+
+
+def _noise_arcname(f: Path, rel_parts: tuple) -> str:
+    """Return the server-expected arcname for a noise file.
+
+    Server expects: wsprdaemon/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt
+    Input rel_parts from UPLOAD_DIR: (RECEIVER, BAND, 'noise', FILENAME)
     """
-    Create a bzip2 tar at tar_path containing the given spot files.
-    Paths inside the tar are prefixed with 'wsprdaemon/' relative to UPLOAD_DIR.
-    When include_client_info is True, adds client_upload_info.txt so the server
-    can provision SFTP access for this reporter.
-    Returns the total bytes of spot data included.
+    receiver = rel_parts[0]
+    band     = rel_parts[1]
+    m = _NOISE_TS_RE.search(f.name)
+    if m:
+        # YYYY MM DD HH MM -> YYMMDD_HHMM
+        ts_name = f'{m.group(1)[2:]}{m.group(2)}{m.group(3)}_{m.group(4)}{m.group(5)}_noise.txt'
+    else:
+        ts_name = f.name
+    return f'wsprdaemon/noise/{RX_SITE}/{receiver}/{band}/{ts_name}'
+
+
+def _spot_arcname(rel_parts: tuple, filename: str) -> str:
+    """Return the server-expected arcname for a spot file.
+
+    Server expects: wsprdaemon/spots/RX_SITE/RECEIVER/BAND/filename
+    Input rel_parts from UPLOAD_DIR: (RECEIVER, BAND, FILENAME)
+    """
+    receiver = rel_parts[0]
+    band     = rel_parts[1]
+    return f'wsprdaemon/spots/{RX_SITE}/{receiver}/{band}/{filename}'
+
+
+def build_tar(files: list, tar_path: Path, include_client_info: bool = False) -> int:
+    """Create a bzip2 tar at tar_path containing the given spot/noise files.
+
+    Internal tar structure matches what wsprdaemon_server.py expects:
+      wsprdaemon/spots/RX_SITE/RECEIVER/BAND/*_spots.txt
+      wsprdaemon/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt
+
+    When include_client_info is True, also adds client_upload_info.txt so the
+    server can auto-provision SFTP access for this reporter.
+    Returns total bytes of spot/noise data included.
     """
     total_bytes = 0
     with tarfile.open(tar_path, 'w:bz2') as tf:
@@ -196,7 +235,19 @@ def build_tar(files: list, tar_path: Path, include_client_info: bool = False) ->
                 rel = f.relative_to(UPLOAD_DIR)
             except ValueError:
                 rel = Path(f.name)
-            arcname = f'wsprdaemon/{rel}'
+
+            parts = rel.parts
+            is_noise = f.name.endswith('_noise.txt')
+
+            if is_noise and len(parts) >= 4:
+                # RECEIVER/BAND/noise/FILENAME → wsprdaemon/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt
+                arcname = _noise_arcname(f, parts)
+            elif not is_noise and len(parts) >= 3:
+                # RECEIVER/BAND/FILENAME → wsprdaemon/spots/RX_SITE/RECEIVER/BAND/FILENAME
+                arcname = _spot_arcname(parts, f.name)
+            else:
+                arcname = f'wsprdaemon/{rel}'
+
             try:
                 total_bytes += f.stat().st_size
                 tf.add(str(f), arcname=arcname, recursive=False)
