@@ -61,6 +61,19 @@ _NOISE_PRE_START=0.25;  _NOISE_PRE_LEN=0.5
 _NOISE_TX_START=1;      _NOISE_TX_LEN=109
 _NOISE_POST_START=113;  _NOISE_POST_LEN=5
 
+# Calibration constants (from v3 decoding.sh defaults — see calculate_nl_adjustments()).
+# These convert sox dBFS and c2_noise.py arbitrary-power values to dBm.
+#
+# RMS: rms_nl_adjust = cal_rms_offset + 10*log10(1/cal_ne_bw)
+#                    = -50.4 + 10*log10(1/246) = -50.4 - 23.91 = -74.31 dB
+#
+# FFT: fft_nl_adjust = cal_c2_correction = -187.7 dB
+#
+# The KiwiSDR frequency-dependent amplitude correction and per-antenna factor
+# from v3 are not applied here — ka9q radiod already delivers calibrated levels.
+_RMS_NL_ADJUST=-74.31
+_FFT_NL_ADJUST=-187.7
+
 # Extract 4 dB stats (Pk, RMS, RMSpk, RMStr) from one time window of a wav.
 _wav_window_stats() {
     local wav=$1 start=$2 len=$3
@@ -88,19 +101,26 @@ _compute_noise_line() {
         return 1
     fi
 
-    # rms_noise = min(pre RMS Tr dB [field 4], post RMS Tr dB [field 4])
+    # rms_noise = min(pre RMS Tr dB [field 4], post RMS Tr dB [field 4]),
+    # then calibrated to dBm by adding _RMS_NL_ADJUST.
     local pre_rms="${pre_list[3]}"
     local post_rms="${post_list[3]}"
-    local rms_noise
+    local rms_raw
     if (( $(echo "${pre_rms} < ${post_rms}" | bc -l) )); then
-        rms_noise="${pre_rms}"
+        rms_raw="${pre_rms}"
     else
-        rms_noise="${post_rms}"
+        rms_raw="${post_rms}"
     fi
+    local rms_noise
+    rms_noise=$(awk "BEGIN { printf \"%.2f\", ${rms_raw} + ${_RMS_NL_ADJUST} }")
 
     local fft_noise="0.00"
-    if [[ -f "${c2}" && -x "${_C2_NOISE_PY}" ]] || python3 -c "" 2>/dev/null; then
-        fft_noise=$(python3 "${_C2_NOISE_PY}" "${c2}" 2>/dev/null | tr -d ' ') || fft_noise="0.00"
+    if [[ -f "${c2}" && -x "${_C2_NOISE_PY}" ]]; then
+        local fft_raw
+        fft_raw=$(python3 "${_C2_NOISE_PY}" "${c2}" 2>/dev/null | tr -d ' ') || fft_raw=""
+        if [[ -n "${fft_raw}" ]]; then
+            fft_noise=$(awk "BEGIN { printf \"%.2f\", ${fft_raw} + ${_FFT_NL_ADJUST} }")
+        fi
     fi
 
     echo "${pre} ${tx} ${post} ${rms_noise} ${fft_noise} 0"
@@ -275,9 +295,14 @@ decode_window() {
             # -o 4: OSD decoding depth 4 (v3 default)
             # -d: deeper search for weak signals
             local wsprd_stdout="${WD_RECORDING_DIR}/wsprd_stdout.txt"
-            "${WSPRD_BIN}" -a "${WD_RECORDING_DIR}" -c -C 500 -o 4 -d \
-                -f "${freq_mhz}" "${concat_wav}" \
-                > "${wsprd_stdout}" 2>&1 || true
+            # Run wsprd in a subshell with CWD = WD_RECORDING_DIR so that the
+            # 000000_0001.c2 file it creates (-c flag) lands in the per-band
+            # directory rather than /tmp (the service WorkingDirectory).
+            # Multiple band instances would otherwise race on /tmp/000000_0001.c2.
+            ( cd "${WD_RECORDING_DIR}" && \
+              "${WSPRD_BIN}" -a "${WD_RECORDING_DIR}" -c -C 500 -o 4 -d \
+                  -f "${freq_mhz}" "${concat_wav}" \
+                  > "${wsprd_stdout}" 2>&1 ) || true
 
             # Sort updated ALL_WSPR.TXT and diff to find new spots, then convert
             # to 11-field wsprnet MEPT format:
