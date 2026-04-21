@@ -101,6 +101,12 @@ max_files_per_band   = 60
 ipc_socket  = "{ipc_sock}"
 status_file = "{stat_file}"
 
+[timing]
+# RX888 is GPSDO-disciplined — RTP timestamps are accurate to parts per billion.
+# RtpSyncStrategy uses only RTP arithmetic for minute boundaries, eliminating
+# the delivery-latency drift that accumulates with ClockSyncStrategy.
+authority = "rtp"
+
 [channel_defaults]
 sample_rate = 12000
 mode        = "usb"
