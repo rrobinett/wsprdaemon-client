@@ -253,12 +253,13 @@ def _build_ka9q_web(src_dir: Path) -> bool:
 
 
 def _ensure_git_repo(section: str, dcfg) -> Path | None:
-    """Clone a git dep from deps.conf if absent; verify pinned commit; return src_dir."""
+    """Clone/update a git dep from deps.conf; verify or pull to latest; return src_dir."""
     import subprocess
 
     url        = dcfg.get(section, 'url', fallback='').strip()
     pinned     = dcfg.get(section, 'commit', fallback='').strip()
     install_to = dcfg.get(section, 'install_to', fallback='').strip()
+    use_latest = pinned.lower() == 'latest'
 
     if not url or not install_to:
         print(f'  ERROR: [{section}] missing url/install_to in deps.conf', file=sys.stderr)
@@ -273,26 +274,26 @@ def _ensure_git_repo(section: str, dcfg) -> Path | None:
         if result.returncode != 0:
             print(f'  ERROR cloning {section}: {result.stderr.strip()}', file=sys.stderr)
             return None
-        if pinned:
-            subprocess.run(
-                ['git', '-C', str(src_dir), 'checkout', pinned],
-                capture_output=True,
-            )
+        if not use_latest and pinned:
+            subprocess.run(['git', '-C', str(src_dir), 'checkout', pinned],
+                           capture_output=True)
+    elif use_latest:
+        subprocess.run(['git', '-C', str(src_dir), 'pull'], capture_output=True)
 
-    # Verify commit
-    if pinned:
-        result = subprocess.run(
-            ['git', '-c', f'safe.directory={src_dir}',
-             '-C', str(src_dir), 'rev-parse', 'HEAD'],
-            capture_output=True, text=True,
-        )
-        current = result.stdout.strip()
-        if current and not current.startswith(pinned[:12]):
-            print(f'  WARNING: {section} source at {current[:12]}, '
-                  f'deps.conf pins {pinned[:12]}')
-            print(f'  To update: cd {src_dir} && git checkout {pinned} && make && sudo make install')
-        else:
-            print(f'  {section} source: OK at {current[:12]}')
+    result = subprocess.run(
+        ['git', '-c', f'safe.directory={src_dir}',
+         '-C', str(src_dir), 'rev-parse', 'HEAD'],
+        capture_output=True, text=True,
+    )
+    current = result.stdout.strip()
+    if use_latest:
+        print(f'  {section} source: {current[:12]} (latest)')
+    elif pinned and current and not current.startswith(pinned[:12]):
+        print(f'  WARNING: {section} source at {current[:12]}, '
+              f'deps.conf pins {pinned[:12]}')
+        print(f'  To update: cd {src_dir} && git checkout {pinned} && make && sudo make install')
+    else:
+        print(f'  {section} source: OK at {current[:12]}')
 
     return src_dir
 
@@ -1613,18 +1614,27 @@ def cmd_install_deps(args):
         url        = cfg[dep].get('url', '').strip()
         commit     = cfg[dep].get('commit', '').strip()
         install_to = cfg[dep].get('install_to', '').strip()
+        use_latest = (commit.lower() == 'latest')
 
-        print(f'\n[{dep}]  type={dep_type}  version={commit}')
+        print(f'\n[{dep}]  type={dep_type}  commit={commit}')
 
         if dep_type == 'git':
             target = Path(install_to)
             if target.exists():
+                if use_latest:
+                    print(f'  Pulling {dep} to latest ...')
+                    subprocess.run(
+                        ['git', '-C', str(target), 'pull'],
+                        capture_output=True, text=True
+                    )
                 current = subprocess.run(
                     ['git', '-c', f'safe.directory={target}',
                      '-C', str(target), 'rev-parse', 'HEAD'],
                     capture_output=True, text=True
                 ).stdout.strip()
-                if current.startswith(commit[:8]):
+                if use_latest:
+                    print(f'  OK — {target} at {current[:12]} (latest)')
+                elif current.startswith(commit[:8]):
                     print(f'  OK — {target} at {current[:12]}')
                 else:
                     print(f'  MISMATCH — have {current[:12]}, want {commit[:12]}')
@@ -1640,58 +1650,74 @@ def cmd_install_deps(args):
                     print(f'  ERROR: {result.stderr.strip()}', file=sys.stderr)
                     errors += 1
                     continue
-                result = subprocess.run(
-                    ['git', '-C', str(target), 'checkout', commit],
-                    capture_output=True, text=True
-                )
-                if result.returncode != 0:
-                    print(f'  ERROR checking out {commit}: {result.stderr.strip()}',
-                          file=sys.stderr)
-                    errors += 1
+                if use_latest:
+                    print(f'  Cloned at latest HEAD')
                 else:
-                    print(f'  Checked out {commit[:12]}')
+                    result = subprocess.run(
+                        ['git', '-C', str(target), 'checkout', commit],
+                        capture_output=True, text=True
+                    )
+                    if result.returncode != 0:
+                        print(f'  ERROR checking out {commit}: {result.stderr.strip()}',
+                              file=sys.stderr)
+                        errors += 1
+                    else:
+                        print(f'  Checked out {commit[:12]}')
 
         elif dep_type == 'pypi':
             pip_cmd = str(Path('/opt/wsprdaemon/venv/bin/pip'))
             is_git_url = url.startswith('git+')
-            # Derive the package name for 'pip show': last path component without .git
             pkg_name = url.rstrip('/').split('/')[-1].replace('.git', '') if is_git_url else url
 
-            result = subprocess.run(
-                [pip_cmd, 'show', pkg_name],
-                capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                installed_ver = next(
-                    (l.split(':', 1)[1].strip()
-                     for l in result.stdout.splitlines()
-                     if l.startswith('Version:')),
-                    'unknown'
-                )
-                if installed_ver == commit:
-                    print(f'  OK — {pkg_name}=={installed_ver}')
-                else:
-                    print(f'  VERSION MISMATCH — have {installed_ver}, want {commit}')
-                    if is_git_url:
-                        print(f'  Run: {pip_cmd} install --upgrade "{url}@{commit}"')
-                    else:
-                        print(f'  Run: {pip_cmd} install "{url}=={commit}"')
-                    errors += 1
-            else:
-                if is_git_url:
-                    install_spec = f'{url}@{commit}'
-                else:
-                    install_spec = f'{url}=={commit}'
-                print(f'  Installing {install_spec}')
+            if use_latest:
+                print(f'  Upgrading {pkg_name} to latest ...')
                 result = subprocess.run(
-                    [pip_cmd, 'install', install_spec],
+                    [pip_cmd, 'install', '--upgrade', url],
                     capture_output=True, text=True
                 )
                 if result.returncode != 0:
                     print(f'  ERROR: {result.stderr.strip()}', file=sys.stderr)
                     errors += 1
                 else:
-                    print(f'  Installed')
+                    ver_r = subprocess.run([pip_cmd, 'show', pkg_name],
+                                           capture_output=True, text=True)
+                    installed_ver = next(
+                        (l.split(':', 1)[1].strip() for l in ver_r.stdout.splitlines()
+                         if l.startswith('Version:')), 'unknown')
+                    print(f'  OK — {pkg_name}=={installed_ver} (latest)')
+            else:
+                result = subprocess.run(
+                    [pip_cmd, 'show', pkg_name],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    installed_ver = next(
+                        (l.split(':', 1)[1].strip()
+                         for l in result.stdout.splitlines()
+                         if l.startswith('Version:')),
+                        'unknown'
+                    )
+                    if installed_ver == commit:
+                        print(f'  OK — {pkg_name}=={installed_ver}')
+                    else:
+                        print(f'  VERSION MISMATCH — have {installed_ver}, want {commit}')
+                        if is_git_url:
+                            print(f'  Run: {pip_cmd} install --upgrade "{url}@{commit}"')
+                        else:
+                            print(f'  Run: {pip_cmd} install "{url}=={commit}"')
+                        errors += 1
+                else:
+                    install_spec = f'{url}@{commit}' if is_git_url else f'{url}=={commit}'
+                    print(f'  Installing {install_spec}')
+                    result = subprocess.run(
+                        [pip_cmd, 'install', install_spec],
+                        capture_output=True, text=True
+                    )
+                    if result.returncode != 0:
+                        print(f'  ERROR: {result.stderr.strip()}', file=sys.stderr)
+                        errors += 1
+                    else:
+                        print(f'  Installed')
         else:
             print(f'  Unknown dep type "{dep_type}", skipping')
 
