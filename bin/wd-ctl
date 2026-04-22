@@ -1728,6 +1728,131 @@ def cmd_install_deps(args):
     return 0
 
 
+def cmd_deps_freeze(args):
+    """Snapshot current installed commits/versions into deps.conf.
+
+    Replaces every 'commit = latest' with the actual installed HEAD SHA (git)
+    or installed version string (pypi).  Also updates the '# pinned: ...'
+    comment on the following line if one exists.
+
+    Use --output to write to a different file (e.g. a beta snapshot) without
+    touching the live deps.conf.
+    """
+    import configparser
+    import re
+    import subprocess
+
+    deps_file = _SOURCE_ROOT / 'deps.conf'
+    if not deps_file.exists():
+        print(f'Error: deps.conf not found at {deps_file}', file=sys.stderr)
+        return 1
+
+    cfg = configparser.ConfigParser()
+    cfg.read(deps_file)
+
+    pip_cmd = '/opt/wsprdaemon/venv/bin/pip'
+    actuals = {}  # section -> actual sha or version string
+
+    for section in cfg.sections():
+        dep_type   = cfg[section].get('type', '').strip()
+        commit     = cfg[section].get('commit', '').strip()
+        install_to = cfg[section].get('install_to', '').strip()
+        url        = cfg[section].get('url', '').strip()
+
+        if dep_type == 'git':
+            target = Path(install_to)
+            if target.exists():
+                r = subprocess.run(
+                    ['git', '-C', str(target), 'rev-parse', 'HEAD'],
+                    capture_output=True, text=True,
+                )
+                if r.returncode == 0:
+                    actuals[section] = r.stdout.strip()
+                else:
+                    print(f'  WARNING: [{section}] could not read HEAD: {r.stderr.strip()}',
+                          file=sys.stderr)
+            else:
+                print(f'  WARNING: [{section}] not installed at {install_to}', file=sys.stderr)
+
+        elif dep_type == 'pypi':
+            pkg_name = url.rstrip('/').split('/')[-1].replace('.git', '')
+            r = subprocess.run([pip_cmd, 'show', pkg_name], capture_output=True, text=True)
+            if r.returncode == 0:
+                ver = next(
+                    (line.split(':', 1)[1].strip()
+                     for line in r.stdout.splitlines() if line.startswith('Version:')),
+                    None,
+                )
+                if ver:
+                    actuals[section] = ver
+                else:
+                    print(f'  WARNING: [{section}] could not parse version from pip show',
+                          file=sys.stderr)
+            else:
+                print(f'  WARNING: [{section}] not installed in venv', file=sys.stderr)
+
+    if not actuals:
+        print('No installed deps found — nothing to freeze.', file=sys.stderr)
+        return 1
+
+    # Rewrite the file line-by-line, preserving all comments and formatting.
+    # Rules:
+    #   - When inside a section that has an actual, replace:
+    #       commit     = latest   →   commit     = <sha>
+    #   - If the very next non-blank line after that is '# pinned: ...' update it too;
+    #     if no such comment exists, insert one.
+    lines = deps_file.read_text().splitlines(keepends=True)
+    current_section = None
+    out_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        m = re.match(r'^\[(\w[\w-]*)\]', line)
+        if m:
+            current_section = m.group(1)
+
+        if current_section and current_section in actuals:
+            actual = actuals[current_section]
+            if re.match(r'^commit\s*=\s*latest\s*$', line, re.IGNORECASE):
+                # Preserve leading whitespace/alignment of the key
+                key_part = re.match(r'^(commit\s*=\s*)', line).group(1)
+                out_lines.append(f'{key_part}{actual}\n')
+                # Look ahead: if next non-blank line is a pinned comment, update it
+                j = i + 1
+                while j < len(lines) and lines[j].strip() == '':
+                    out_lines.append(lines[j])
+                    j += 1
+                if j < len(lines) and re.match(r'^#\s*pinned:', lines[j]):
+                    out_lines.append(f'# pinned: {actual}\n')
+                    i = j  # consumed the pinned comment line
+                else:
+                    # Insert a pinned comment before whatever comes next
+                    out_lines.append(f'# pinned: {actual}\n')
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+        out_lines.append(line)
+        i += 1
+
+    out_path = Path(args.output) if args.output else deps_file
+
+    if args.dry_run:
+        print(''.join(out_lines), end='')
+        print(f'\n--- dry-run: would write {len(actuals)} frozen deps to {out_path} ---',
+              file=sys.stderr)
+        return 0
+
+    out_path.write_text(''.join(out_lines))
+    print(f'deps-freeze: wrote {out_path}')
+    for section, actual in actuals.items():
+        display = actual[:12] + '...' if len(actual) == 40 else actual
+        print(f'  [{section}] = {display}')
+    return 0
+
+
 def cmd_migrate_config(args) -> int:
     """Convert a v3 bash config file to v4 INI format."""
     import socket
@@ -1770,7 +1895,7 @@ _wd_ctl_complete() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="apply completion diag-upload install-deps inventory \
+    local subcommands="apply completion deps-freeze diag-upload install-deps inventory \
 migrate-config status teardown validate verbosity version"
 
     if [[ $cword -eq 1 ]]; then
@@ -2020,6 +2145,14 @@ def main():
     sub.add_parser('install-deps',
                    help='Install or verify external dependencies from deps.conf')
 
+    # deps-freeze
+    p_freeze = sub.add_parser('deps-freeze',
+                               help='Pin deps.conf to currently installed commits/versions')
+    p_freeze.add_argument('-o', '--output', metavar='FILE',
+                          help='Write frozen deps to FILE instead of deps.conf')
+    p_freeze.add_argument('-n', '--dry-run', action='store_true',
+                          help='Print what would be written without changing deps.conf')
+
     # diag-upload
     p_diag = sub.add_parser('diag-upload',
                              help='Test SFTP and FTP upload connectivity')
@@ -2046,6 +2179,7 @@ def main():
         'version': cmd_version,
         'verbosity': cmd_verbosity,
         'install-deps': cmd_install_deps,
+        'deps-freeze': cmd_deps_freeze,
         'diag-upload': cmd_diag_upload,
         'completion': cmd_completion,
     }
