@@ -8,3 +8,9 @@ wspr_wisdom.dat
 jt9_wisdom.dat
 .wsprd_result
 *.c2
+# Claude Code session data
+.claude/
+# Dependency repos now managed at sigmond level
+ka9q-radio/
+ka9q-web/
+onion/
