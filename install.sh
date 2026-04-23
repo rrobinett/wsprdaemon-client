@@ -80,6 +80,12 @@ fi
 # --- Install ---
 info "Installing wsprdaemon v4..."
 
+# Create radio group if needed (must exist before useradd --groups)
+if ! getent group "${WD_GROUP}" &>/dev/null; then
+    info "Creating group ${WD_GROUP}..."
+    groupadd --system "${WD_GROUP}"
+fi
+
 # Create user if needed
 if ! id "${WD_USER}" &>/dev/null; then
     info "Creating user ${WD_USER}..."
