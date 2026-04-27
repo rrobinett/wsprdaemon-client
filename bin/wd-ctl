@@ -1041,7 +1041,43 @@ def cmd_apply(args):
         return 1
 
     written = generate_all_env_files(config, env_dir)
+    written_names = {Path(p).name for p in written}
     print(f'  Env files: {len(written)} files in {env_dir}/')
+
+    # --- Stop and disable orphaned service instances ---
+    # Any env file that exists but was NOT just written is for a receiver that
+    # was removed from the config.  Stop and disable its service so it doesn't
+    # keep running or restart on reboot.
+    MANAGED_PREFIXES = ('wd-ka9q-record@', 'wd-kiwi-record@', 'wd-decode@',
+                        'wd-post@', 'wd-upload-wsprnet@', 'wd-upload-wsprdaemon@')
+    orphaned_svcs = []
+    for existing_env in sorted(env_dir.glob('*.env')):
+        if existing_env.name in written_names:
+            continue
+        prefix = next((p for p in MANAGED_PREFIXES if existing_env.name.startswith(p)), None)
+        if prefix is None:
+            continue
+        instance = existing_env.stem.split('@', 1)[1] if '@' in existing_env.stem else None
+        if not instance:
+            continue
+        svc = f'{prefix.rstrip("@")}@{instance}.service'
+        orphaned_svcs.append((svc, existing_env))
+    if orphaned_svcs:
+        print(f'\n--- Removing {len(orphaned_svcs)} orphaned service instance(s) ---')
+        for svc, env_file in orphaned_svcs:
+            result = subprocess.run(
+                ['systemctl', 'disable', '--now', svc],
+                capture_output=True, text=True
+            )
+            status = 'stopped+disabled' if result.returncode == 0 else f'rc={result.returncode}'
+            print(f'  {svc}: {status}')
+            try:
+                env_file.unlink()
+                print(f'  removed {env_file}')
+            except OSError as e:
+                print(f'  WARNING: could not remove {env_file}: {e}')
+    else:
+        print('  No orphaned instances to remove')
 
     # --- Install systemd unit templates ---
     # Must happen before any peer-service blocks that call systemctl enable.
