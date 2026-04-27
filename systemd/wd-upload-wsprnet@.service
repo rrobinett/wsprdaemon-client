@@ -16,7 +16,7 @@ Type=simple
 User=wsprdaemon
 Group=radio
 EnvironmentFile=-/etc/sigmond/coordination.env
-EnvironmentFile=/etc/wsprdaemon/env/wd-upload-wsprnet@%I.env
+EnvironmentFile=/etc/wsprdaemon/env/wd-upload-wsprnet@%i.env
 ExecStart=/usr/local/sbin/wd-upload-wsprnet
 
 Restart=always

@@ -196,7 +196,7 @@ def generate_upload_wsprdaemon_env(call: str, grid: str) -> str:
     lines = [_env_header()]
     lines.append(f'WD_RECEIVER_CALL={call}')
     lines.append(f'WD_RECEIVER_GRID={grid}')
-    lines.append(f'WD_UPLOAD_WSPRDAEMON_BASE_DIR={base_upload_dir}')
+    lines.append(f'WD_UPLOAD_WSPRDAEMON_DIR={base_upload_dir}')
     lines.append(f'WD_VERSION=4.0')
     lines.append(f'WD_LOG_DIR={paths.LOG_DIR}')
     return '\n'.join(lines) + '\n'
