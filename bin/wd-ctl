@@ -652,6 +652,12 @@ def _apply_rac(config) -> None:
     import tempfile
     import urllib.request
 
+    # If sigmond is managing the RAC tunnel via wd-rac.service, skip the
+    # legacy wd-remote-access.service entirely — sigmond owns this concern.
+    if Path('/etc/systemd/system/wd-rac.service').exists():
+        print('  RAC: managed by sigmond (wd-rac.service) — skipping legacy service')
+        return
+
     rac_str = config.rac
     if not rac_str:
         return
