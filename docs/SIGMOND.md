@@ -69,7 +69,7 @@ emitted by [`../lib/wdlib/contract.py`](../lib/wdlib/contract.py)
 | §12.1 Entry-point reachability (MUST) | `if __name__ == "__main__":` guard on every Python entry-point | [`check_entry_points`](../lib/wdlib/contract.py) covers `bin/wd-ctl` and `bin/wd-ka9q-record.py`. Errors surface in `validate.issues`. |
 | §12.2 SSRC uniqueness (MUST) | One (freq, preset, rate, encoding) tuple per radiod per band | [`check_ssrc_uniqueness`](../lib/wdlib/contract.py) — wsprdaemon-client always uses `preset=usb`, `rate=12000`, `enc=f32`, so the check reduces to "no two bands on the same KA9Q receiver share a frequency". |
 | §12.3 config_path disclosure (MUST) | `config_path` resolved to absolute path in inventory and validate output | [`build_inventory`](../lib/wdlib/contract.py) and [`build_validate`](../lib/wdlib/contract.py) call `Path(config_path).resolve()`. |
-| §12.5 Pattern A repo layout (SHOULD) | `/opt/git/wsprdaemon-client` group-writable + `~/wsprdaemon-client` symlink | See [Section 4](#4-pattern-a-repo-layout-125) below. |
+| §12.5 Pattern A repo layout (SHOULD) | `/opt/git/sigmond/wsprdaemon-client` group-writable + `~/wsprdaemon-client` symlink | See [Section 4](#4-pattern-a-repo-layout-125) below. |
 | §12.6 ka9q-python PyPI lag (SHOULD) | Warn if installed `ka9q.__version__` < deps.conf pin | [`check_ka9q_python_version`](../lib/wdlib/contract.py) reads the `[ka9q-python]` pin from [../deps.conf](../deps.conf) and compares to the imported `ka9q.__version__`. Returns a warn issue if low. |
 
 `build_validate` aggregates schedule-sanity checks (KA9Q receivers must
@@ -83,14 +83,14 @@ is the consumer side, and the producer surface lives in
 
 ## 4. Pattern A repo layout (§12.5)
 
-The contract specifies `/opt/git/<client>` as the canonical repo
+The contract specifies `/opt/git/sigmond/<client>` as the canonical repo
 location for a HamSCI client on a managed host:
 
-- Path: `/opt/git/wsprdaemon-client`.
+- Path: `/opt/git/sigmond/wsprdaemon-client`.
 - Owner: `mjh:<service-group>` (typically `mjh:wsprdaemon`), mode-775
   (group-writable).
 - Service user (`wsprdaemon`) is a member of the service group.
-- Convenience symlink: `~/wsprdaemon-client → /opt/git/wsprdaemon-client`
+- Convenience symlink: `~/wsprdaemon-client → /opt/git/sigmond/wsprdaemon-client`
   in the maintainer's home directory.
 
 ### Why
@@ -99,13 +99,13 @@ System services run as `User=wsprdaemon` and need to read from the repo
 clone (or its installed copies under `/opt/wsprdaemon/` and
 `/usr/local/sbin/`). If the clone lives under `~mjh/git/wsprdaemon-client`,
 mode-700 home directories block the service user from traversing into
-it. Putting the canonical clone under `/opt/git/` and giving the
+it. Putting the canonical clone under `/opt/git/sigmond/` and giving the
 service group read/exec satisfies the traversability constraint without
 loosening the maintainer's home permissions.
 
 ### Anti-pattern (banned)
 
-`install.sh` writing the **reverse** symlink — `/opt/git/<client> →
+`install.sh` writing the **reverse** symlink — `/opt/git/sigmond/<client> →
 ~/git/<client>` — re-introduces the home-directory traversal problem
 because the service user follows the symlink into mode-700 territory.
 The contract calls this out as the trap `hf-timestd` and `psk-recorder`

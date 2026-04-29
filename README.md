@@ -23,11 +23,12 @@ Housekeeping (`wd-spool-clean.timer`) trims the WAV spool and posting queue.
 
 ## Install
 
-Canonical install path is `/opt/git/wsprdaemon-client` (Pattern A repo layout — see [docs/SIGMOND.md](docs/SIGMOND.md)):
+Canonical install path is `/opt/git/sigmond/wsprdaemon-client` (Pattern A repo layout — see [docs/SIGMOND.md](docs/SIGMOND.md)):
 
 ```bash
-sudo install -d -o <maintainer> -g <service-group> -m 2775 /opt/git
-cd /opt/git
+sudo install -d -m 0755 /opt/git
+sudo install -d -o <maintainer> -g <service-group> -m 2775 /opt/git/sigmond
+cd /opt/git/sigmond
 sudo -u <maintainer> git clone https://github.com/rrobinett/wsprdaemon-client.git
 cd wsprdaemon-client
 sudo ./install.sh

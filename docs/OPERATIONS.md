@@ -11,7 +11,7 @@ see [wd-v4-architecture.md](../wd-v4-architecture.md).
 
 ### 1.1 Repo layout (Pattern A)
 
-The canonical source-tree location is `/opt/git/wsprdaemon-client` (Pattern A
+The canonical source-tree location is `/opt/git/sigmond/wsprdaemon-client` (Pattern A
 multi-machine workflow used across the wsprdaemon/hf-timestd toolchain). Any
 location works; `wd-ctl` resolves its own root by looking for `deps.conf`
 beside the script, then `/opt/wsprdaemon`, then `/home/wsprdaemon/wsprdaemon-client`.
