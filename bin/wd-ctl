@@ -372,14 +372,28 @@ def _apply_ka9q_web(config) -> None:
         print(f'  env:    {env_path}')
 
         svc = f'wd-ka9q-web@{radiod_name}.service'
-        result = subprocess.run(
-            ['systemctl', 'enable', '--now', svc],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            print(f'  Started: {svc}')
-        else:
-            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+        _enable_now(svc)
+
+
+def _enable_now(svc: str) -> None:
+    """systemctl enable --now <svc>; print 'Started:' only on real transitions.
+
+    Idempotent: if the unit is already active, this is a no-op as far as
+    output goes (the enable bit is still ensured).  Avoids the misleading
+    "Started: X" print on every apply for already-running services.
+    """
+    import subprocess
+    was_active = subprocess.run(
+        ['systemctl', 'is-active', '--quiet', svc],
+    ).returncode == 0
+    result = subprocess.run(
+        ['systemctl', 'enable', '--now', svc],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f'  Failed to start {svc}: {result.stderr.strip()}')
+    elif not was_active:
+        print(f'  Started: {svc}')
 
 
 def _manage_radiod(conf_name: str) -> None:
@@ -1267,14 +1281,7 @@ WantedBy=local-fs.target
     ]
     for instance in sorted(ka9q_instances):
         svc = f'wd-ka9q-record@{instance}.service'
-        result = subprocess.run(
-            ['systemctl', 'enable', '--now', svc],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            print(f'  Started: {svc}')
-        else:
-            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+        _enable_now(svc)
 
     # --- Start kiwi-record services ---
     kiwi_instances = [
@@ -1284,14 +1291,7 @@ WantedBy=local-fs.target
     ]
     for instance in sorted(kiwi_instances):
         svc = f'wd-kiwi-record@{instance}.service'
-        result = subprocess.run(
-            ['systemctl', 'enable', '--now', svc],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            print(f'  Started: {svc}')
-        else:
-            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+        _enable_now(svc)
 
     # --- Start decode services ---
     decode_instances = [
@@ -1301,14 +1301,7 @@ WantedBy=local-fs.target
     ]
     for instance in sorted(decode_instances):
         svc = f'wd-decode@{instance}.service'
-        result = subprocess.run(
-            ['systemctl', 'enable', '--now', svc],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            print(f'  Started: {svc}')
-        else:
-            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+        _enable_now(svc)
 
     # --- Start post services ---
     post_instances = [
@@ -1318,14 +1311,7 @@ WantedBy=local-fs.target
     ]
     for instance in sorted(post_instances):
         svc = f'wd-post@{instance}.service'
-        result = subprocess.run(
-            ['systemctl', 'enable', '--now', svc],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            print(f'  Started: {svc}')
-        else:
-            print(f'  Failed to start {svc}: {result.stderr.strip()}')
+        _enable_now(svc)
 
     # --- Start upload services ---
     for svc_prefix in ('wd-upload-wsprnet', 'wd-upload-wsprdaemon'):
@@ -1336,14 +1322,7 @@ WantedBy=local-fs.target
         ]
         for instance in sorted(instances):
             svc = f'{svc_prefix}@{instance}.service'
-            result = subprocess.run(
-                ['systemctl', 'enable', '--now', svc],
-                capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                print(f'  Started: {svc}')
-            else:
-                print(f'  Failed to start {svc}: {result.stderr.strip()}')
+            _enable_now(svc)
 
     # --- Enable spool janitor timer ---
     subprocess.run(['systemctl', 'enable', '--now', 'wd-spool-clean.timer'],
