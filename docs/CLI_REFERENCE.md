@@ -101,7 +101,7 @@ Iterate over [deps.conf](../deps.conf) and install/verify each entry.
 - `type = git`: clone `url` to `install_to` if missing, then
   `git checkout commit`. Mismatches print a remediation hint; the
   command returns non-zero when any dep is wrong.
-- `type = pypi`: install into `/opt/wsprdaemon/venv` via `pip`. Handles
+- `type = pypi`: install into `/opt/wsprdaemon-client/venv` via `pip`. Handles
   both PyPI names and `git+…` URLs. Creates the venv on first run.
 
 Not in the public contract but exposed in `main()`'s subparser table.
@@ -122,7 +122,7 @@ Source: [bin/wd-ka9q-record](../bin/wd-ka9q-record) (bash wrapper),
 
 Role: thin wrapper that validates env vars and execs the AC0G
 [wspr-recorder](https://github.com/mijahauan/wspr-recorder) under
-`/opt/wsprdaemon/venv/bin/wspr-recorder`. The Python body composes a
+`/opt/wsprdaemon-client/venv/bin/wspr-recorder`. The Python body composes a
 TOML config from env vars plus the per-band `WD_RECEIVER_MODES` it reads
 from sibling `wd-decode@<rx>-<band>.env` files; the recorder then handles
 channel lifecycle (via ka9q-python `RadiodControl`), RTP reception,
@@ -156,7 +156,7 @@ config to `/run/wsprdaemon/wspr-rec-<RX>.sock` and a status JSON to
 ### B.3 `wd-kiwi-record` — Kiwi recorder (systemd-only)
 
 Source: [bin/wd-kiwi-record](../bin/wd-kiwi-record). Wrapper for
-`/opt/wsprdaemon/kiwiclient/kiwirecorder.py` — one instance per
+`/opt/wsprdaemon-client/kiwiclient/kiwirecorder.py` — one instance per
 `<RECEIVER>-<BAND>`. Writes minute-aligned 16-bit PCM 12 kHz mono WAVs
 named `YYYYMMDDTHHMMSSz_<freq_hz>_usb.wav` into `WD_RECORDING_DIR`.
 
@@ -199,7 +199,7 @@ Source: [bin/wd-decode](../bin/wd-decode). One instance per
 For each ready period-length WAV it dispatches per `WD_RECEIVER_MODES`:
 
 - `W` modes → `wsprd` (architecture-selected from
-  `/opt/wsprdaemon/bin/decoders/wsprd-{x86,arm64,armhf}-vNN`).
+  `/opt/wsprdaemon-client/bin/decoders/wsprd-{x86,arm64,armhf}-vNN`).
 - `F` modes → `jt9 --fst4w -p <period_sec>`.
 - `I` modes → archive only, no decode.
 

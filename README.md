@@ -34,7 +34,7 @@ cd wsprdaemon-client
 sudo ./install.sh
 ```
 
-`install.sh` creates the `wsprdaemon:radio` user/group, the FHS-compliant path set (`/etc/wsprdaemon`, `/var/spool/wsprdaemon`, `/var/log/wsprdaemon`, `/run/wsprdaemon`, `/opt/wsprdaemon`), installs executables under `/usr/local/sbin/`, and drops the systemd unit templates into `/etc/systemd/system/`. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for first-run steps and [deploy.toml](deploy.toml) for the canonical install manifest.
+`install.sh` creates the `wsprdaemon:radio` user/group, the FHS-compliant path set (`/etc/wsprdaemon`, `/var/spool/wsprdaemon`, `/var/log/wsprdaemon`, `/run/wsprdaemon`, `/opt/wsprdaemon-client`), installs executables under `/usr/local/sbin/`, and drops the systemd unit templates into `/etc/systemd/system/`. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for first-run steps and [deploy.toml](deploy.toml) for the canonical install manifest.
 
 ## Quick start
 

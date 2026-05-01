@@ -107,7 +107,7 @@ Config → wd-ctl apply → env files → systemd services
 /var/log/wsprdaemon/          Per-daemon log files
 /run/wsprdaemon/              Runtime state (tmpfs)
 /usr/local/sbin/              Installed executables
-/opt/wsprdaemon/              Installer, shared libs
+/opt/wsprdaemon-client/              Installer, shared libs
 /etc/systemd/system/          Unit files
 ```
 

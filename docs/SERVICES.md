@@ -126,8 +126,8 @@ This is the **1:N** model: one process per receiver, all bands inside.
   e.g. `wd-ka9q-record@KA9Q_0.service`.
 - ExecStart: [`/usr/local/sbin/wd-ka9q-record`](../bin/wd-ka9q-record),
   a thin bash wrapper that exec's
-  [`/opt/wsprdaemon/bin/wd-ka9q-record.py`](../bin/wd-ka9q-record.py)
-  under the project venv at `/opt/wsprdaemon/venv/bin/python3`.
+  [`/opt/wsprdaemon-client/bin/wd-ka9q-record.py`](../bin/wd-ka9q-record.py)
+  under the project venv at `/opt/wsprdaemon-client/venv/bin/python3`.
 - WorkingDirectory: `/var/spool/wsprdaemon/recording/%i`.
 - EnvironmentFile (in order):
     - `-/etc/sigmond/coordination.env` (optional, sigmond drop-in)
@@ -167,7 +167,7 @@ through.
 - Instance `%i`: `RECEIVER-BAND`, e.g. `wd-kiwi-record@KIWI_0-80.service`.
 - ExecStart: [`/usr/local/sbin/wd-kiwi-record`](../bin/wd-kiwi-record),
   a bash wrapper that exec's
-  `/opt/wsprdaemon/kiwiclient/kiwirecorder.py` (pinned commit in
+  `/opt/wsprdaemon-client/kiwiclient/kiwirecorder.py` (pinned commit in
   [../deps.conf](../deps.conf) `[kiwiclient]`).
 - ExecStopPost: [`/usr/local/sbin/wd-kiwi-cleanup`](../bin/wd-kiwi-cleanup) `%i`
   — deletes the truncated WAV that `kiwirecorder.py` leaves behind on
@@ -204,7 +204,7 @@ runs `wsprd` (W modes) or `jt9 --fst4w` (F modes). Mode prefixes:
 
 - Instance `%i`: `RECEIVER-BAND`, e.g. `wd-decode@KA9Q_0-80.service`.
 - ExecStart: [`/usr/local/sbin/wd-decode`](../bin/wd-decode). Decoder
-  binaries live in `/opt/wsprdaemon/bin/decoders/` (architecture-keyed:
+  binaries live in `/opt/wsprdaemon-client/bin/decoders/` (architecture-keyed:
   `wsprd-x86-v27`, `wsprd-arm64-v27`, `wsprd-armhf-v26`, etc.).
 - WorkingDirectory: `/tmp` (the script picks per-instance paths from env).
 - EnvironmentFile:

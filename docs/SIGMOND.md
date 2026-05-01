@@ -96,7 +96,7 @@ location for a HamSCI client on a managed host:
 ### Why
 
 System services run as `User=wsprdaemon` and need to read from the repo
-clone (or its installed copies under `/opt/wsprdaemon/` and
+clone (or its installed copies under `/opt/wsprdaemon-client/` and
 `/usr/local/sbin/`). If the clone lives under `~mjh/git/wsprdaemon-client`,
 mode-700 home directories block the service user from traversing into
 it. Putting the canonical clone under `/opt/git/sigmond/` and giving the

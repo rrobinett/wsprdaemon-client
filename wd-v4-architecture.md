@@ -127,7 +127,7 @@ configured, and are running. It does not contain the work itself.
 
 ┌──────────────────────────────────────────────────────────────────────┐
 │              PYTHON DEPENDENCIES                                     │
-│       (installed into /opt/wsprdaemon/python/)                       │
+│       (installed into /opt/wsprdaemon-client/python/)                       │
 ├──────────────────────────────────────────────────────────────────────┤
 │  ka9q-python (pip: ka9q-python)                                      │
 │    — Pure-Python radiod control API (dynamic channel                 │
@@ -536,7 +536,7 @@ Type=simple
 User=wsprdaemon
 Group=radio
 EnvironmentFile=/etc/wsprdaemon/env/wd-hftime@%i.env
-ExecStart=/opt/wsprdaemon/python/bin/python3 -m hf_timestd \
+ExecStart=/opt/wsprdaemon-client/python/bin/python3 -m hf_timestd \
     --radiod-host ${WD_RADIOD_STATUS_ADDRESS} \
     --calib-file /run/wsprdaemon/%i/hftime.json
 WorkingDirectory=/run/wsprdaemon
@@ -1222,7 +1222,7 @@ downstream decoder is not running.
 ├── KA9Q_0/
 │   └── hftime.json                           # Time calibration from wd-hftime
 
-/opt/wsprdaemon/                              # Installer and supporting files
+/opt/wsprdaemon-client/                              # Installer and supporting files
 ├── install.sh                                # Installer script
 ├── lib/                                      # Shared bash libraries (wd-logger, etc.)
 ├── share/                                    # Data files, templates, etc.
@@ -1236,15 +1236,15 @@ downstream decoder is not running.
 **Key principles**:
 - Executables that are invoked directly (daemons, `wd-ctl`) go in `/usr/local/sbin/`.
   They are *not* executed from the source/install directory.
-- The installer lives in `/opt/wsprdaemon/` and is responsible for copying executables,
+- The installer lives in `/opt/wsprdaemon-client/` and is responsible for copying executables,
   unit files, and config templates into their FHS locations.
-- Shared libraries and helper functions (like `wd-logger`) live in `/opt/wsprdaemon/lib/`
+- Shared libraries and helper functions (like `wd-logger`) live in `/opt/wsprdaemon-client/lib/`
   and are sourced by the executables at runtime.
 - Unit files go in `/etc/systemd/system/` (the standard location for admin-installed units).
 - Python dependencies (`ka9q-python`, `hf-timestd`) are installed into an isolated
-  virtual environment at `/opt/wsprdaemon/python/`.  The installer creates this venv
+  virtual environment at `/opt/wsprdaemon-client/python/`.  The installer creates this venv
   and runs `pip install ka9q-python hf-timestd` into it.  Bash wrapper scripts invoke
-  the venv's interpreter directly (e.g., `/opt/wsprdaemon/python/bin/python3 -m ...`)
+  the venv's interpreter directly (e.g., `/opt/wsprdaemon-client/python/bin/python3 -m ...`)
   so there is no dependency on the system Python path.
 
 ---
@@ -1256,7 +1256,7 @@ downstream decoder is not running.
 1. Create `/etc/wsprdaemon/components.ini` with pinned commit hashes for all
    external dependencies.  Verify each component can be cloned and checked out
    at the pinned commit.
-2. Install Python dependencies: create `/opt/wsprdaemon/python/` venv, install
+2. Install Python dependencies: create `/opt/wsprdaemon-client/python/` venv, install
    `ka9q-python` and `hf-timestd` at their pinned commits via pip.
 3. Create `wd-hftime` unit file and wrapper — verify it creates a WWV channel on
    radiod dynamically and publishes a calibration file to `/run/wsprdaemon/`.
@@ -1542,7 +1542,7 @@ commit = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ### 10.2 Installer Behavior
 
-The wsprdaemon installer (`/opt/wsprdaemon/install.sh`) reads `components.ini`
+The wsprdaemon installer (`/opt/wsprdaemon-client/install.sh`) reads `components.ini`
 and the receiver configuration in `wsprdaemon.conf`, then performs the following
 for each required component:
 
@@ -1573,7 +1573,7 @@ When `wd-ctl apply` runs (either at boot via `wsprdaemon.service` or on the
 
 ```
 For each [component] in components.ini:
-    installed_commit = (cd /opt/wsprdaemon/src/<component> && git rev-parse HEAD)
+    installed_commit = (cd /opt/wsprdaemon-client/src/<component> && git rev-parse HEAD)
     expected_commit  = components.ini[component].commit
     if installed_commit != expected_commit:
         log WARNING: "<component> version mismatch:
@@ -1599,7 +1599,7 @@ When a new wsprdaemon release ships, it includes an updated `components.ini`
 with commit hashes that have been tested together.  The migration path is:
 
 ```bash
-cd /opt/wsprdaemon && git pull          # update wsprdaemon itself
+cd /opt/wsprdaemon-client && git pull          # update wsprdaemon itself
 cp share/components.ini /etc/wsprdaemon/components.ini   # update pins
 wd-ctl update-components                # checkout + rebuild
 sudo systemctl restart wsprdaemon       # restart with verified versions
@@ -1627,7 +1627,7 @@ version string looks like `4.0-4837`.
 
 ### 11.1 The VERSION File
 
-The version string lives in `/opt/wsprdaemon/VERSION` (and in the repo root).
+The version string lives in `/opt/wsprdaemon-client/VERSION` (and in the repo root).
 The file contains a single line with the `MAJOR.MINOR` portion:
 
 ```
@@ -1664,7 +1664,7 @@ The version string is also included in:
 If a user is told "use version 4.0-4837", they can check it out with:
 
 ```bash
-cd /opt/wsprdaemon
+cd /opt/wsprdaemon-client
 git checkout $(git rev-list --reverse HEAD | sed -n '4837p')
 ```
 

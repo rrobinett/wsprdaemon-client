@@ -14,7 +14,7 @@ see [wd-v4-architecture.md](../wd-v4-architecture.md).
 The canonical source-tree location is `/opt/git/sigmond/wsprdaemon-client` (Pattern A
 multi-machine workflow used across the wsprdaemon/hf-timestd toolchain). Any
 location works; `wd-ctl` resolves its own root by looking for `deps.conf`
-beside the script, then `/opt/wsprdaemon`, then `/home/wsprdaemon/wsprdaemon-client`.
+beside the script, then `/opt/wsprdaemon-client`, then `/home/wsprdaemon/wsprdaemon-client`.
 
 ### 1.2 Prerequisites
 
@@ -42,14 +42,14 @@ sudo ./install.sh
   - `/etc/wsprdaemon/` and `/etc/wsprdaemon/env/` (mode 2775, group `radio`)
   - `/var/spool/wsprdaemon/{recording,posting,posting/uploads/{wsprnet,wsprdaemon}}`
   - `/var/log/wsprdaemon/`
-  - `/opt/wsprdaemon/{lib,bin}`
-- Copies [lib/wdlib](../lib/wdlib) to `/opt/wsprdaemon/lib/wdlib`.
+  - `/opt/wsprdaemon-client/{lib,bin}`
+- Copies [lib/wdlib](../lib/wdlib) to `/opt/wsprdaemon-client/lib/wdlib`.
 - Copies [bin/wd-ka9q-record.py](../bin/wd-ka9q-record.py) to
-  `/opt/wsprdaemon/bin/`.
-- Copies [deps.conf](../deps.conf) to `/opt/wsprdaemon/deps.conf` so the
+  `/opt/wsprdaemon-client/bin/`.
+- Copies [deps.conf](../deps.conf) to `/opt/wsprdaemon-client/deps.conf` so the
   installed `wd-ctl` can find dependency pins.
 - Installs the bundled decoder binaries (`wsprd`, `jt9` for x86, arm64,
-  armhf) to `/opt/wsprdaemon/bin/decoders/`.
+  armhf) to `/opt/wsprdaemon-client/bin/decoders/`.
 - Installs the wrapper executables (`wd-ctl`, `wd-ka9q-record`,
   `wd-kiwi-record`, `wd-kiwi-cleanup`, `wd-decode`, `wd-post`) to
   `/usr/local/sbin/`.
@@ -300,12 +300,12 @@ so stdout stays pure JSON even when the parser logs warnings.
 Likely causes:
 
 - **ka9q-python missing or wrong version.** Check
-  `/opt/wsprdaemon/venv/bin/python3 -c 'import ka9q; print(ka9q.__version__)'`.
+  `/opt/wsprdaemon-client/venv/bin/python3 -c 'import ka9q; print(ka9q.__version__)'`.
   Run `sudo wd-ctl install-deps` to install/upgrade per
   [deps.conf](../deps.conf).
 - **wspr-recorder missing.** `wd-ka9q-record` execs
-  `/opt/wsprdaemon/venv/bin/wspr-recorder`. Verify it is installed:
-  `ls -l /opt/wsprdaemon/venv/bin/wspr-recorder`.
+  `/opt/wsprdaemon-client/venv/bin/wspr-recorder`. Verify it is installed:
+  `ls -l /opt/wsprdaemon-client/venv/bin/wspr-recorder`.
 - **radiod unreachable.** Verify `<radiod_name>-status.local` resolves
   (mDNS) and the multicast group is reachable:
   `getent hosts <radiod_name>-status.local`,
