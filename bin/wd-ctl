@@ -1366,42 +1366,43 @@ WantedBy=local-fs.target
     for radiod_name in local_radiods:
         _manage_radiod(radiod_name)
 
-    # --- Read radiod CPU assignments (managed by hf-timestd, not wd-ctl) ---
-    # wd-ctl does NOT write radiod cpu-affinity.conf drop-ins.
-    # hf-timestd's timestd-radiod-affinity.path owns radiod CPU pinning.
-    # We read the existing assignments here only to know which CPUs to exclude
-    # from the worker affinity set.
-    print('\n--- CPU affinity ---')
-    all_assignments = _get_radiod_cpu_assignments()
+    # --- CPU affinity ---
+    # When invoked under sigmond, WD_SKIP_AFFINITY=1 suppresses this block;
+    # sigmond owns CPU affinity for all managed services (radiod + workers).
+    if not os.environ.get('WD_SKIP_AFFINITY'):
+        # Read radiod CPU assignments (managed by hf-timestd, not wd-ctl) so
+        # we know which CPUs to exclude from the worker affinity set.
+        print('\n--- CPU affinity ---')
+        all_assignments = _get_radiod_cpu_assignments()
 
-    for radiod_name in local_radiods:
-        cpus = sorted(all_assignments.get(radiod_name) or [])
-        if cpus:
-            print(f'  radiod@{radiod_name}: CPUAffinity={cpus} (set by hf-timestd)')
-        else:
-            print(f'  radiod@{radiod_name}: no cpu-affinity.conf found — hf-timestd not configured')
+        for radiod_name in local_radiods:
+            cpus = sorted(all_assignments.get(radiod_name) or [])
+            if cpus:
+                print(f'  radiod@{radiod_name}: CPUAffinity={cpus} (set by hf-timestd)')
+            else:
+                print(f'  radiod@{radiod_name}: no cpu-affinity.conf found — hf-timestd not configured')
 
-    if not local_radiods:
-        print('  No local radiod instances configured')
+        if not local_radiods:
+            print('  No local radiod instances configured')
 
-    # --- Build reserved CPU set: hf-timestd radiod assignments + user-specified extras ---
-    reserved_cpus: set = set()
-    for radiod_name in local_radiods:
-        assigned = all_assignments.get(radiod_name) or frozenset()
-        reserved_cpus |= set(assigned)
+        # Build reserved CPU set: hf-timestd radiod assignments + user-specified extras
+        reserved_cpus: set = set()
+        for radiod_name in local_radiods:
+            assigned = all_assignments.get(radiod_name) or frozenset()
+            reserved_cpus |= set(assigned)
 
-    # Add any CPUs reserved by the user for manually-managed services
-    user_reserved = config.reserved_cpus
-    if user_reserved:
-        for tok in user_reserved.replace(',', ' ').split():
-            try:
-                reserved_cpus.add(int(tok))
-            except ValueError:
-                pass
-        print(f'  User-reserved CPUs: {sorted(int(t) for t in user_reserved.replace(",", " ").split() if t.isdigit())}')
+        # Add any CPUs reserved by the user for manually-managed services
+        user_reserved = config.reserved_cpus
+        if user_reserved:
+            for tok in user_reserved.replace(',', ' ').split():
+                try:
+                    reserved_cpus.add(int(tok))
+                except ValueError:
+                    pass
+            print(f'  User-reserved CPUs: {sorted(int(t) for t in user_reserved.replace(",", " ").split() if t.isdigit())}')
 
-    # --- Write worker CPU affinity drop-ins for all managed services ---
-    _apply_worker_cpu_affinity(reserved_cpus)
+        # Write worker CPU affinity drop-ins for all managed services
+        _apply_worker_cpu_affinity(reserved_cpus)
 
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
 
