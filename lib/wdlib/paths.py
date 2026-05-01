@@ -12,7 +12,7 @@ Layout:
     /var/log/wsprdaemon/          — per-daemon log files
     /run/wsprdaemon/              — runtime PID/state (tmpfs, auto-created)
     /usr/local/sbin/              — installed executables
-    /opt/wsprdaemon/              — installer, shared libs
+    /opt/wsprdaemon-client/              — installer, shared libs
     /etc/systemd/system/          — unit files
 """
 
@@ -24,7 +24,7 @@ ETC_DIR = Path('/etc/wsprdaemon')
 SPOOL_DIR = Path('/var/spool/wsprdaemon')
 LOG_DIR = Path('/var/log/wsprdaemon')
 RUN_DIR = Path('/run/wsprdaemon')
-INSTALL_DIR = Path('/opt/wsprdaemon')
+INSTALL_DIR = Path('/opt/wsprdaemon-client')
 SBIN_DIR = Path('/usr/local/sbin')
 SYSTEMD_DIR = Path('/etc/systemd/system')
 

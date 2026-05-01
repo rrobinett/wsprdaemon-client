@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-for _p in ['/opt/wsprdaemon/lib', str(_HERE.parent / 'lib')]:
+for _p in ['/opt/wsprdaemon-client/lib', str(_HERE.parent / 'lib')]:
     if Path(_p).exists() and _p not in sys.path:
         sys.path.insert(0, _p)
 

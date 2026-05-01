@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Contract §11 log-level resolution + SIGHUP handler.
-for _d in /opt/wsprdaemon/lib /usr/local/share/wsprdaemon/lib; do
+for _d in /opt/wsprdaemon-client/lib /usr/local/share/wsprdaemon/lib; do
     if [[ -r "${_d}/wd-loglevel.sh" ]]; then
         # shellcheck source=/dev/null
         . "${_d}/wd-loglevel.sh"
@@ -19,7 +19,7 @@ done
 
 # Resolve decoder binaries from the project's decoders directory.
 # Never rely on PATH — these are versioned project binaries.
-_DECODER_DIR="/opt/wsprdaemon/bin/decoders"
+_DECODER_DIR="/opt/wsprdaemon-client/bin/decoders"
 _ARCH=$(uname -m)
 case "${_ARCH}" in
     x86_64)       WSPRD_BIN="${_DECODER_DIR}/wsprd-x86-v27"
@@ -50,7 +50,7 @@ WD_RECEIVER_CALL="${WD_RECEIVER_CALL:-UNKNOWN}"
 WD_RECEIVER_GRID="${WD_RECEIVER_GRID:-AA00}"
 
 # Extended-spot tooling
-_C2_NOISE_PY="/opt/wsprdaemon/bin/c2_noise.py"
+_C2_NOISE_PY="/opt/wsprdaemon-client/bin/c2_noise.py"
 _WD_EXTEND_SPOTS="/usr/local/sbin/wd-extend-spots"
 # Pre-TX / post-TX time windows used to sample background noise from the wav.
 # Units: seconds from wav start.  WSPR-2 wav = 120 s total.

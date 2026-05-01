@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # Contract §11 log-level resolution + SIGHUP handler.
-for _d in /opt/wsprdaemon/lib /usr/local/share/wsprdaemon/lib; do
+for _d in /opt/wsprdaemon-client/lib /usr/local/share/wsprdaemon/lib; do
     if [[ -r "${_d}/wd-loglevel.sh" ]]; then
         # shellcheck source=/dev/null
         . "${_d}/wd-loglevel.sh"

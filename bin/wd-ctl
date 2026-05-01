@@ -19,12 +19,12 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Resolve source tree root — works from the source tree (bin/) and installed (/usr/local/sbin/).
-# Priority: beside this script, then /opt/wsprdaemon (install.sh copies deps.conf there),
+# Priority: beside this script, then /opt/wsprdaemon-client (install.sh copies deps.conf there),
 # then a hard fallback to the default source tree location.
 _SOURCE_ROOT = _SCRIPT_DIR.parent
 if not (_SOURCE_ROOT / 'deps.conf').exists():
     for _candidate in [
-        Path('/opt/wsprdaemon'),
+        Path('/opt/wsprdaemon-client'),
         Path('/home/wsprdaemon/wsprdaemon-client'),
     ]:
         if (_candidate / 'deps.conf').exists():
@@ -34,8 +34,8 @@ if not (_SOURCE_ROOT / 'deps.conf').exists():
 _LIB_DIR = _SOURCE_ROOT / 'lib'
 if (_LIB_DIR / 'wdlib').exists():
     sys.path.insert(0, str(_LIB_DIR))
-elif Path('/opt/wsprdaemon/lib/wdlib').exists():
-    sys.path.insert(0, '/opt/wsprdaemon/lib')
+elif Path('/opt/wsprdaemon-client/lib/wdlib').exists():
+    sys.path.insert(0, '/opt/wsprdaemon-client/lib')
 
 from wdlib import paths
 from wdlib.v4_parser import parse_v4_config
@@ -649,7 +649,7 @@ def _apply_rac(config) -> None:
 
     Writes:
       /etc/wsprdaemon/frpc.toml      — template (serverAddr substituted at runtime)
-      /opt/wsprdaemon/bin/wd-rac-connect — failover launcher script
+      /opt/wsprdaemon-client/bin/wd-rac-connect — failover launcher script
       /etc/systemd/system/wd-remote-access.service
 
     Does NOT enable or start the service — RAC runs independently of wd-ctl.
@@ -708,7 +708,7 @@ def _apply_rac(config) -> None:
 
     # --- Ensure frpc binary is present ---
     frpc_version = '0.64.0'
-    frpc_bin     = Path('/opt/wsprdaemon/bin/frpc')
+    frpc_bin     = Path('/opt/wsprdaemon-client/bin/frpc')
     if frpc_bin.exists():
         print(f'  frpc: already present at {frpc_bin}')
     else:
@@ -815,7 +815,7 @@ def _apply_rac(config) -> None:
     # When on fallback: frpc runs in background; a 60s poll loop detects when
     # the primary returns and kills frpc so systemd restarts to the primary.
     # When on primary: exec frpc directly so systemd tracks the correct PID.
-    connector = Path('/opt/wsprdaemon/bin/wd-rac-connect')
+    connector = Path('/opt/wsprdaemon-client/bin/wd-rac-connect')
     fallback_block = ''
     if fallback:
         fallback_block = (
@@ -894,7 +894,7 @@ def _apply_rac(config) -> None:
         f'User=wsprdaemon\n'
         f'RuntimeDirectory=wsprdaemon\n'
         f'RuntimeDirectoryPreserve=yes\n'
-        f'ExecStart=/opt/wsprdaemon/bin/wd-rac-connect\n'
+        f'ExecStart=/opt/wsprdaemon-client/bin/wd-rac-connect\n'
         f'Restart=always\n'
         f'RestartSec=30\n'
         f'StartLimitIntervalSec=0\n'
@@ -1159,7 +1159,7 @@ def cmd_apply(args):
     print(f'  Wrappers installed to {sbin}/')
 
     # --- Install Python recorder ---
-    opt_bin = Path('/opt/wsprdaemon/bin')
+    opt_bin = Path('/opt/wsprdaemon-client/bin')
     opt_bin.mkdir(parents=True, exist_ok=True)
     # Look in source bin/ first, then the source root bin/
     py_src = _SCRIPT_DIR / 'wd-ka9q-record.py'
@@ -1169,11 +1169,11 @@ def cmd_apply(args):
         py_dst = opt_bin / 'wd-ka9q-record.py'
         if not py_dst.exists() or py_src.resolve() != py_dst.resolve():
             shutil.copy2(py_src, py_dst)
-    opt_lib = Path('/opt/wsprdaemon/lib')
+    opt_lib = Path('/opt/wsprdaemon-client/lib')
     opt_lib.mkdir(parents=True, exist_ok=True)
     wdlib_src = _SOURCE_ROOT / 'lib' / 'wdlib'
     wdlib_dst = opt_lib / 'wdlib'
-    # Only create a symlink when the source is a real directory outside /opt/wsprdaemon
+    # Only create a symlink when the source is a real directory outside /opt/wsprdaemon-client
     # (i.e. running from a source tree). Skip if they'd resolve to the same path.
     if wdlib_src.is_dir() and wdlib_src.resolve() != wdlib_dst.resolve():
         if wdlib_dst.is_symlink() or wdlib_dst.exists():
@@ -1619,7 +1619,7 @@ def cmd_install_deps(args):
     errors = 0
 
     # --- Ensure the wsprdaemon venv exists ---
-    venv_dir = Path('/opt/wsprdaemon/venv')
+    venv_dir = Path('/opt/wsprdaemon-client/venv')
     if not venv_dir.exists():
         print(f'Creating Python venv at {venv_dir}...')
         result = subprocess.run(
@@ -1687,7 +1687,7 @@ def cmd_install_deps(args):
                         print(f'  Checked out {commit[:12]}')
 
         elif dep_type == 'pypi':
-            pip_cmd = str(Path('/opt/wsprdaemon/venv/bin/pip'))
+            pip_cmd = str(Path('/opt/wsprdaemon-client/venv/bin/pip'))
             is_git_url = url.startswith('git+')
             pkg_name = url.rstrip('/').split('/')[-1].replace('.git', '') if is_git_url else url
 
@@ -1772,7 +1772,7 @@ def cmd_deps_freeze(args):
     cfg = configparser.ConfigParser()
     cfg.read(deps_file)
 
-    pip_cmd = '/opt/wsprdaemon/venv/bin/pip'
+    pip_cmd = '/opt/wsprdaemon-client/venv/bin/pip'
     actuals = {}  # section -> actual sha or version string
 
     for section in cfg.sections():

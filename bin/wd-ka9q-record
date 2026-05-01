@@ -11,7 +11,7 @@ set -euo pipefail
 : "${WD_RECORDING_DIR:?WD_RECORDING_DIR not set}"
 : "${WD_BANDS:?WD_BANDS not set}"
 
-VENV_PYTHON=/opt/wsprdaemon/venv/bin/python3
-RECORDER=/opt/wsprdaemon/bin/wd-ka9q-record.py
+VENV_PYTHON=/opt/wsprdaemon-client/venv/bin/python3
+RECORDER=/opt/wsprdaemon-client/bin/wd-ka9q-record.py
 
 exec "${VENV_PYTHON}" "${RECORDER}"

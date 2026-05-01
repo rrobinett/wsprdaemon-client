@@ -2,7 +2,7 @@
 """wd-ka9q-record — KA9Q WSPR recording daemon for wsprdaemon v4.
 
 Generates a wspr-recorder config from env vars and execs
-/opt/wsprdaemon/venv/bin/wspr-recorder (github.com/mijahauan/wspr-recorder
+/opt/wsprdaemon-client/venv/bin/wspr-recorder (github.com/mijahauan/wspr-recorder
 by AC0G).  wspr-recorder handles channel lifecycle via RadiodControl,
 RTP multicast reception, minute-aligned WAV writing, gap detection,
 quality JSON sidecars, and health monitoring.
@@ -31,9 +31,9 @@ import logging
 from pathlib import Path
 from typing import List
 
-# wdlib is in /opt/wsprdaemon/lib (installed) or relative to this script
+# wdlib is in /opt/wsprdaemon-client/lib (installed) or relative to this script
 _HERE = Path(__file__).resolve().parent
-for _p in ['/opt/wsprdaemon/lib', str(_HERE.parent / 'lib')]:
+for _p in ['/opt/wsprdaemon-client/lib', str(_HERE.parent / 'lib')]:
     if Path(_p).exists() and _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -48,7 +48,7 @@ RECORDING_DIR = Path(os.environ['WD_RECORDING_DIR'])
 GAIN_DB       = float(os.environ.get('WD_GAIN_DB', '0'))
 ENV_DIR       = Path(os.environ.get('WD_ENV_DIR', '/etc/wsprdaemon/env'))
 
-WSPR_RECORDER = '/opt/wsprdaemon/venv/bin/wspr-recorder'
+WSPR_RECORDER = '/opt/wsprdaemon-client/venv/bin/wspr-recorder'
 
 
 def _read_band_modes(band: str) -> List[str]:

@@ -1,5 +1,5 @@
 #!/bin/bash
-# /opt/wsprdaemon/install.sh
+# /opt/wsprdaemon-client/install.sh
 # wsprdaemon v4 installer
 #
 # Usage: sudo ./install.sh [--uninstall]
@@ -8,14 +8,14 @@
 #   - wsprdaemon user/group
 #   - Directory structure (FHS compliant)
 #   - Executables to /usr/local/sbin/
-#   - Python library to /opt/wsprdaemon/lib/
+#   - Python library to /opt/wsprdaemon-client/lib/
 #   - systemd unit files to /etc/systemd/system/
 #   - Config directory /etc/wsprdaemon/
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_DIR="/opt/wsprdaemon"
+INSTALL_DIR="/opt/wsprdaemon-client"
 SBIN_DIR="/usr/local/sbin"
 SYSTEMD_DIR="/etc/systemd/system"
 ETC_DIR="/etc/wsprdaemon"
@@ -133,7 +133,7 @@ cp "${SCRIPT_DIR}/bin/wd-ka9q-record.py" "${INSTALL_DIR}/bin/wd-ka9q-record.py"
 # Install deps.conf so wd-ctl can resolve source-tree paths when installed
 cp "${SCRIPT_DIR}/deps.conf" "${INSTALL_DIR}/deps.conf"
 
-# Install decoder binaries into /opt/wsprdaemon/bin/decoders/ (all arches).
+# Install decoder binaries into /opt/wsprdaemon-client/bin/decoders/ (all arches).
 # wd-decode resolves the right binary at runtime via arch detection.
 # These are versioned project binaries — do NOT install to /usr/local/sbin/.
 info "Installing decoder binaries to ${INSTALL_DIR}/bin/decoders/..."

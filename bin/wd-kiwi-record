@@ -25,7 +25,7 @@ FREQ_KHZ=$(awk "BEGIN { printf \"%.3f\", ${WD_RECEIVER_FREQ_HZ}/1000 }")
 
 PASSWORD="${WD_KIWI_PASSWORD:-}"
 
-KIWIRECORDER=/opt/wsprdaemon/kiwiclient/kiwirecorder.py
+KIWIRECORDER=/opt/wsprdaemon-client/kiwiclient/kiwirecorder.py
 
 mkdir -p "${WD_RECORDING_DIR}"
 cd "${WD_RECORDING_DIR}"
