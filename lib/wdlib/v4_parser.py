@@ -171,4 +171,23 @@ def parse_v4_config(config_path: str) -> WdConfig:
             else:
                 rx.locality    = rx.locality or 'remote'
 
+    # ── Final fallback: scan /etc/radio/ for a single local radiod conf ───────
+    # The radiod conf is the canonical source of truth for the status DNS.
+    # Operators shouldn't have to duplicate that name in wsprdaemon.conf when
+    # there's an unambiguous local radiod on the host.  Multi-radiod hosts
+    # still need an explicit radiod_name (or address-prefix match above).
+    import glob as _scan_radiod_confs
+    confs = sorted(_scan_radiod_confs.glob('/etc/radio/radiod@*.conf'))
+    if len(confs) == 1:
+        from pathlib import Path as _P
+        only = _P(confs[0]).stem.split('@', 1)[1]
+        for rx in result.receivers.values():
+            if rx.receiver_type not in ('ka9q', 'ka9q_wwv'):
+                continue
+            if rx.radiod_name:
+                continue
+            rx.radiod_name = only
+            # Force local: the conf exists on disk, so this radiod is local.
+            rx.locality = 'local'
+
     return result
