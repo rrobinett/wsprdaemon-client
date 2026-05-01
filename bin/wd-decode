@@ -540,6 +540,11 @@ run_decode_cycle() {
 
 # Main loop
 if ${use_inotify}; then
+    if ! command -v inotifywait >/dev/null 2>&1; then
+        echo "wd-decode: inotifywait not found — required for ${WD_RECEIVER_TYPE} sources" >&2
+        echo "wd-decode: install with: sudo apt install -y inotify-tools" >&2
+        exit 1
+    fi
     echo "wd-decode: using inotifywait for ${WD_RECEIVER_TYPE} source"
     while true; do
         # ka9q-radio writes .wav.tmp then renames → MOVED_TO .wav.

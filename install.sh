@@ -80,6 +80,18 @@ fi
 # --- Install ---
 info "Installing wsprdaemon v4..."
 
+# --- Runtime system packages ---
+# Hard runtime dependencies of the wd-* scripts.  Without these:
+#   - inotify-tools : wd-decode silently busy-loops (no inotifywait → command
+#     not found is swallowed, while loop spins ~100 forks/sec per band).
+#   - sox           : wd-decode noise-window stats (RMS/Pk/peak-level dB).
+#   - curl          : upload paths and a few diag scripts.
+if command -v apt-get >/dev/null 2>&1; then
+    info "Installing runtime system packages (inotify-tools, sox, curl)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        inotify-tools sox curl
+fi
+
 # Create radio group if needed (must exist before useradd --groups)
 if ! getent group "${WD_GROUP}" &>/dev/null; then
     info "Creating group ${WD_GROUP}..."
