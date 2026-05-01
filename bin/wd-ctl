@@ -405,7 +405,6 @@ def _manage_radiod(conf_name: str) -> None:
       3. If radiod is running but /etc/radio/radiod@<conf_name>.conf was modified
          after the service last started → restart it.
     """
-    import calendar
     import configparser
     import subprocess
     from datetime import datetime, timezone
@@ -463,7 +462,16 @@ def _manage_radiod(conf_name: str) -> None:
         for fmt in ('%a %Y-%m-%d %H:%M:%S %Z', '%a %Y-%m-%d %H:%M:%S'):
             try:
                 dt       = datetime.strptime(start_ts_str.strip(), fmt)
-                start_ts = calendar.timegm(dt.timetuple())
+                # systemctl prints ExecMainStartTimestamp in *local* time
+                # (e.g. "Fri 2026-05-01 09:55:53 PDT").  strptime parses %Z
+                # but does not attach tzinfo, so dt is naive.  dt.timestamp()
+                # correctly treats a naive datetime as local time and returns
+                # the right epoch.  The previous calendar.timegm(dt.timetuple())
+                # treated the local time as if it were UTC, producing an epoch
+                # that was off by the local-vs-UTC offset (e.g. -7 h on PDT)
+                # — enough to make conf_mtime > start_ts trigger a phantom
+                # restart on every smd apply.
+                start_ts = dt.timestamp()
                 break
             except ValueError:
                 continue
