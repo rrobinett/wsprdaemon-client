@@ -408,7 +408,7 @@ def _manage_radiod(conf_name: str) -> None:
     import calendar
     import configparser
     import subprocess
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     svc       = f'radiod@{conf_name}.service'
     conf_file = Path(f'/etc/radio/radiod@{conf_name}.conf')
@@ -470,8 +470,8 @@ def _manage_radiod(conf_name: str) -> None:
 
     if active_state == 'active' and start_ts:
         if conf_mtime > start_ts:
-            conf_dt  = datetime.utcfromtimestamp(conf_mtime).strftime('%H:%M:%S UTC')
-            start_dt = datetime.utcfromtimestamp(start_ts).strftime('%H:%M:%S UTC')
+            conf_dt  = datetime.fromtimestamp(conf_mtime, timezone.utc).strftime('%H:%M:%S UTC')
+            start_dt = datetime.fromtimestamp(start_ts, timezone.utc).strftime('%H:%M:%S UTC')
             print(f'  Config changed ({conf_dt}) after last start ({start_dt}) — restarting')
             result = subprocess.run(
                 ['systemctl', 'restart', svc],

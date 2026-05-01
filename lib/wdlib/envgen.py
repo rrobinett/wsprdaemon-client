@@ -41,11 +41,20 @@ def _radiod_status_dns(receiver: 'Receiver') -> str:
                 m = re.match(r'^status\s*=\s*(\S+)', line)
                 if m:
                     actual = m.group(1)
-                    if actual != derived and derived:
+                    # Only warn when the conf's status name doesn't even
+                    # start with the radiod_name — that case suggests the
+                    # operator pointed the receiver at a different radiod.
+                    # Names that just add a suffix (e.g. -hf) for antenna
+                    # disambiguation are fine and shouldn't generate noise
+                    # on every apply.
+                    actual_base = actual.removesuffix('.local').removesuffix('.status')
+                    if (actual_base != receiver.radiod_name
+                            and not actual_base.startswith(receiver.radiod_name + '-')
+                            and derived):
                         import sys
                         print(f'  WARNING: radiod@{receiver.radiod_name}: '
-                              f'status={actual!r} but convention would be '
-                              f'{derived!r} — update the conf to match',
+                              f'status={actual!r} does not match radiod_name '
+                              f'(expected something like {derived!r})',
                               file=sys.stderr)
                     return actual
         return derived
