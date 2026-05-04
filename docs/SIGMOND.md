@@ -1,7 +1,7 @@
 # Sigmond integration
 
 This document describes how wsprdaemon-client interacts with sigmond,
-the HamSCI station coordinator, and which contract v0.4 surfaces it
+the HamSCI station coordinator, and which contract v0.5 surfaces it
 implements. For per-unit detail see [SERVICES.md](SERVICES.md); for
 producer/consumer relationships with sibling repos see
 [INTEGRATION.md](INTEGRATION.md).
@@ -12,7 +12,9 @@ producer/consumer relationships with sibling repos see
 multi-receiver station coordinator. It runs as a separate daemon and
 manages cross-client effects (log levels, radiod address overrides,
 fleet start/stop) across the clients that opt in via the
-[client contract v0.4](/home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md):
+[client contract v0.5](/home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md)
+(with v0.5 additions tracked in
+`/home/mjh/git/sigmond/docs/CONTRACT-v0.5-DRAFT.md`):
 `hf-timestd`, `wsprdaemon-client`, `psk-recorder`, `wspr-recorder`,
 `ka9q-web`. Sigmond never imports a client's code, never edits its
 config files, and never shells into a client's processes. The contract
@@ -53,11 +55,11 @@ Conformance is "the binary runs unchanged under both regimes"
 The client therefore needs no sigmond-mode toggle. The presence or
 absence of `coordination.env` alone selects the regime.
 
-## 3. Contract v0.4 conformance surfaces
+## 3. Contract v0.5 conformance surfaces
 
-The client's declared conformance level is `contract_version = "0.4"`,
+The client's declared conformance level is `contract_version = "0.5"`,
 emitted by [`../lib/wdlib/contract.py`](../lib/wdlib/contract.py)
-(`CLIENT_NAME = "wsprdaemon"`, `CONTRACT_VERSION = "0.4"`).
+(`CLIENT_NAME = "wsprdaemon"`, `CONTRACT_VERSION = "0.5"`).
 
 | Section | Surface | Where it lives |
 |---------|---------|----------------|
@@ -71,6 +73,7 @@ emitted by [`../lib/wdlib/contract.py`](../lib/wdlib/contract.py)
 | §12.3 config_path disclosure (MUST) | `config_path` resolved to absolute path in inventory and validate output | [`build_inventory`](../lib/wdlib/contract.py) and [`build_validate`](../lib/wdlib/contract.py) call `Path(config_path).resolve()`. |
 | §12.5 Pattern A repo layout (SHOULD) | `/opt/git/sigmond/wsprdaemon-client` group-writable + `~/wsprdaemon-client` symlink | See [Section 4](#4-pattern-a-repo-layout-125) below. |
 | §12.6 ka9q-python PyPI lag (SHOULD) | Warn if installed `ka9q.__version__` < deps.conf pin | [`check_ka9q_python_version`](../lib/wdlib/contract.py) reads the `[ka9q-python]` pin from [../deps.conf](../deps.conf) and compares to the imported `ka9q.__version__`. Returns a warn issue if low. |
+| §16.3 data_path declaration (v0.5) | `data_path` per instance in inventory; `kind = "file"` for every instance | [`_data_path_for`](../lib/wdlib/contract.py). See [Section 3.1](#31-data_path-and-the-meta-client-stance) for the rationale — wsprdaemon-client never opens a radiod or kiwi connection itself; it decodes WAVs from `wd-ka9q-record` (which execs `wspr-recorder`) and `wd-kiwi-record`. The radiod-side facts live on the upstream client's inventory, not here. |
 
 `build_validate` aggregates schedule-sanity checks (KA9Q receivers must
 not appear in non-`00:00` time slots) plus the §12 hardening checks and
@@ -80,6 +83,32 @@ sets `ok = False` if any `severity == "error"` issue is present.
 is the consumer side, and the producer surface lives in
 [wspr-recorder](https://github.com/mijahauan/wspr-recorder). See
 [INTEGRATION.md §2](INTEGRATION.md#2-producerconsumer-relationship-with-wspr-recorder).
+
+### 3.1 data_path and the meta-client stance
+
+wsprdaemon-client occupies an unusual position in the contract:
+**it does not consume radiod RTP or KiwiSDR audio directly**. It is a
+decoder/poster pipeline that reads WAV files spooled by its child
+recorders. Per CONTRACT-v0.5 §16.3, every instance therefore declares
+`data_path.kind = "file"`, with `details.upstream_client` naming the
+client that *does* speak to the radio:
+
+| Receiver type | `upstream_client`   | What that client's data_path is |
+|---------------|---------------------|---------------------------------|
+| `ka9q`        | `wspr-recorder`     | `radiod-ka9q-python` (Path A, §16.3) |
+| `ka9q_wwv`    | `wspr-recorder`     | `radiod-ka9q-python` (Path A, §16.3) |
+| `kiwi`        | `wd-kiwi-record`    | (kiwirecorder.py — KiwiSDR WebSocket) |
+
+This means the radiod-side obligations in §16.4 (multicast
+non-collision, env-var resolution, chain-delay application, clean
+teardown) are satisfied *by the upstream client*, which sigmond can
+read independently from its own inventory. wsprdaemon-client's job is
+to manage the pipeline; it never claims to be the radiod consumer.
+
+If a future receiver type is added that wsprdaemon-client *does*
+consume directly (rather than via a child recorder), that receiver's
+instances should declare a non-`file` `kind` matching the actual data
+plane.
 
 ## 4. Pattern A repo layout (§12.5)
 

@@ -8,7 +8,7 @@ Maintainer: Rob Robinett (AI6VN).
 
 ## Status
 
-Pre-beta. The service set, config parser, and contract-v0.4 conformance surfaces are in place and exercised on a Beelink test bench with RX888 and KiwiSDR receivers. Do not deploy on a production station yet. See [wd-v4-architecture.md](wd-v4-architecture.md) for the design spec and which parts of it are already implemented.
+Pre-beta. The service set, config parser, and contract-v0.5 conformance surfaces are in place and exercised on a Beelink test bench with RX888 and KiwiSDR receivers. Do not deploy on a production station yet. See [wd-v4-architecture.md](wd-v4-architecture.md) for the design spec and which parts of it are already implemented.
 
 ## What it does
 
@@ -62,7 +62,7 @@ To stop everything: `sudo wd-ctl teardown`.
 - **[docs/SERVICES.md](docs/SERVICES.md)** — every systemd unit: purpose, inputs/outputs, dependencies
 - **[docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md)** — every `wd-ctl` subcommand and `wd-*` helper
 - **[docs/INTEGRATION.md](docs/INTEGRATION.md)** — relationship to `wspr-recorder`, `ka9q-python`, `hf-timestd`, `ka9q-radio`, and the upload sinks
-- **[docs/SIGMOND.md](docs/SIGMOND.md)** — running under the sigmond coordinator; contract-v0.4 conformance
+- **[docs/SIGMOND.md](docs/SIGMOND.md)** — running under the sigmond coordinator; contract-v0.5 conformance
 - **[wd-v4-architecture.md](wd-v4-architecture.md)** — full v0.10 design spec
 - **[deps.conf](deps.conf)** — pinned versions of every external dependency
 - **[deploy.toml](deploy.toml)** — contract §5 deploy manifest
@@ -70,7 +70,7 @@ To stop everything: `sudo wd-ctl teardown`.
 ## Companion projects
 
 - [ka9q-python](https://github.com/mijahauan/ka9q-python) — Python control of ka9q-radio; used by the KA9Q recorder
-- [wspr-recorder](https://github.com/mijahauan/wspr-recorder) — contract-v0.4-compliant WSPR WAV producer; preferred over the built-in recorder
+- [wspr-recorder](https://github.com/mijahauan/wspr-recorder) — contract-v0.5-compliant WSPR WAV producer; preferred over the built-in recorder
 - [hf-timestd](https://github.com/mijahauan/hf-timestd) — sub-ms HF time standard (planned integration via `wd-hftime@`)
 - [sigmond](https://github.com/mijahauan/sigmond) — multi-client coordinator; defines the contract this client implements
 - [ka9q-radio](https://github.com/ka9q/ka9q-radio) — Phil Karn's `radiod` daemon

@@ -1560,7 +1560,7 @@ def cmd_validate(args):
 
 
 def cmd_inventory(args):
-    """Emit contract v0.4 inventory JSON on stdout."""
+    """Emit contract v0.5 inventory JSON on stdout."""
     import json
     from wdlib import contract
 
@@ -2155,10 +2155,10 @@ def main():
     p_val = sub.add_parser('validate', help='Validate config')
     p_val.add_argument('-c', '--config', help='Config file path')
     p_val.add_argument('--json', action='store_true',
-                       help='Emit validate output as contract v0.4 JSON on stdout')
+                       help='Emit validate output as contract v0.5 JSON on stdout')
 
     # inventory (contract §3)
-    p_inv = sub.add_parser('inventory', help='Emit contract v0.4 inventory JSON on stdout')
+    p_inv = sub.add_parser('inventory', help='Emit contract v0.5 inventory JSON on stdout')
     p_inv.add_argument('-c', '--config', help='Config file path')
     p_inv.add_argument('--json', action='store_true', default=True,
                        help='(default) Emit JSON on stdout')

@@ -1,8 +1,9 @@
-"""HamSCI client contract v0.4 surfaces for wsprdaemon-client.
+"""HamSCI client contract v0.5 surfaces for wsprdaemon-client.
 
 Implements inventory and validate payloads for `wd-ctl inventory --json`
 and `wd-ctl validate --json`. See /home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md
-for the authoritative schema; CLIENT_NAME/CONTRACT_VERSION here are the
+for the authoritative schema (with v0.5 additions tracked in
+docs/CONTRACT-v0.5-DRAFT.md); CLIENT_NAME/CONTRACT_VERSION here are the
 declared conformance level.
 """
 
@@ -18,8 +19,9 @@ from wdlib.envgen import BAND_FREQ_HZ
 
 
 CLIENT_NAME = "wsprdaemon"
-CONTRACT_VERSION = "0.4"
+CONTRACT_VERSION = "0.5"
 DEFAULT_CONFIG_PATH = "/etc/wsprdaemon/wsprdaemon.conf"
+SPOOL_ROOT = "/var/spool/wsprdaemon/recording"
 
 
 # ── §11 log level resolution ────────────────────────────────────────────────
@@ -249,10 +251,48 @@ def enumerate_instances(config: WdConfig) -> List[Dict[str, Any]]:
                 "radiod_id":     rx.radiod_name or None,
                 "frequency_hz":  freq,
                 "decode_modes":  modes,
+                "data_path":     _data_path_for(rx, band),
                 # chain_delay_ns applied is a wspr-recorder-internal concern;
                 # wsprdaemon-client does not apply it, so it is not surfaced here.
             })
     return instances
+
+
+def _data_path_for(receiver, band: str) -> Dict[str, Any]:
+    """CONTRACT-v0.5 §16.3: declare each instance's data path.
+
+    wsprdaemon-client itself decodes WAV files spooled by its child
+    recorders; it never opens a radiod or kiwi connection.  All
+    instances therefore declare `kind = "file"`, with `details` naming
+    the upstream client and spool directory.  The radiod-side facts
+    (radiod_id, multicast group, chain delay) live on the upstream
+    client's inventory — wspr-recorder for KA9Q receivers, or whatever
+    Path B client (e.g. a future radiod-direct WebSDR) substitutes for
+    it.  Sigmond cross-references via `details.upstream_client`.
+    """
+    rx_type = receiver.receiver_type
+    if rx_type in ("ka9q", "ka9q_wwv"):
+        return {
+            "kind": "file",
+            "details": {
+                "upstream_client": "wspr-recorder",
+                "upstream_unit":   f"wd-ka9q-record@{receiver.name}.service",
+                "spool":           f"{SPOOL_ROOT}/{receiver.name}",
+            },
+        }
+    if rx_type == "kiwi":
+        return {
+            "kind": "file",
+            "details": {
+                "upstream_client": "wd-kiwi-record",
+                "upstream_unit":   f"wd-kiwi-record@{receiver.name}-{band}.service",
+                "spool":           f"{SPOOL_ROOT}/{receiver.name}-{band}",
+            },
+        }
+    return {
+        "kind": "other",
+        "details": {"description": f"unrecognized receiver_type={rx_type!r}"},
+    }
 
 
 # ── Inventory / validate payload builders ───────────────────────────────────

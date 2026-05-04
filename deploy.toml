@@ -8,8 +8,9 @@
 # See /home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md §5 for the schema.
 
 [package]
-name    = "wsprdaemon"
-version = "4.0.0-dev"
+name             = "wsprdaemon"
+version          = "4.0.0-dev"
+contract_version = "0.5"
 
 [build]
 # Pure-Python core plus bundled decoder binaries in bin/decoders/. No build.

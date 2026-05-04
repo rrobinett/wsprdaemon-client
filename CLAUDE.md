@@ -132,7 +132,7 @@ lib/wdlib/
 - `teardown` — Stop and disable all services
 - `status` — Show service status
 - `validate [--json]` — Check config for errors (contract §12)
-- `inventory` — Emit contract v0.4 inventory JSON (§3)
+- `inventory` — Emit contract v0.5 inventory JSON (§3, with v0.5 §16.3 `data_path` per instance)
 - `version` — Emit client/contract version JSON
 - `verbosity up|down SERVICE|all` — Dynamic log verbosity via USR1/USR2
 
@@ -156,7 +156,7 @@ with `python3 -m unittest discover tests`.
 - `docs/SERVICES.md` — per-systemd-unit reference
 - `docs/CLI_REFERENCE.md` — `wd-ctl` and `wd-*` script reference
 - `docs/INTEGRATION.md` — relationships with wspr-recorder, ka9q-python, hf-timestd, radiod
-- `docs/SIGMOND.md` — coordinator integration, contract v0.4 conformance
+- `docs/SIGMOND.md` — coordinator integration, contract v0.5 conformance
 - `wd-v4-architecture.md` — v0.10 design spec (some sections spec-only)
 - `deploy.toml`, `deps.conf` — contract §5 manifest and pinned dependency list
 
