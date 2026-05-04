@@ -2,9 +2,8 @@
 
 Implements inventory and validate payloads for `wd-ctl inventory --json`
 and `wd-ctl validate --json`. See /home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md
-for the authoritative schema (with v0.5 additions tracked in
-docs/CONTRACT-v0.5-DRAFT.md); CLIENT_NAME/CONTRACT_VERSION here are the
-declared conformance level.
+for the authoritative schema; CLIENT_NAME/CONTRACT_VERSION here are
+the declared conformance level.
 """
 
 import configparser

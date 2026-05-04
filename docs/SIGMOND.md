@@ -12,9 +12,7 @@ producer/consumer relationships with sibling repos see
 multi-receiver station coordinator. It runs as a separate daemon and
 manages cross-client effects (log levels, radiod address overrides,
 fleet start/stop) across the clients that opt in via the
-[client contract v0.5](/home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md)
-(with v0.5 additions tracked in
-`/home/mjh/git/sigmond/docs/CONTRACT-v0.5-DRAFT.md`):
+[client contract v0.5](/home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md):
 `hf-timestd`, `wsprdaemon-client`, `psk-recorder`, `wspr-recorder`,
 `ka9q-web`. Sigmond never imports a client's code, never edits its
 config files, and never shells into a client's processes. The contract
@@ -147,8 +145,7 @@ Pattern A.
 - Repo: [sigmond](https://github.com/mijahauan/sigmond) (Michael
   Hauan, AC0G).
 - Local clone: [/home/mjh/git/sigmond](../../sigmond).
-- Authoritative contract spec: [/home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md](../../sigmond/docs/CLIENT-CONTRACT.md).
-- v0.5 draft (next contract revision): [/home/mjh/git/sigmond/docs/CONTRACT-v0.5-DRAFT.md](../../sigmond/docs/CONTRACT-v0.5-DRAFT.md).
+- Authoritative contract spec: [/home/mjh/git/sigmond/docs/CLIENT-CONTRACT.md](../../sigmond/docs/CLIENT-CONTRACT.md). v0.5 sections were folded in 2026-05-04 (the standalone `CONTRACT-v0.5-DRAFT.md` has been retired).
 
 The contract is the only allowed interface between sigmond and any
 client — including this one. If sigmond ever needs to know something
