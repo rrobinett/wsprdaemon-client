@@ -51,12 +51,19 @@ def main(argv=None) -> int:
                    help="value to write into the version column")
     p.add_argument("--batch-rows", type=int, default=50_000,
                    help="hamsci_ch batch size (default: 50000)")
+    p.add_argument("--callhash-path", type=Path, default=None,
+                   help="path to a CallHashTable JSON file (per-station "
+                        "compound-callsign cache).  When provided, "
+                        "<call> markers in spot files accumulate over "
+                        "invocations.  Default: no persistence.")
     p.add_argument("paths", nargs="+", type=Path)
     args = p.parse_args(argv)
 
     if not os.environ.get("SIGMOND_CLICKHOUSE_URL", "").strip():
         log.debug("SIGMOND_CLICKHOUSE_URL unset; no-op (file upload path unaffected)")
         return 0
+
+    callhash_table = _load_callhash(args.callhash_path)
 
     writer = build_writer(batch_rows=args.batch_rows)
     written = 0
@@ -72,6 +79,7 @@ def main(argv=None) -> int:
                     path,
                     rx_id=args.rx_id,
                     client_version=args.client_version,
+                    callhash_table=callhash_table,
                 ))
             except OSError as e:
                 log.warning("read failed for %s: %s", path, e)
@@ -80,9 +88,28 @@ def main(argv=None) -> int:
             if rows:
                 writer.insert(rows)
                 written += len(rows)
+    if callhash_table is not None and args.callhash_path is not None:
+        try:
+            callhash_table.save()
+        except Exception as exc:
+            log.warning("callhash save failed: %s", exc)
     log.info("wrote %d row(s); skipped %d file(s); writer health=%s",
              written, skipped, writer.health)
     return 0
+
+
+def _load_callhash(path):
+    """Load (or initialise) a CallHashTable, returning None if
+    sigmond.callhash isn't importable (graceful degradation: bracket
+    normalisation in spot_to_ch_row uses the inline fallback)."""
+    if path is None:
+        return None
+    try:
+        from sigmond.callhash import CallHashTable
+    except ImportError:
+        log.debug("sigmond.callhash unavailable; --callhash-path ignored")
+        return None
+    return CallHashTable.load_or_new(path)
 
 
 if __name__ == "__main__":

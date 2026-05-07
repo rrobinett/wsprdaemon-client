@@ -182,3 +182,136 @@ class TestBuildWriter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Bracket normalisation + callhash accumulation (v0.4 callhash wire) ────
+
+class TestBracketNormalisation:
+    """wsprd outputs `<call>` when it resolved a hash from its session
+    table, and `<...>` when it couldn't.  spot_to_ch_row strips the
+    brackets so tx_sign in wspr.spots is plain plaintext, and maps the
+    unresolved placeholder to an empty string (the schema's tx_sign
+    column is non-nullable).
+    """
+
+    def _spot(self, **overrides) -> dict:
+        # Minimal valid spot dict for spot_to_ch_row.
+        base = {
+            "date": "260507", "time_str": "1234",
+            "sync_quality": 1.0, "snr": -22, "dt": 0.5,
+            "freq_hz": 14_097_100.0,
+            "tx_sign": "K1ABC", "tx_loc": "EM26",
+            "power_dbm": 30, "drift": 0,
+            "decode_cycles": 1234, "jitter": 0,
+            "blocksize": 256, "metric": 0,
+            "osd_decode": 1, "ipass": 1, "nhardmin": 0, "code": 1,
+            "rms_noise": -65.0, "c2_noise": -68.0,
+            "band_m": 20, "rx_loc": "EN16ov",
+            "rx_sign_file": "AC0G/ND", "distance": 1234,
+            "rx_azimuth": 45.5, "rx_lat": 39.5, "rx_lon": -98.5,
+            "azimuth": 270.5, "tx_lat": 42.5, "tx_lon": -71.5,
+            "v_lat": 40.5, "v_lon": -85.0,
+            "ov_count": 0, "proxy_upload": 0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_plain_call_passes_through(self):
+        from wdlib.ch_writer import spot_to_ch_row
+        row = spot_to_ch_row(
+            self._spot(tx_sign="K1ABC"),
+            band=20, rx_sign="AC0G", rx_id="KA9Q_DXE",
+        )
+        assert row["tx_sign"] == "K1ABC"
+
+    def test_bracketed_compound_call_strips_brackets(self):
+        from wdlib.ch_writer import spot_to_ch_row
+        row = spot_to_ch_row(
+            self._spot(tx_sign="<K1ABC/QRP>"),
+            band=20, rx_sign="AC0G", rx_id="KA9Q_DXE",
+        )
+        assert row["tx_sign"] == "K1ABC/QRP"
+
+    def test_bracketed_simple_call_strips_brackets(self):
+        # wsprd also brackets even simple calls when it resolved them
+        # from a hash; the brackets carry no information past the
+        # decoder boundary so we strip them too.
+        from wdlib.ch_writer import spot_to_ch_row
+        row = spot_to_ch_row(
+            self._spot(tx_sign="<K1ABC>"),
+            band=20, rx_sign="AC0G", rx_id="KA9Q_DXE",
+        )
+        assert row["tx_sign"] == "K1ABC"
+
+    def test_unresolved_placeholder_becomes_empty(self):
+        # `<...>` is wsprd's "I couldn't resolve this hash" marker.
+        # The hash itself is gone from the line; we map to empty
+        # string so wspr.spots.tx_sign (non-nullable) stays clean.
+        from wdlib.ch_writer import spot_to_ch_row
+        row = spot_to_ch_row(
+            self._spot(tx_sign="<...>"),
+            band=20, rx_sign="AC0G", rx_id="KA9Q_DXE",
+        )
+        assert row["tx_sign"] == ""
+
+    def test_empty_input_passes_through(self):
+        from wdlib.ch_writer import spot_to_ch_row
+        row = spot_to_ch_row(
+            self._spot(tx_sign=""),
+            band=20, rx_sign="AC0G", rx_id="KA9Q_DXE",
+        )
+        assert row["tx_sign"] == ""
+
+
+class TestCallhashAccumulation:
+    """rows_from_spots_file feeds each raw line to a CallHashTable
+    when one is supplied so the persistent cache accumulates compound
+    calls across invocations."""
+
+    def test_observe_pulls_compound_calls_from_lines(self, tmp_path):
+        from sigmond.callhash import CallHashTable
+        from wdlib.ch_writer import rows_from_spots_file
+        # Synthesise a wd_spots file with two compound-call lines
+        # — wsprd's `<call>` markers come through verbatim in tx_sign
+        # (parts[6]) of the 34-field format.  We craft minimal valid
+        # 34-field lines.
+        spots_file = tmp_path / "AC0G" / "EN16ov" / "KA9Q_DXE" / "20" / "260507_1234_wd_spots.txt"
+        spots_file.parent.mkdir(parents=True)
+        # 34-field layout: see ch_writer.parse_wd_spots_line.
+        line_template = (
+            "260507 1234 1.0 -22 0.5 14.097100 "                       # 0-5
+            "{tx_sign} EM26 30 0 "                                      # 6-9 tx_sign here
+            "1234 0 256 0 1 1 0 1 "                                     # 10-17
+            "-65.0 -68.0 "                                              # 18-19
+            "20 EN16ov AC0G 1234 "                                      # 20-23
+            "45.5 39.5 -98.5 270.5 42.5 -71.5 "                         # 24-29
+            "40.5 -85.0 0 0\n"                                          # 30-33
+        )
+        spots_file.write_text(
+            line_template.format(tx_sign="<K1ABC/QRP>")
+            + line_template.format(tx_sign="K1ABC")              # standard
+            + line_template.format(tx_sign="<VE3/W1XYZ>")        # prefix-form
+        )
+        table = CallHashTable()
+        list(rows_from_spots_file(spots_file, callhash_table=table))
+        assert "K1ABC/QRP" in table
+        assert "VE3/W1XYZ" in table
+        # Standard call also gets observed (the regex doesn't require
+        # brackets; wsprd brackets resolved hashes regardless of
+        # whether they were compound).
+        assert len(table) >= 2
+
+    def test_callhash_optional_path_skips_observation(self, tmp_path):
+        # Without a table, parsing still works — the kwarg is optional.
+        from wdlib.ch_writer import rows_from_spots_file
+        spots_file = tmp_path / "AC0G" / "EN16ov" / "KA9Q_DXE" / "20" / "260507_1234_wd_spots.txt"
+        spots_file.parent.mkdir(parents=True)
+        spots_file.write_text(
+            "260507 1234 1.0 -22 0.5 14.097100 K1ABC EM26 30 0 "
+            "1234 0 256 0 1 1 0 1 -65.0 -68.0 "
+            "20 EN16ov AC0G 1234 45.5 39.5 -98.5 270.5 42.5 -71.5 "
+            "40.5 -85.0 0 0\n"
+        )
+        rows = list(rows_from_spots_file(spots_file))
+        assert len(rows) == 1
+        assert rows[0]["tx_sign"] == "K1ABC"

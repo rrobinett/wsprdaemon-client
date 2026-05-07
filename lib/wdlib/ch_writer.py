@@ -136,6 +136,13 @@ def spot_to_ch_row(
 
     Mirrors `convert_spot_to_clickhouse` in tar-bulk-loader.py so the
     same input produces identical rows on edge and central CH.
+
+    `tx_sign` is normalised through ``CallHashTable.normalise_brackets``
+    when sigmond.callhash is available so wsprd's bracketed compound-
+    callsign output (``<K1ABC/QRP>``) lands as plain ``K1ABC/QRP`` in
+    the row, and the literal unresolved-hash placeholder ``<...>``
+    becomes an empty string (the schema's tx_sign column is
+    non-nullable).
     """
     date_str = spot["date"]
     time_str = spot["time_str"]
@@ -147,6 +154,8 @@ def spot_to_ch_row(
         int(time_str[2:4]),
     )
     freq_hz = spot["freq_hz"]
+    raw_tx_sign = spot.get("tx_sign", "") or ""
+    tx_sign = _normalise_call_brackets(raw_tx_sign)
     return {
         "time":          ts,
         "band":          band,
@@ -154,7 +163,7 @@ def spot_to_ch_row(
         "rx_lat":        spot.get("rx_lat", 0.0),
         "rx_lon":        spot.get("rx_lon", 0.0),
         "rx_loc":        spot.get("rx_loc", ""),
-        "tx_sign":       spot["tx_sign"],
+        "tx_sign":       tx_sign,
         "tx_loc":        spot.get("tx_loc", ""),
         "tx_lat":        spot.get("tx_lat", 0.0),
         "tx_lon":        spot.get("tx_lon", 0.0),
@@ -194,14 +203,28 @@ def rows_from_spots_file(
     *,
     rx_id: Optional[str] = None,
     client_version: Optional[str] = None,
+    callhash_table: Optional[Any] = None,
 ) -> Iterable[Dict[str, Any]]:
-    """Yield wspr.spots rows for every parseable line in `path`."""
+    """Yield wspr.spots rows for every parseable line in `path`.
+
+    When ``callhash_table`` is supplied (a
+    ``sigmond.callhash.CallHashTable`` instance), every raw spot line
+    is fed to ``observe()`` so any ``<call>`` markers wsprd emitted
+    while resolving hashes from its session table are accumulated in
+    the operator-side cache.  Persistence (load/save) is the caller's
+    concern — the table is observed in place.
+    """
     meta = parse_spots_path(path)
     band_m = band_str_to_meters(meta["band"]) or 0
     rx_sign = meta["rx_call"]
     rx_id_resolved = rx_id or meta["receiver"]
     with open(path) as fh:
         for line in fh:
+            if callhash_table is not None:
+                try:
+                    callhash_table.observe(line)
+                except Exception:
+                    pass
             spot = parse_wd_spots_line(line)
             if spot is None:
                 continue
@@ -212,6 +235,41 @@ def rows_from_spots_file(
                 rx_id=rx_id_resolved,
                 client_version=client_version,
             )
+
+
+# ── Bracket normalisation (sigmond.callhash bridge) ────────────────────────
+
+def _normalise_call_brackets(raw: str) -> str:
+    """Strip WSJT-X angle-bracket markers from a callsign field.
+
+    Delegates to ``sigmond.callhash.CallHashTable.normalise_brackets``
+    when available (canonical implementation, used by both psk-recorder
+    and wsprdaemon-client).  Falls back to a small inline equivalent
+    when sigmond isn't installed so wsprdaemon-client stays runnable
+    standalone.
+
+    Behaviour:
+      * ``<K1ABC>`` or ``<K1ABC/QRP>`` → strip brackets, return inner.
+      * ``<...>`` literal placeholder  → return ``""`` (schema's
+        ``tx_sign`` column is non-nullable; empty is the data-quality
+        signal that the decoder couldn't resolve the hash).
+      * Anything else (already plain) → passthrough.
+    """
+    if not raw:
+        return raw
+    try:
+        from sigmond.callhash import CallHashTable  # type: ignore[import-not-found]
+        result = CallHashTable.normalise_brackets(raw)
+    except ImportError:
+        # Inline fallback — keep the data-quality fix even if sigmond
+        # isn't available.
+        s = raw.strip()
+        if s == "<...>":
+            return ""
+        if s.startswith("<") and s.endswith(">") and len(s) > 2:
+            return s[1:-1]
+        return raw
+    return "" if result is None else result
 
 
 # ── Writer factory ──────────────────────────────────────────────────────────
