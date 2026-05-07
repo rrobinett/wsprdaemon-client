@@ -18,7 +18,7 @@ from wdlib.envgen import BAND_FREQ_HZ
 
 
 CLIENT_NAME = "wsprdaemon"
-CONTRACT_VERSION = "0.5"
+CONTRACT_VERSION = "0.6"
 DEFAULT_CONFIG_PATH = "/etc/wsprdaemon/wsprdaemon.conf"
 SPOOL_ROOT = "/var/spool/wsprdaemon/recording"
 
@@ -251,10 +251,43 @@ def enumerate_instances(config: WdConfig) -> List[Dict[str, Any]]:
                 "frequency_hz":  freq,
                 "decode_modes":  modes,
                 "data_path":     _data_path_for(rx, band),
+                "data_sinks":    _data_sinks_for(rx, band),
                 # chain_delay_ns applied is a wspr-recorder-internal concern;
                 # wsprdaemon-client does not apply it, so it is not surfaced here.
             })
     return instances
+
+
+def _data_sinks_for(receiver, band: str) -> List[Dict[str, Any]]:
+    """CONTRACT v0.6 §17: declare every output sink for this instance.
+
+    wsprdaemon-client always writes per-cycle spot files into the posting
+    directory.  When `SIGMOND_CLICKHOUSE_URL` is published into the
+    environment by sigmond's coordination.env, it ALSO writes the
+    parsed rows into the local CH staging tier (`wspr.spots`) so the
+    future `hs-uploader` library can ship them upstream from CH instead
+    of from filesystem tarballs.  The CH path is additive: the file
+    upload to wsprdaemon.org continues unchanged.
+    """
+    sinks: List[Dict[str, Any]] = [
+        {
+            "kind":           "file",
+            "target":         "/var/spool/wsprdaemon/posting/*_wd_spots.txt",
+            "schema_ref":     None,
+            "retention_days": 1,                # consumed by upload, then deleted
+            "mb_per_day":     2,                # rough; per-instance footprint is small
+        },
+    ]
+    if os.environ.get("SIGMOND_CLICKHOUSE_URL", "").strip():
+        sinks.append({
+            "kind":           "clickhouse",
+            "target":         "wspr.spots",
+            "schema_ref":     "wsprdaemon:1",   # vendored wspr DDL version (sigmond-clickhouse)
+            "retention_days": 90,
+            "mb_per_day":     6,                # per-instance write rate (rough)
+            "health":         "ok",
+        })
+    return sinks
 
 
 def _data_path_for(receiver, band: str) -> Dict[str, Any]:

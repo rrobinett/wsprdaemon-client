@@ -73,8 +73,18 @@ while true; do
         fi
 
         if [[ "${bn}" == *_wd_spots.txt ]]; then
-            # Extended W-mode spots → wsprdaemon only
+            # Extended W-mode spots → wsprdaemon SFTP queue (canonical path).
             [[ -n "${WSPRDAEMON_DIR}" ]] && cp "${f}" "${WSPRDAEMON_DIR}/"
+
+            # CONTRACT v0.6 §17 — local CH staging tier (additive).
+            # No-op when SIGMOND_CLICKHOUSE_URL is unset.  When the
+            # SFTP path is eventually retired in favor of hs-uploader,
+            # the cp above goes away and this call remains as the
+            # only sink for these rows.
+            if command -v wd-ch-write >/dev/null 2>&1; then
+                wd-ch-write --client-version "${WD_VERSION:-4.0}" "${f}" \
+                    || echo "wd-post: wd-ch-write failed for ${bn} (upload path unaffected)" >&2
+            fi
 
         elif [[ "${bn}" == *_noise.txt ]]; then
             # Noise measurement → wsprdaemon noise subdir only

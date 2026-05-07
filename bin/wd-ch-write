@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""wd-ch-write — parse `_wd_spots.txt` files and insert rows into the
+local ClickHouse staging tier (CONTRACT v0.6 §17).
+
+Standalone-safe: when `SIGMOND_CLICKHOUSE_URL` is unset (no sigmond, or
+sigmond's `[storage.clickhouse]` block omitted), this script is a clean
+no-op — it parses the files but writes nothing, and exits 0.  The
+existing SFTP upload to wsprdaemon.org is not affected.
+
+Wire-compat: rows are produced by the same parser used by
+`wsprdaemon-server/tar-bulk-loader.py`, so edge-CH rows are byte-equal
+to central-CH rows for the same input.
+
+Usage:
+    wd-ch-write [--rx-id RX_ID] [--client-version VER] PATH...
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+
+# Make wdlib importable both from the repo (./lib) and from the
+# install layout (/opt/wsprdaemon-client/lib).
+_HERE = Path(__file__).resolve()
+for _candidate in (
+    _HERE.parent.parent / "lib",
+    Path("/opt/wsprdaemon-client/lib"),
+):
+    if (_candidate / "wdlib").exists():
+        sys.path.insert(0, str(_candidate))
+        break
+
+from wdlib.ch_writer import build_writer, rows_from_spots_file
+
+
+logging.basicConfig(
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s wd-ch-write: %(message)s",
+)
+log = logging.getLogger("wd-ch-write")
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="wd-ch-write")
+    p.add_argument("--rx-id", default=None,
+                   help="rx_id column value (defaults to receiver dir name)")
+    p.add_argument("--client-version", default=None,
+                   help="value to write into the version column")
+    p.add_argument("--batch-rows", type=int, default=50_000,
+                   help="hamsci_ch batch size (default: 50000)")
+    p.add_argument("paths", nargs="+", type=Path)
+    args = p.parse_args(argv)
+
+    if not os.environ.get("SIGMOND_CLICKHOUSE_URL", "").strip():
+        log.debug("SIGMOND_CLICKHOUSE_URL unset; no-op (file upload path unaffected)")
+        return 0
+
+    writer = build_writer(batch_rows=args.batch_rows)
+    written = 0
+    skipped = 0
+    with writer:
+        for path in args.paths:
+            if not path.exists():
+                log.warning("missing file: %s", path)
+                skipped += 1
+                continue
+            try:
+                rows = list(rows_from_spots_file(
+                    path,
+                    rx_id=args.rx_id,
+                    client_version=args.client_version,
+                ))
+            except OSError as e:
+                log.warning("read failed for %s: %s", path, e)
+                skipped += 1
+                continue
+            if rows:
+                writer.insert(rows)
+                written += len(rows)
+    log.info("wrote %d row(s); skipped %d file(s); writer health=%s",
+             written, skipped, writer.health)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

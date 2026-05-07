@@ -10,7 +10,7 @@
 [package]
 name             = "wsprdaemon"
 version          = "4.0.0-dev"
-contract_version = "0.5"
+contract_version = "0.6"
 
 [build]
 # Pure-Python core plus bundled decoder binaries in bin/decoders/. No build.
@@ -78,6 +78,11 @@ dst  = "/usr/local/sbin/wd-upload-wsprnet"
 kind = "link"
 src  = "bin/wd-upload-wsprdaemon"
 dst  = "/usr/local/sbin/wd-upload-wsprdaemon"
+
+[[install.steps]]
+kind = "link"
+src  = "bin/wd-ch-write"
+dst  = "/usr/local/sbin/wd-ch-write"
 
 [[install.steps]]
 kind = "link"
@@ -167,6 +172,19 @@ units = [
     "wd-spool-clean.service",
     "wd-spool-clean.timer",
 ]
+
+# CONTRACT v0.6 §17 — local ClickHouse sink for `wspr.spots`.  The DDL is
+# vendored in sigmond-clickhouse (see SCHEMA_PROVENANCE there); this
+# block only declares the schema_ref this client expects.  When sigmond
+# publishes SIGMOND_CLICKHOUSE_URL into coordination.env, `wd-ch-write`
+# parses each `_wd_spots.txt` and inserts rows into wspr.spots in
+# parallel with the existing SFTP upload to wsprdaemon.org.  No CH means
+# no rows written — the file path is unaffected.
+[clickhouse]
+database         = "wspr"
+schema_dir       = ""                       # owned by sigmond-clickhouse, not this repo
+schema_ref       = "wsprdaemon:1"
+required_min_ch  = "23.8"
 
 # [deps] — the authoritative pins live in deps.conf to avoid duplication.
 # Sigmond reads deps.conf directly (same format hf-timestd uses).
