@@ -178,6 +178,23 @@ install -m 644 "${SCRIPT_DIR}/systemd/wsprdaemon.target" "${SYSTEMD_DIR}/"
 # Reload systemd
 systemctl daemon-reload
 
+# --- Python venv + dependency installation ---------------------------------
+# wd-ctl install-deps creates /opt/wsprdaemon-client/venv and pip-installs
+# the deps listed in deps.conf (ka9q-python, wspr-recorder, etc.).  Without
+# this step, `wd-ka9q-record@*.service` fails with "venv/bin/python3: No
+# such file or directory" the first time radiod hands it a stream.  Run it
+# here so `smd install wsprdaemon-client` (or a hand `./install.sh`)
+# produces a fully-runnable install — operators no longer have to remember
+# to follow up with a separate `wd-ctl install-deps`.
+info ""
+info "=== Installing Python dependencies (wd-ctl install-deps) ==="
+if "${SBIN_DIR}/wd-ctl" install-deps; then
+    info "Python venv ready at /opt/wsprdaemon-client/venv"
+else
+    warn "wd-ctl install-deps failed — wd-ka9q-record will not start."
+    warn "Re-run manually with:  sudo wd-ctl install-deps"
+fi
+
 # Create tmpfs fstab entry hint
 info ""
 info "=== Optional: tmpfs mount for recording directory ==="

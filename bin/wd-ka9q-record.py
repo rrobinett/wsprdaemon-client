@@ -26,6 +26,7 @@ WAV output: YYYYMMDDTHHMMSSz_{freq_hz}_usb.wav  (matches kiwi format)
 """
 
 import os
+import shutil
 import sys
 import logging
 from pathlib import Path
@@ -48,7 +49,24 @@ RECORDING_DIR = Path(os.environ['WD_RECORDING_DIR'])
 GAIN_DB       = float(os.environ.get('WD_GAIN_DB', '0'))
 ENV_DIR       = Path(os.environ.get('WD_ENV_DIR', '/etc/wsprdaemon/env'))
 
-WSPR_RECORDER = '/opt/wsprdaemon-client/venv/bin/wspr-recorder'
+def _resolve_wspr_recorder() -> str:
+    """Find the wspr-recorder binary.
+
+    Look on $PATH first (covers /usr/local/bin/wspr-recorder, the location
+    that `smd install wspr-recorder` writes to via its install.sh) and
+    fall back to the legacy venv path that earlier versions of this
+    script hard-coded.  When neither exists we still return the legacy
+    path so the operator gets the well-known error message; a missing
+    wspr-recorder is a setup gap, not something to silently paper over.
+    """
+    found = shutil.which('wspr-recorder')
+    if found:
+        return found
+    legacy = '/opt/wsprdaemon-client/venv/bin/wspr-recorder'
+    return legacy
+
+
+WSPR_RECORDER = _resolve_wspr_recorder()
 
 
 def _read_band_modes(band: str) -> List[str]:
