@@ -92,6 +92,12 @@ class WdConfig:
     ka9q_conf_name: str = ''
     ka9q_web_dns: str = ''
     rac: str = ''
+    # Operator identity defaults from [general]; per-receiver call/grid
+    # override these.  When [general] also leaves them empty, the parser
+    # falls back to STATION_CALL / STATION_GRID env vars (published by
+    # sigmond from /etc/sigmond/coordination.toml [host]).
+    reporter_call: str = ''
+    reporter_grid: str = ''
     hf_timestd: HfTimestdConfig = field(default_factory=HfTimestdConfig)
     ka9q_web: Ka9qWebConfig = field(default_factory=Ka9qWebConfig)
     # Space-separated CPU IDs reserved for manually-managed services (e.g. a second

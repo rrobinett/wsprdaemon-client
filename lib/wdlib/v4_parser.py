@@ -26,6 +26,7 @@ Section shapes:
 """
 
 import configparser
+import os
 from typing import Dict
 
 from wdlib.config import (
@@ -36,7 +37,21 @@ from wdlib.envgen import BAND_FREQ_HZ
 
 
 def parse_v4_config(config_path: str) -> WdConfig:
-    """Parse a v4 INI config file and return a WdConfig."""
+    """Parse a v4 INI config file and return a WdConfig.
+
+    Operator-identity resolution for each receiver / merge:
+
+        receiver.call ← [receiver:X].call   if non-empty
+                      ↓
+                       [general].reporter_call   if non-empty
+                      ↓
+                       $STATION_CALL              (sigmond-published)
+
+    Same chain for grid.  This means a single-receiver host can omit
+    receiver-level call/grid entirely once `smd config identity` has
+    captured the operator identity at the sigmond level — the values
+    flow through automatically.
+    """
     cfg = configparser.ConfigParser(
         comment_prefixes=(';', '#'),
         inline_comment_prefixes=(';', '#'),
@@ -58,6 +73,13 @@ def parse_v4_config(config_path: str) -> WdConfig:
         result.ka9q_conf_name      = g.get('ka9q_conf_name', '').strip()
         result.ka9q_web_dns        = g.get('ka9q_web_dns', '').strip()
         result.reserved_cpus       = g.get('reserved_cpus', '').strip()
+        result.reporter_call       = g.get('reporter_call', '').strip()
+        result.reporter_grid       = g.get('reporter_grid', '').strip()
+
+    # Operator-identity fallbacks: [general] → STATION_* env var.
+    # Computed once, applied per receiver/merge below.
+    default_call = result.reporter_call or os.environ.get('STATION_CALL', '').strip()
+    default_grid = result.reporter_grid or os.environ.get('STATION_GRID', '').strip()
 
     # ── [receiver:NAME] ──────────────────────────────────────────────────────
     for section in cfg.sections():
@@ -69,8 +91,8 @@ def parse_v4_config(config_path: str) -> WdConfig:
         result.receivers[rx_name] = Receiver(
             name        = rx_name,
             address     = s.get('address', '').strip(),
-            call        = s.get('call', '').strip(),
-            grid        = s.get('grid', '').strip(),
+            call        = s.get('call', '').strip() or default_call,
+            grid        = s.get('grid', '').strip() or default_grid,
             password    = s.get('password', 'NULL').strip() or 'NULL',
             locality    = s.get('locality', '').strip(),
             radiod_name = s.get('radiod_name', '').strip(),
@@ -87,8 +109,8 @@ def parse_v4_config(config_path: str) -> WdConfig:
         result.receivers[rx_name] = Receiver(
             name     = rx_name,
             address  = ','.join(sources),   # merge address = CSV of source names
-            call     = s.get('call', '').strip(),
-            grid     = s.get('grid', '').strip(),
+            call     = s.get('call', '').strip() or default_call,
+            grid     = s.get('grid', '').strip() or default_grid,
             password = 'NULL',
         )
 
