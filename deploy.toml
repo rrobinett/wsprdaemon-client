@@ -17,6 +17,16 @@ contract_version = "0.6"
 steps    = []
 produces = []
 
+[contract.config]
+# `smd config init wsprdaemon-client` runs this; it generates a default
+# /etc/wsprdaemon/wsprdaemon.conf from sigmond's coordination.toml so the
+# operator gets a working WSPR setup (every band 2200m..10m, W2/F2/F5
+# everywhere plus F15/F30 on 2200m & 630m) without hand-writing the INI.
+# Re-run with --force after adding/removing radiod instances.
+init = ["bin/wd-config-init"]
+# `smd config edit wsprdaemon-client` falls through to $EDITOR on the
+# rendered config — leave unset so the contract default kicks in.
+
 [install]
 # kind = "link" | "copy" | "render"
 # src paths are relative to the repo root; dst paths are absolute.

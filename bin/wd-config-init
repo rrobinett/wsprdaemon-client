@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""wd-config-init — generate a default wsprdaemon.conf from sigmond's
+coordination.toml.
+
+Advertised in deploy.toml as the [contract.config].init entry point;
+`smd config init wsprdaemon-client` invokes it with the env-var bag
+already populated (STATION_CALL, STATION_GRID, SIGMOND_RADIOD_*, ...
+per CONTRACT-v0.5 §14.2).
+
+We don't read those env vars directly — they're handled by the v4
+parser's fallback chain at runtime — but the script does honour
+STATION_CALL/_GRID when emitting reminder comments at the top of the
+file so the operator can see what their effective callsign/grid is.
+
+Usage:
+  wd-config-init                         # write /etc/wsprdaemon/wsprdaemon.conf
+  wd-config-init --force                 # regenerate even if file exists
+  wd-config-init --output /tmp/x.conf    # write to a different path (smoke testing)
+  wd-config-init --dry-run               # print to stdout, don't write
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Make wdlib importable when run from a checkout (Python doesn't auto-add
+# the lib/ sibling).
+_HERE = Path(__file__).resolve().parent
+for _candidate in (_HERE.parent / 'lib', Path('/opt/wsprdaemon/lib')):
+    if (_candidate / 'wdlib' / '__init__.py').exists():
+        sys.path.insert(0, str(_candidate))
+        break
+
+from wdlib.config_init import init_config, render_default_conf, _load_local_radiods
+
+
+def _green(s: str) -> str: return f'\033[32m{s}\033[0m' if sys.stdout.isatty() else s
+def _red(s:   str) -> str: return f'\033[31m{s}\033[0m' if sys.stderr.isatty() else s
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog='wd-config-init',
+                                description=__doc__.split('\n\n')[0])
+    p.add_argument('--coord-path',
+                   default='/etc/sigmond/coordination.toml',
+                   help='sigmond coordination.toml (default: %(default)s)')
+    p.add_argument('--output', default='/etc/wsprdaemon/wsprdaemon.conf',
+                   help='output path (default: %(default)s)')
+    p.add_argument('--force', action='store_true',
+                   help='regenerate even if output exists (clobbers local edits)')
+    p.add_argument('--dry-run', action='store_true',
+                   help='print to stdout, do not write')
+    args = p.parse_args()
+
+    coord = Path(args.coord_path)
+    out   = Path(args.output)
+
+    # Echo what we're about to do — sigmond's banner already printed
+    # the heading, so keep this short.
+    print(f'  source:   {coord}')
+    print(f'  target:   {out}')
+    if os.environ.get('STATION_CALL'):
+        print(f'  callsign: {os.environ["STATION_CALL"]}  '
+              f'(from $STATION_CALL — wsprdaemon-client picks it up via '
+              f'parser fallback)')
+    if os.environ.get('STATION_GRID'):
+        print(f'  grid:     {os.environ["STATION_GRID"]}')
+
+    if args.dry_run:
+        radiods = _load_local_radiods(coord)
+        if not radiods:
+            print(_red('  ✗ no local radiods declared — '
+                       'run `smd config init radiod` first'),
+                  file=sys.stderr)
+            return 1
+        print()
+        print(render_default_conf(radiods))
+        print('# (dry-run — no file written)')
+        return 0
+
+    ok, msg = init_config(coord_path=coord, output_path=out, force=args.force)
+    if not ok:
+        print(f'  {_red("✗")} {msg}', file=sys.stderr)
+        return 1
+    print(f'  {_green("✓")} {msg}')
+    print('  next:  wd-ctl apply        # render env files + start services')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
