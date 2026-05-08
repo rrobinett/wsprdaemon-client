@@ -343,7 +343,12 @@ def generate_all_env_files(config: WdConfig, output_dir: Path) -> List[str]:
         if key in seen_uploaders:
             continue
         seen_uploaders.add(key)
-        safe_call = rx.call.replace('/', '=')
+        # Systemd instance names allow [a-zA-Z0-9_:.-] only — '/' (as in
+        # AC0G/B4 portable-suffix callsigns) and '=' are both rejected.
+        # Other call sites in this module use '=' for filesystem path
+        # encoding where '=' is valid; here the value flows into a unit
+        # name, so we use '-' instead.  See wd-upload@*.service template.
+        safe_call = rx.call.replace('/', '-')
         instance = f'{safe_call}_{rx.grid}'
 
         env_path = output_dir / f'wd-upload-wsprnet@{instance}.env'
