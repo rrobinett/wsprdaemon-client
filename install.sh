@@ -108,6 +108,18 @@ if ! id "${WD_USER}" &>/dev/null; then
     usermod -a -G "${WD_GROUP}" "${WD_USER}" 2>/dev/null || true
 fi
 
+# Make sure ${WD_USER}'s HOME is usable.  Even with --no-create-home above,
+# /etc/passwd lists /home/wsprdaemon as the user's HOME, and wd-upload-
+# wsprdaemon writes an SSH keypair there for SFTP auth to wsprdaemon.org.
+# Without the directory (or with root ownership), the upload service emits
+# `Permission denied: '/home/wsprdaemon/.ssh'` on every cycle.
+WSPRDAEMON_HOME="$(getent passwd "${WD_USER}" | cut -d: -f6)"
+if [[ -n "${WSPRDAEMON_HOME}" ]]; then
+    mkdir -p "${WSPRDAEMON_HOME}"
+    chown "${WD_USER}:${WD_USER}" "${WSPRDAEMON_HOME}"
+    chmod 0750 "${WSPRDAEMON_HOME}"
+fi
+
 # Create directories
 info "Creating directories..."
 dirs=(
@@ -132,6 +144,15 @@ chown -R "${WD_USER}:${WD_GROUP}" "${SPOOL_DIR}"
 chown -R "${WD_USER}:${WD_GROUP}" "${LOG_DIR}"
 chown -R root:"${WD_GROUP}" "${ETC_DIR}"
 chmod 2775 "${ETC_DIR}"
+
+# /var/log/wspr.log is the KA9Q-standard append-only spot log that
+# wd-upload-wsprnet writes to after each successful upload.  Pre-create
+# it with wsprdaemon ownership so the service can append without
+# emitting a permission-denied warning on every cycle (the warning is
+# noisy but harmless — actual uploads still succeed via journal-only
+# logging).  Empty file is fine; the uploader rotates it itself once
+# it exceeds WSPR_LOG_MAX.
+install -m 0644 -o "${WD_USER}" -g "${WD_GROUP}" /dev/null /var/log/wspr.log
 chmod 2775 "${ETC_DIR}/env"
 
 # Install Python library
