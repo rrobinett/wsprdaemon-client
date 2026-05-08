@@ -2127,7 +2127,43 @@ def cmd_diag_upload(args):
     return 0
 
 
+def _load_sigmond_coordination_env(
+    path: str = '/etc/sigmond/coordination.env',
+) -> None:
+    """Pre-populate os.environ from sigmond's coordination.env.
+
+    Sigmond writes the cross-cutting bag (STATION_CALL, STATION_GRID,
+    RADIOD_<ID>_*, SIGMOND_RADIOD_*, ...) here as ``KEY=VAL`` lines;
+    each managed systemd unit picks them up via ``EnvironmentFile=-
+    /etc/sigmond/coordination.env``.  When wd-ctl runs from an
+    interactive shell those env vars aren't present unless the
+    operator sourced the file by hand, and the v4_parser's
+    ``[receiver:X].call → [general].reporter_call → $STATION_CALL``
+    fallback chain then has nothing to fall back to.  Loading the
+    file here closes that gap so a plain ``sudo wd-ctl apply`` does
+    the right thing.
+
+    Operator-set env vars take precedence — we don't overwrite a value
+    that's already in ``os.environ``.  An absent file is silently
+    ignored (sigmond is optional from wd-ctl's perspective).
+    """
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        k, v = k.strip(), v.strip()
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
 def main():
+    _load_sigmond_coordination_env()
     parser = argparse.ArgumentParser(
         prog='wd-ctl',
         description='wsprdaemon v4 orchestrator'
