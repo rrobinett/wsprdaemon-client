@@ -269,7 +269,7 @@ class TestCallhashAccumulation:
     calls across invocations."""
 
     def test_observe_pulls_compound_calls_from_lines(self, tmp_path):
-        from sigmond.callhash import CallHashTable
+        from callhash import CallHashTable
         from wdlib.ch_writer import rows_from_spots_file
         # Synthesise a wd_spots file with two compound-call lines
         # — wsprd's `<call>` markers come through verbatim in tx_sign

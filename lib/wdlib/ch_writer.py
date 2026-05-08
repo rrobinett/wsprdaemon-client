@@ -138,11 +138,11 @@ def spot_to_ch_row(
     same input produces identical rows on edge and central CH.
 
     `tx_sign` is normalised through ``CallHashTable.normalise_brackets``
-    when sigmond.callhash is available so wsprd's bracketed compound-
-    callsign output (``<K1ABC/QRP>``) lands as plain ``K1ABC/QRP`` in
-    the row, and the literal unresolved-hash placeholder ``<...>``
-    becomes an empty string (the schema's tx_sign column is
-    non-nullable).
+    when the ``callhash`` library is available so wsprd's bracketed
+    compound-callsign output (``<K1ABC/QRP>``) lands as plain
+    ``K1ABC/QRP`` in the row, and the literal unresolved-hash
+    placeholder ``<...>`` becomes an empty string (the schema's tx_sign
+    column is non-nullable).
     """
     date_str = spot["date"]
     time_str = spot["time_str"]
@@ -208,7 +208,7 @@ def rows_from_spots_file(
     """Yield wspr.spots rows for every parseable line in `path`.
 
     When ``callhash_table`` is supplied (a
-    ``sigmond.callhash.CallHashTable`` instance), every raw spot line
+    ``callhash.CallHashTable`` instance), every raw spot line
     is fed to ``observe()`` so any ``<call>`` markers wsprd emitted
     while resolving hashes from its session table are accumulated in
     the operator-side cache.  Persistence (load/save) is the caller's
@@ -237,16 +237,16 @@ def rows_from_spots_file(
             )
 
 
-# ── Bracket normalisation (sigmond.callhash bridge) ────────────────────────
+# ── Bracket normalisation (callhash bridge) ────────────────────────────────
 
 def _normalise_call_brackets(raw: str) -> str:
     """Strip WSJT-X angle-bracket markers from a callsign field.
 
-    Delegates to ``sigmond.callhash.CallHashTable.normalise_brackets``
-    when available (canonical implementation, used by both psk-recorder
-    and wsprdaemon-client).  Falls back to a small inline equivalent
-    when sigmond isn't installed so wsprdaemon-client stays runnable
-    standalone.
+    Delegates to ``callhash.CallHashTable.normalise_brackets`` when
+    available (canonical implementation, used by both psk-recorder and
+    wsprdaemon-client).  Falls back to a small inline equivalent when
+    the callhash library isn't installed so wsprdaemon-client stays
+    runnable standalone.
 
     Behaviour:
       * ``<K1ABC>`` or ``<K1ABC/QRP>`` → strip brackets, return inner.
@@ -258,11 +258,11 @@ def _normalise_call_brackets(raw: str) -> str:
     if not raw:
         return raw
     try:
-        from sigmond.callhash import CallHashTable  # type: ignore[import-not-found]
+        from callhash import CallHashTable  # type: ignore[import-not-found]
         result = CallHashTable.normalise_brackets(raw)
     except ImportError:
-        # Inline fallback — keep the data-quality fix even if sigmond
-        # isn't available.
+        # Inline fallback — keep the data-quality fix even if the
+        # callhash library isn't available.
         s = raw.strip()
         if s == "<...>":
             return ""
