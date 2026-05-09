@@ -291,16 +291,24 @@ decode_window() {
             #   "  -3  0.3  14.097107  KD9LVN EN61  33   0  0"
             # (no date/time prefix — those are added only in ALL_WSPR.TXT)
             # -c: write .c2 file (first-pass subtraction aid)
-            # -C 500: max decoder cycles/bit (v3 default, faster than 10000)
-            # -o 4: OSD decoding depth 4 (v3 default)
-            # -d: deeper search for weak signals
+            # -C ${WSPRD_C:-500}: max decoder cycles/bit.  500 is the v3
+            #   wsprdaemon default — chosen so a Raspberry Pi finishes a
+            #   13-band cycle inside the 2-min budget.  wsprd's own default
+            #   is 10000 (~20× deeper).  Faster x86 hosts can set
+            #   WSPRD_C=10000 in /etc/sigmond/coordination.env to recover
+            #   weaker signals at the cost of CPU.
+            # -o ${WSPRD_O:-4}: OSD decoding depth (0..5; v3 default 4).
+            # -d (when WSPRD_DEEP unset or =1): deeper second-pass search.
             local wsprd_stdout="${WD_RECORDING_DIR}/wsprd_stdout.txt"
+            local wsprd_deep_flag="-d"
+            [[ "${WSPRD_DEEP:-1}" == "0" ]] && wsprd_deep_flag=""
             # Run wsprd in a subshell with CWD = WD_RECORDING_DIR so that the
             # 000000_0001.c2 file it creates (-c flag) lands in the per-band
             # directory rather than /tmp (the service WorkingDirectory).
             # Multiple band instances would otherwise race on /tmp/000000_0001.c2.
             ( cd "${WD_RECORDING_DIR}" && \
-              "${WSPRD_BIN}" -a "${WD_RECORDING_DIR}" -c -C 500 -o 4 -d \
+              "${WSPRD_BIN}" -a "${WD_RECORDING_DIR}" -c \
+                  -C "${WSPRD_C:-500}" -o "${WSPRD_O:-4}" ${wsprd_deep_flag} \
                   -f "${freq_mhz}" "${concat_wav}" \
                   > "${wsprd_stdout}" 2>&1 ) || true
 
