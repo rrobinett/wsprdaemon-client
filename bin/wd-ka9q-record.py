@@ -120,10 +120,15 @@ ipc_socket  = "{ipc_sock}"
 status_file = "{stat_file}"
 
 [timing]
-# RX888 is GPSDO-disciplined — RTP timestamps are accurate to parts per billion.
-# RtpSyncStrategy uses only RTP arithmetic for minute boundaries, eliminating
-# the delivery-latency drift that accumulates with ClockSyncStrategy.
-authority = "rtp"
+# RX888 is GPSDO-disciplined — RTP timestamps are accurate to parts per
+# billion, so RtpSyncStrategy is always the right choice for minute-
+# boundary arithmetic.  authority="auto" still uses RtpSyncStrategy;
+# what it adds is that the one-time RTP->UTC correlation is taken from
+# /run/hf-timestd/authority.json (precise, sub-us) when hf-timestd is
+# running, instead of from datetime.now() (delivery-latency-bound,
+# ~hundreds of ms error).  Falls back automatically to wall-clock
+# correlation in standalone mode.
+authority = "auto"
 
 [channel_defaults]
 sample_rate = 12000
