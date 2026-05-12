@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """wd-ch-write — parse `_wd_spots.txt` files and insert rows into the
-local ClickHouse staging tier (CONTRACT v0.6 §17).
+local sigmond staging tier (CONTRACT v0.6 §17).
 
-Standalone-safe: when `SIGMOND_CLICKHOUSE_URL` is unset (no sigmond, or
-sigmond's `[storage.clickhouse]` block omitted), this script is a clean
-no-op — it parses the files but writes nothing, and exits 0.  The
-existing SFTP upload to wsprdaemon.org is not affected.
+Standalone-safe: when neither `SIGMOND_CLICKHOUSE_URL` nor
+`SIGMOND_SQLITE_PATH` is set (no sigmond install, or sigmond is
+running on a different host), `hamsci_ch.Writer.from_env()` returns a
+no-op writer that silently discards inserts and exits 0.  The
+existing SFTP upload to wsprdaemon.org is not affected by this path
+either way.
+
+Backend dispatch is delegated to `Writer.from_env()`:
+  - `SIGMOND_CLICKHOUSE_URL` set       → ClickHouse Writer
+  - `SIGMOND_SQLITE_PATH` set OR
+    /var/lib/sigmond/sink.db present   → SqliteWriter (the post-
+                                          `smd storage migrate-to-sqlite`
+                                          default)
+  - neither                              → no-op
 
 Wire-compat: rows are produced by the same parser used by
 `wsprdaemon-server/tar-bulk-loader.py`, so edge-CH rows are byte-equal
@@ -59,13 +69,21 @@ def main(argv=None) -> int:
     p.add_argument("paths", nargs="+", type=Path)
     args = p.parse_args(argv)
 
-    if not os.environ.get("SIGMOND_CLICKHOUSE_URL", "").strip():
-        log.debug("SIGMOND_CLICKHOUSE_URL unset; no-op (file upload path unaffected)")
-        return 0
-
+    # Delegate backend selection to hamsci_ch.Writer.from_env: it
+    # picks ClickHouse when SIGMOND_CLICKHOUSE_URL is set, SQLite when
+    # SIGMOND_SQLITE_PATH is set (or the default /var/lib/sigmond/
+    # sink.db exists), and returns a no-op writer otherwise.  The
+    # old "early-out when CH is unset" guard incorrectly skipped the
+    # SQLite path entirely after the smd storage migrate-to-sqlite
+    # rollout — observed on bee1 2026-05-12 where wd-ch-write was
+    # still trying to connect to localhost:8123 (long after the CH
+    # server was purged) and dropping wspr.spots rows on the floor.
     callhash_table = _load_callhash(args.callhash_path)
 
     writer = build_writer(batch_rows=args.batch_rows)
+    if writer.is_noop:
+        log.debug("hamsci_ch writer is no-op; file upload path unaffected")
+        return 0
     written = 0
     skipped = 0
     with writer:
