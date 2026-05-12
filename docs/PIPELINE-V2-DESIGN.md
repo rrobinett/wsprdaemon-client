@@ -1,7 +1,11 @@
 # wsprdaemon-client pipeline v2 — DB-direct decode + dedup-at-upload
 
-**Status:** proposal, agreed in principle 2026-05-12 by Rob (architect)
-and Michael (author).  Authoring on a topic branch; staged migration.
+**Status:** in flight 2026-05-12.  Originally agreed in principle by
+Rob (architect) and Michael (author); since then Michael has shipped
+the upload-side of the design directly (commits `3c4fb76` /
+`a552b2b` / `05f8510` — `wd-upload-hs` via the hs_uploader package
+with `SqliteSource`).  This doc has been updated to reflect what's
+landed vs what's still proposed.
 
 ## Background — what we have today
 
@@ -200,7 +204,27 @@ mitigation is a bounded subprocess pool with a configurable cap
 (default = number of bands).
 **Effort:** 3-5 days.
 
-### Phase 3 — switch uploader to DB-as-source
+### Phase 3 — switch uploader to DB-as-source  (LANDED via `wd-upload-hs`)
+
+**Implemented differently from this draft and already merged to
+`main`.**  Michael's commits `a552b2b` + `05f8510` ship a unified
+`wd-upload-hs@<station>.service` that reads `wspr.spots` via
+`hs_uploader.SqliteSource` and POSTs to wsprnet.org (HTTP MEPT)
+*and* wsprdaemon.org (SFTP tar) from a single daemon.  Operator
+gate is `WSPR_USE_HS_UPLOADER=1`; off by default.
+
+This supersedes the `wd-upload-wsprnet` + `DbSource` draft that
+was prototyped on the `pipeline-v2/phase-3` topic branch — that
+branch was dropped 2026-05-12 once `wd-upload-hs` landed.  The
+two implementations covered the same need (read `wspr.spots`,
+dedup, ship); `wd-upload-hs` is the survivor because it also
+handles the wsprdaemon.org SFTP destination and uses the proven
+`hs_uploader` package the psk-recorder shim is built on.
+
+The remaining narrative below describes the original draft for
+historical context.
+
+#### Original draft (superseded — kept for reference)
 
 Change `wd-upload-wsprnet` to read from `wspr.spots` instead of
 the upload spool.
