@@ -1,0 +1,38 @@
+# /etc/systemd/system/wd-upload-hs@.service
+[Unit]
+Description=wsprdaemon-client hs-uploader-driven uploader for %i
+Documentation=https://github.com/rrobinett/wsprdaemon-client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=wsprdaemon
+
+# Same env shape as the legacy wd-upload-* services so an operator
+# only flips one variable (WSPR_USE_HS_UPLOADER=1) plus disables the
+# legacy units; nothing else moves.
+EnvironmentFile=-/etc/sigmond/coordination.env
+EnvironmentFile=/etc/wsprdaemon/env/wd-upload-hs@%i.env
+
+ExecStart=/usr/local/sbin/wd-upload-hs
+
+# Restart=on-failure (NOT always) so a clean exit — feature-flag
+# off-path returning 0, or an operator-initiated SIGTERM — stays
+# stopped.  Transport failures inside the pump thread are absorbed
+# by hs-uploader's RetryPolicy + deliverables (per-batch retry
+# with exponential backoff, dead-letter on permanent failure).
+# Service-level restart is the safety net for "uploader process
+# died with a Python exception", which surfaces as exit != 0.
+Restart=on-failure
+RestartSec=10
+
+# Quiet output: the shim's own logger emits one line per pump cycle
+# with work, plus warnings on failure.  No additional buffering.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wd-upload-hs
+
+[Install]
+WantedBy=multi-user.target

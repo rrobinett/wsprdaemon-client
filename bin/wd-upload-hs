@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""wd-upload-hs — hs-uploader-driven wspr.spots shipper.
+
+Drop-in replacement for ``wd-upload-wsprdaemon@`` + ``wd-upload-wsprnet@``
+when ``WSPR_USE_HS_UPLOADER=1`` is set.  Reads the same wd-ctl-
+generated env (WD_RECEIVER_CALL, WD_UPLOAD_*_DIR, WD_SFTP_SERVERS,
+etc.) so swapping is a feature-flag flip, not a config rewrite.
+
+The work happens inside ``wdlib.hs_uploader_shim.WsprUploaderHs``.
+This script is the systemd-facing process: it constructs the shim,
+calls ``start()``, blocks until SIGTERM, then ``stop()`` for a
+clean shutdown.
+"""
+from __future__ import annotations
+
+import logging
+import signal
+import sys
+import threading
+from pathlib import Path
+
+
+# Make wdlib importable from both the repo layout (./lib) and the
+# /opt install path (matches wd-ch-write and wd-ka9q-record.py).
+_HERE = Path(__file__).resolve()
+for _candidate in (
+    _HERE.parent.parent / "lib",
+    Path("/opt/wsprdaemon-client/lib"),
+    Path("/opt/git/sigmond/wsprdaemon-client/lib"),
+):
+    if (_candidate / "wdlib").exists():
+        sys.path.insert(0, str(_candidate))
+        break
+
+
+def main() -> int:
+    # Source the wsprdaemon log-level convention if available
+    # (contract §11).  Falls back to INFO otherwise.
+    import os
+    level_name = os.environ.get("WSPR_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    if not os.environ.get("WSPR_USE_HS_UPLOADER", "").strip():
+        logging.info(
+            "wd-upload-hs: WSPR_USE_HS_UPLOADER unset; nothing to do. "
+            "Set WSPR_USE_HS_UPLOADER=1 in the service env file to "
+            "enable the new uploader (legacy wd-upload-* services "
+            "should be disabled in the same change)."
+        )
+        return 0
+
+    try:
+        from wdlib.hs_uploader_shim import WsprUploaderHs
+    except ImportError as exc:
+        logging.error("wd-upload-hs: hs_uploader_shim import failed: %s", exc)
+        return 1
+
+    try:
+        uploader = WsprUploaderHs.from_env()
+    except ValueError as exc:
+        logging.error("wd-upload-hs: env-validation failed: %s", exc)
+        return 2
+
+    stop = threading.Event()
+
+    def _handle_signal(signum, _frame):
+        logging.info("wd-upload-hs: caught signal %d, shutting down", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    # SIGHUP is the wsprdaemon convention for "reload" — for this
+    # shim, treat it as a graceful restart signal (stop + exit; systemd
+    # Restart=always brings us back).
+    signal.signal(signal.SIGHUP, _handle_signal)
+
+    uploader.start()
+    if not uploader.is_active:
+        # start() decided not to run (no pipelines, missing env, etc.).
+        # Exit cleanly so systemd Restart=always doesn't loop on an
+        # impossible config.
+        logging.info(
+            "wd-upload-hs: uploader did not enter active state; exiting"
+        )
+        return 0
+
+    try:
+        stop.wait()
+    finally:
+        uploader.stop(timeout=15.0)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
