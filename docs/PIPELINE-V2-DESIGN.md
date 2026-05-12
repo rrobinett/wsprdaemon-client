@@ -256,30 +256,50 @@ produce equivalent spot counts, and the rollback is a single env
 flag flip.
 **Effort:** 1 day.
 
-## Dedup semantics — needs explicit ruling before Phase 3
+## Dedup semantics — confirmed 2026-05-12
 
-Three plausible interpretations of "find the best SNR for each
-duplicate":
+**Rule:** dedup is **(a) only** — within-band same-callsign in the
+same cycle, keep the spot with the best SNR.
 
-(a) **Within-band near-frequency clusters.**  Same transmitter
-mis-decoded twice at slightly different audio freqs (±5 Hz typical).
-WSPRnet's API does this server-side today.  Local dedup makes
-upstream messages cleaner but doesn't change what reaches the WSPR
-database.
+Three things this rule deliberately does NOT do:
 
-(b) **Across bands, same callsign in the same cycle.**  K9XX heard
-on 40 m AND 20 m in the same cycle.  These are TWO distinct
-propagation reports; WSPRnet wants both.  De-duping these LOSES
-data.
+(b) **Cross-band same-callsign** — `K9XX` heard on 40 m AND 20 m in
+the same cycle stays as two distinct rows uploaded to WSPRnet.  These
+are independent propagation reports and WSPRnet wants both.
 
-(c) **Type-2 + type-3 from the same station.**  `K9XX` (no grid,
-type 2) and `<K9XX>` with `EM37jh` (hashed, type 3) — same station,
-two reports.  These are conventionally merged at upload.
+**Multi-receiver same-band** — on hosts running multiple antennas /
+receivers, the same callsign may be decoded on the same band twice
+in the same cycle from different `radiod_id`s.  Every row goes into
+the local `wspr.spots` DB tagged with its `radiod_id` so that the
+**wsprdaemon-server** upload path (via hs-uploader) gets the full
+multi-receiver picture — operators downstream care which antenna
+heard what.  At **WSPRnet** upload time, however, `wd-upload-wsprnet`
+groups by `(time, callsign, band)` **ignoring `radiod_id`**, picks
+the best SNR across all receivers, and ships only one row.
 
-**Default recommendation:** (a) and (c) yes, (b) no.
+(c) **Type-2 + type-3 from the same station** — `K9XX` and
+`<K9XX>` in the same cycle stay as separate rows.  Treating them
+as duplicates is a downstream interpretation problem; we keep them
+distinct locally.
 
-Phase 3 ships with (a) + (c) only.  Pinning this before query
-work starts.
+**Phase 3 implication:** the SQL dedup query is exactly:
+
+```sql
+WITH ranked AS (
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY time, callsign, band
+           ORDER BY snr_db DESC, frequency_hz ASC
+         ) AS rk
+  FROM wspr_spots
+  WHERE time = :cycle AND uploaded_at IS NULL
+)
+SELECT * FROM ranked WHERE rk = 1;
+```
+
+`PARTITION BY time, callsign, band` (no `radiod_id`) is the
+load-bearing part — it merges across receivers.  Ties on `snr_db`
+resolved by `MIN(frequency_hz)` for stability.
 
 ## Decode concurrency / CPU policy
 
@@ -314,14 +334,18 @@ New model needs to replicate this in-process:
 
 ## Open questions for review
 
-1. **Dedup semantics** — confirm "(a) + (c) yes, (b) no" above.
+1. ~~Dedup semantics~~ — **decided 2026-05-12**: rule (a) only;
+   see "Dedup semantics" section.
 2. **FST4 / WSPR-15 modes** — same architecture works, but the
    spawn timing differs (15-min cycle ≠ 2-min cycle).  Need to
    confirm the decode-pool worker correctly handles both cadences
    when bands within one cycle have different periods.
 3. **CPU affinity input** — current sigmond drop-ins are
    per-band-service; new model needs a config representation
-   inside `wd-ka9q-record`'s env file.  Format TBD.
+   inside `wd-ka9q-record`'s env file.  Default proposal:
+   `[decode_pool] cpu_map = { "20" = "4-5", "40" = "6-7", ... }`
+   in the existing wsprdaemon-client TOML.  Sigmond's affinity
+   drop-ins for the old per-band services translate 1:1.
 4. **Sigmond `smd watch wspr` source** — currently reads the
    partial-report file written by `wd-upload-wsprnet`.  We keep
    writing that file in Phase 3 so the verb keeps working

@@ -76,6 +76,38 @@ class TestRow(unittest.TestCase):
         d = row_to_dict(r)
         self.assertEqual(d["time"], "2026-05-09T21:06:00Z")
 
+    def test_multi_receiver_same_band_same_callsign(self):
+        """Two receivers on the same host decoding the same callsign
+        on the same band in the same cycle produce two distinct
+        rows.  They differ ONLY by radiod_id (and SNR / freq, which
+        the upload-side dedup uses to pick a winner).  This is the
+        load-bearing case for the wsprdaemon-server upload path,
+        which wants every receiver's report; WSPRnet dedup happens
+        downstream by grouping on (time, callsign, band)."""
+        time = datetime(2026, 5, 9, 21, 6, tzinfo=timezone.utc)
+        a = _make_row(
+            time=time, band="20", callsign="K9XX", grid="EM37",
+            radiod_id="B4-100-rx888mk2",
+            frequency_hz=14_097_143, snr_db=-12,
+        )
+        b = _make_row(
+            time=time, band="20", callsign="K9XX", grid="EM37",
+            radiod_id="B4-100-kiwi1",
+            frequency_hz=14_097_145, snr_db=-15,
+        )
+        # Rows are distinct (radiod_id differs).
+        self.assertNotEqual(a, b)
+        # Serialize both — radiod_id is preserved so the local DB
+        # / hs-uploader path sees both.
+        self.assertEqual(row_to_dict(a)["radiod_id"], "B4-100-rx888mk2")
+        self.assertEqual(row_to_dict(b)["radiod_id"], "B4-100-kiwi1")
+        # The (time, callsign, band) grouping key collapses to one
+        # bucket — that's what wd-upload-wsprnet's dedup query
+        # will partition by.
+        key_a = (row_to_dict(a)["time"], a.callsign, a.band)
+        key_b = (row_to_dict(b)["time"], b.callsign, b.band)
+        self.assertEqual(key_a, key_b)
+
 
 if __name__ == "__main__":
     unittest.main()

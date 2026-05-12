@@ -19,6 +19,17 @@ See `row.py`.  Every field is mandatory except `uploaded_at`
 
 ## Conventions
 
+- **`radiod_id`** is the **receiver identifier**.  On multi-RX hosts
+  (multiple antennas / multiple RX888s / KiwiSDR alongside RX888),
+  each radiod instance gets its own `radiod_id` and every spot
+  carries the `radiod_id` of the receiver that decoded it.  This
+  matters because the local DB keeps every spot — including
+  duplicates of the same callsign decoded on the same band by
+  different receivers — so the wsprdaemon-server upload path can
+  ship the full multi-receiver picture upstream.  At WSPRnet upload
+  time, `wd-upload-wsprnet` groups by `(time, callsign, band)`
+  **ignoring `radiod_id`** and picks the best-SNR row to ship.
+  See `docs/PIPELINE-V2-DESIGN.md`, "Dedup semantics".
 - **`time`** is the slot start in UTC, second resolution.  Producers
   must pass a tz-aware UTC datetime (or a tz-naive datetime that is
   *known* to be UTC — `row_to_dict` tags it Z).
