@@ -78,6 +78,14 @@ BAND_FREQ_HZ = {
     '15':   21094600,
     '12':   24924600,
     '10':   28124600,
+    # VHF experimental + 6m
+    # 8m: UK Ofcom experimental allocation 40.660-40.700 MHz; WSJT-X
+    # places WSPR's carrier at 40.680400 MHz (1.5 kHz audio offset
+    # above the 40.679 MHz dial).  EU stations report on this band.
+    '8':    40680400,
+    # 6m: WSPR carrier at 50.293000 MHz.  Sporadic-E + meteor scatter
+    # producer; long quiet stretches between band openings are normal.
+    '6':    50293000,
     # WWV/CHU bands (IQ recording)
     'WWV_2_5':  2500000,
     'WWV_5':    5000000,
