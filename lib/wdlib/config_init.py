@@ -16,8 +16,10 @@ What the generator does:
     .reporter_call`` → ``$STATION_CALL`` (CONTRACT-v0.5 §14.2),
     so the operator never types a callsign that sigmond already knows.
   * Emit per-band ``[receiver:<name>:<band>]`` blocks that cover
-    every WSPR band the upstream parser knows about (``2200`` through
-    ``10`` per ``BAND_FREQ_HZ``):
+    every WSPR band the upstream parser knows about (``2200``
+    through ``6`` per ``BAND_FREQ_HZ``, including the EU secondary
+    allocations ``80eu`` and ``60eu`` and the UK experimental
+    ``8`` m band):
       - On ``2200`` and ``630``, modes ``W2 F2 F5 F15 F30`` —
         the long FST4W windows that the slow LF/MF QSB rewards.
       - On every other band, modes ``W2 F2 F5`` — standard
@@ -43,8 +45,13 @@ from typing import Optional
 # in operator-friendly low→high order so the rendered conf reads naturally.
 WSPR_BANDS_DEFAULT: tuple[str, ...] = (
     '2200', '630',                             # LF / MF
-    '160', '80', '60', '40', '30', '22',       # HF low + middle
+    '160',                                     # HF low
+    '80', '80eu',                              # 80m + EU secondary (3.5926 MHz)
+    '60', '60eu',                              # 60m + EU secondary (5.3647 MHz)
+    '40', '30', '22',                          # HF middle
     '20', '17', '15', '12', '10',              # HF high
+    '8',                                       # 8m experimental (UK 40 MHz)
+    '6',                                       # 6m (Sporadic-E / MS)
 )
 
 # Modes per band class.  Long-window FST4W (F15, F30) added on
