@@ -100,8 +100,10 @@ class WsprUploaderHs:
         # iteration.
         self._pump_wsprdaemon_records = 0
         self._pump_wsprnet_records = 0
+        self._pump_wsprnet_accepted = 0    # what wsprnet actually added (parsed from response body)
         self._total_wsprdaemon_records = 0
         self._total_wsprnet_records = 0
+        self._total_wsprnet_accepted = 0
         self._pump_count = 0
         self._work_count = 0
 
@@ -236,10 +238,33 @@ class WsprUploaderHs:
             self._call, self._grid, len(pipelines), int(PUMP_INTERVAL_SEC),
         )
 
+        # Optional: verify-and-flush thread polls wsprnet for our reporter's
+        # accepted spots and deletes confirmed rows from pending_uploads.
+        # Off by default; opt in with WD_VERIFY_FLUSH=1 in the env file.
+        # See wsprnet_verifier.py for the full rationale.
+        self._verifier = None
+        if os.environ.get("WD_VERIFY_FLUSH", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            try:
+                from .wsprnet_verifier import WsprnetVerifier
+                self._verifier = WsprnetVerifier(reporter=self._call)
+                self._verifier.start()
+            except Exception:
+                logger.exception(
+                    "wspr-uploader-hs: failed to start wsprnet verifier; "
+                    "continuing without it"
+                )
+
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        if self._verifier is not None:
+            try:
+                self._verifier.stop(timeout=timeout)
+            except Exception:
+                logger.exception("wspr-uploader-hs: verifier.stop failed")
         for t in self._transports:
             close = getattr(t, "close", None)
             if callable(close):
@@ -268,17 +293,36 @@ class WsprUploaderHs:
                 self._pump_count += 1
                 self._pump_wsprdaemon_records = 0
                 self._pump_wsprnet_records = 0
+                self._pump_wsprnet_accepted = 0
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
                     self._total_wsprdaemon_records += self._pump_wsprdaemon_records
                     self._total_wsprnet_records += self._pump_wsprnet_records
+                    self._total_wsprnet_accepted += self._pump_wsprnet_accepted
+                    # wsprnet acceptance disclosure: server may add fewer
+                    # spots than we POSTed (duplicates from prior batches,
+                    # MAX_SPOTS truncation, malformed lines).  Show both
+                    # the posted count AND the actually-added count when
+                    # they differ — otherwise the log line stays compact.
+                    if self._pump_wsprnet_records != self._pump_wsprnet_accepted:
+                        wsprnet_field = (
+                            f"wsprnet=posted:{self._pump_wsprnet_records}"
+                            f"/added:{self._pump_wsprnet_accepted}"
+                        )
+                        total_wsprnet_field = (
+                            f"wsprnet=posted:{self._total_wsprnet_records}"
+                            f"/added:{self._total_wsprnet_accepted}"
+                        )
+                    else:
+                        wsprnet_field = f"wsprnet={self._pump_wsprnet_records}"
+                        total_wsprnet_field = f"wsprnet={self._total_wsprnet_records}"
                     logger.info(
-                        "wspr-uploader-hs: shipped wsprdaemon=%d wsprnet=%d "
-                        "(total wsprdaemon=%d wsprnet=%d, work=%d)",
+                        "wspr-uploader-hs: shipped wsprdaemon=%d %s "
+                        "(total wsprdaemon=%d %s, work=%d)",
                         self._pump_wsprdaemon_records,
-                        self._pump_wsprnet_records,
+                        wsprnet_field,
                         self._total_wsprdaemon_records,
-                        self._total_wsprnet_records,
+                        total_wsprnet_field,
                         self._work_count,
                     )
             except Exception:
@@ -288,13 +332,28 @@ class WsprUploaderHs:
 
     def _on_batch_outcome(self, pipeline, batch, outcome) -> None:
         """Tally per-pipeline ship counts; outcomes other than acked /
-        partial_ack are skipped (those records will retry next pass)."""
+        partial_ack are skipped (those records will retry next pass).
+
+        For wsprnet, outcome.reason carries "N/M added" parsed from
+        the server response body — see WsprNet._post().  We tally both
+        the posted count (batch.records) AND the actual accepted count
+        so the journal can report the true server-side acceptance rate.
+        """
         if outcome.kind not in ("acked", "partial_ack"):
             return
         if pipeline.name.startswith("wsprdaemon-tar"):
             self._pump_wsprdaemon_records += len(batch.records)
         elif pipeline.name.startswith("wsprnet"):
             self._pump_wsprnet_records += len(batch.records)
+            # Parse "N/M added" from outcome.reason if present.
+            import re
+            m = re.match(r"(\d+)/(\d+) added", outcome.reason or "")
+            if m:
+                self._pump_wsprnet_accepted += int(m.group(1))
+            else:
+                # No diagnostic — assume all posted records were accepted
+                # (older transport version without the parse).
+                self._pump_wsprnet_accepted += len(batch.records)
 
     # ----- pipeline construction -----
 
