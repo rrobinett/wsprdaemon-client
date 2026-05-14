@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import threading
 from pathlib import Path
 from typing import Optional
@@ -229,6 +230,34 @@ class WsprUploaderHs:
         )
 
         self._stop.clear()
+        # Wake event: pump loop waits on this OR a PUMP_INTERVAL_SEC
+        # timeout, whichever comes first.  SIGUSR1 sets it from the
+        # outside — wspr-recorder's CycleBatcher signals us as soon as
+        # a cycle's spots are committed to sink.db, so end-to-end
+        # latency from "decoded" to "shipped" drops from up to PUMP_INTERVAL_SEC
+        # (60 s with the original polling design) to a few hundred ms.
+        # Falls back to plain polling if no producer sends the signal.
+        self._wake = threading.Event()
+        try:
+            signal.signal(signal.SIGUSR1, self._on_wake_signal)
+        except (ValueError, AttributeError):
+            # signal.signal requires the main thread on Linux/macOS;
+            # if we're being constructed in a worker thread (tests),
+            # accept the polling fallback rather than crash.
+            logger.debug("hs-uploader-shim: SIGUSR1 handler not installable; "
+                         "polling-only mode")
+
+        # Pid file at the shared /run/wsprdaemon IPC dir so peer
+        # processes (the wspr-recorder decoder) can locate us via a
+        # single well-known path.  Best-effort: missing dir or perm
+        # failure is non-fatal.
+        try:
+            os.makedirs("/run/wsprdaemon", exist_ok=True)
+            with open(self._pid_file_path(), "w") as f:
+                f.write(f"{os.getpid()}\n")
+        except OSError as exc:
+            logger.warning("hs-uploader-shim: could not write pid file: %s", exc)
+
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="wspr-uploader-hs",
         )
@@ -237,6 +266,15 @@ class WsprUploaderHs:
             "wspr-uploader-hs started: %s/%s (%d pipeline(s), pump=%ds)",
             self._call, self._grid, len(pipelines), int(PUMP_INTERVAL_SEC),
         )
+
+    def _on_wake_signal(self, _signum, _frame) -> None:
+        # Signal handlers run on the main thread; setting an Event is
+        # async-signal-safe.  No I/O or locks here.
+        self._wake.set()
+
+    @staticmethod
+    def _pid_file_path() -> str:
+        return "/run/wsprdaemon/wd-upload-hs.pid"
 
         # Optional: verify-and-flush thread polls wsprnet for our reporter's
         # accepted spots and deletes confirmed rows from pending_uploads.
@@ -258,8 +296,19 @@ class WsprUploaderHs:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        # Kick the pump loop awake so it observes _stop without
+        # waiting out the rest of its PUMP_INTERVAL_SEC.
+        try:
+            self._wake.set()
+        except AttributeError:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        # Best-effort pid file cleanup.
+        try:
+            os.unlink(self._pid_file_path())
+        except OSError:
+            pass
         if self._verifier is not None:
             try:
                 self._verifier.stop(timeout=timeout)
@@ -288,7 +337,15 @@ class WsprUploaderHs:
     # ----- pump loop -----
 
     def _run(self) -> None:
-        while not self._stop.wait(PUMP_INTERVAL_SEC):
+        while not self._stop.is_set():
+            # Wait for either the regular pump interval OR a SIGUSR1
+            # wake-up from a producer that just committed new spots.
+            # When the wake event fires before the timeout, pump
+            # immediately; otherwise this is a normal polling tick.
+            woke = self._wake.wait(PUMP_INTERVAL_SEC)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
             try:
                 self._pump_count += 1
                 self._pump_wsprdaemon_records = 0
