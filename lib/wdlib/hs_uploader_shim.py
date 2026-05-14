@@ -354,6 +354,11 @@ class WsprUploaderHs:
                 table="spots",
                 accepted_schema_versions=[1, 2],   # both pre/post v2 cutover
                 start_at="now",
+                # Don't delete on ack — the wsprnet pipeline shares this
+                # same (database, table) queue.  Whichever pipeline acks
+                # first would race-delete the other's pending rows.
+                # `smd storage trim` (24h wspr retention) cleans up.
+                delete_on_commit=False,
             )
             if sqlite_source.health() != HEALTH_NOOP:
                 logger.info(
@@ -432,6 +437,13 @@ class WsprUploaderHs:
                 # likely be filtered server-side, but the noise is
                 # avoidable).  Once the watermark exists, restarts
                 # resume from it and start_at is ignored.
+                #
+                # Don't delete on ack — the wsprdaemon pipeline shares
+                # this same (database, table) queue (since 2026-05-14
+                # Phase 4 cutover).  Race-delete would starve the other
+                # pipeline.  `smd storage trim` (24h wspr retention)
+                # is the cleanup mechanism.
+                delete_on_commit=False,
             )
             if sqlite_source.health() != HEALTH_NOOP:
                 logger.info(
