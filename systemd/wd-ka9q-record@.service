@@ -23,16 +23,33 @@ WorkingDirectory=/var/spool/wsprdaemon/recording/%i
 
 Restart=always
 RestartSec=5
-# Continuous runtime — no scheduled restart.  The historical
-# `RuntimeMaxSec=45min` was a safety net for memory growth /
-# processing-lag accumulation in pre-pipeline-v2 wspr-recorder
-# (observed ~3s/min drift, capped under 135s by a 45-min reset).
-# pipeline-v2 fixed those root causes (anchor-once timing + per-cycle
-# CycleBatcher; no decode queue building up), and every 45-min restart
-# was costing ~1 WSPR cycle of decodes (~30 missed spots × 32 restarts/day
-# = ~1k spots/day on B4-100).  Disabled 2026-05-14.  If memory growth
-# returns, prefer fixing the leak over reinstating this — see git blame
-# for the original rationale.
+# Safety-net restart at 4 hours.
+#
+# History: the original 45-min restart was added because of observed
+# RSS climb at ~5-40 MB/min that would eventually OOM the host.  On
+# 2026-05-14 the policy was disabled (commit 58d97da) believing that
+# pipeline-v2's anchor-once timing + CycleBatcher had removed the root
+# cause.  Same-day instrumentation showed the RSS climb is still real:
+#
+#   - tracemalloc current stays stable at ~407 MB (Python heap fine)
+#   - RSS grows ~41 MB/min over many cycles (50 → 624 MB in 14 min)
+#   - Disabling Transparent Huge Pages dropped AnonHugePages
+#     411 MB → 2 MB but did NOT reduce the growth rate, ruling out
+#     THP fragmentation as the cause.
+#   - The ~220 MB gap between RSS and tracemalloc-tracked memory is
+#     non-Python C allocations (numpy, subprocess pipes, sqlite, ...)
+#     that aren't being released back to the OS even after Python
+#     drops its references.
+#
+# Until the leak is identified and fixed, 4 h is a compromise:
+#   - misses ~1 WSPR cycle per 4h = ~6 cycles/day = 0.8% loss
+#     (vs. ~32/day = 4% under the old 45-min policy)
+#   - bounds peak RSS to ~4 × 41 MB/min × 240 min = 1.6 GB / cycle of
+#     ramp-up + accumulated baseline ≈ 2 GB before reset — comfortably
+#     within the 7.8 GB host budget.
+#
+# When the real leak is fixed, this can return to continuous runtime.
+RuntimeMaxSec=4h
 
 StandardOutput=journal
 StandardError=journal
