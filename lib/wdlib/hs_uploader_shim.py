@@ -186,7 +186,7 @@ class WsprUploaderHs:
         )
         pipelines = []
 
-        # --- pipeline 1: wsprdaemon.org via tar/SFTP ---
+        # --- pipeline 1: wsprdaemon.org via tar/SFTP (spots) ---
         wsprd_pipe = self._build_wsprdaemon_pipeline(
             identity=identity, watermark=watermark,
         )
@@ -194,7 +194,18 @@ class WsprUploaderHs:
             pipelines.append(wsprd_pipe[0])
             self._transports.append(wsprd_pipe[1])
 
-        # --- pipeline 2: wsprnet.org via HTTP MEPT ---
+        # --- pipeline 2: wsprdaemon.org via tar/SFTP (noise) ---
+        # Separate pipeline because SqliteSource is single-table.
+        # WsprdaemonTarSftp routes records by their `table` attribute:
+        # wspr.noise rows produce wsprdaemon/noise/... arcnames.
+        wsprd_noise_pipe = self._build_wsprdaemon_noise_pipeline(
+            identity=identity, watermark=watermark,
+        )
+        if wsprd_noise_pipe is not None:
+            pipelines.append(wsprd_noise_pipe[0])
+            self._transports.append(wsprd_noise_pipe[1])
+
+        # --- pipeline 3: wsprnet.org via HTTP MEPT ---
         wsprnet_pipe = self._build_wsprnet_pipeline(
             identity=identity, watermark=watermark,
         )
@@ -369,6 +380,59 @@ class WsprUploaderHs:
         # Fallback: legacy file path.  Only useful on pre-cutover hosts
         # where wd-post is still populating the spool dir.
         return self._build_wsprdaemon_file_source()
+
+    def _build_wsprdaemon_noise_pipeline(self, *, identity, watermark):
+        """Per-cycle noise rows → wsprdaemon.org via tar/SFTP.
+
+        Reads sink.db `wspr.noise` (produced by wspr-recorder's
+        in-process noise measurement, Phase 2 of the cutover).  Same
+        WsprdaemonTarSftp transport as the spots pipeline; the
+        transport detects records with `table=="wspr.noise"` and
+        builds noise-only tars with `wsprdaemon/noise/...` arcnames.
+        """
+        if not self._sftp_servers or not self._sink_db.exists():
+            return None
+        try:
+            from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
+        except ImportError:
+            return None
+        from hs_uploader import Pipeline, RetryPolicy
+        from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
+
+        source = SqliteSource.from_env(
+            database="wspr",
+            table="noise",
+            accepted_schema_versions=[1],
+            start_at="now",
+            delete_on_commit=True,    # single consumer; safe to delete on ack
+        )
+        if source.health() == HEALTH_NOOP:
+            return None
+
+        receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
+        transport = WsprdaemonTarSftp(
+            servers=[_server_host(s) for s in self._sftp_servers],
+            spool_root=None,
+            sftp_user=self._sftp_user,
+            version=self._version,
+            upload_id=self._upload_id,
+            receiver=receiver,
+            name=f"wsprdaemon-tar-sftp-noise:{','.join(_server_host(s) for s in self._sftp_servers)}",
+        )
+        pipeline = Pipeline(
+            name=f"wsprdaemon-noise-{self._instance_name}",
+            source=source,
+            transport=transport,
+            watermark=watermark,
+            identity=identity,
+            retry=RetryPolicy.exponential(base=2.0, cap_sec=900.0),
+            batch_limit=10_000,
+        )
+        logger.info(
+            "wspr-uploader-hs: using SqliteSource for wsprdaemon noise "
+            "(sink at %s)", self._sink_db,
+        )
+        return (pipeline, transport)
 
     def _build_wsprdaemon_file_source(self):
         """Legacy spool-dir path: wd-post → _wd_spots.txt files."""
