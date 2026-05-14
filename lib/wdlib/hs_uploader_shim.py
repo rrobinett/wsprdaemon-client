@@ -288,42 +288,37 @@ class WsprUploaderHs:
     # ----- pipeline construction -----
 
     def _build_wsprdaemon_pipeline(self, *, identity, watermark):
-        if self._wsprdaemon_dir is None:
-            logger.info(
-                "wspr-uploader-hs: WD_UPLOAD_WSPRDAEMON_DIR unset — "
-                "skipping wsprdaemon.org pipeline"
-            )
-            return None
         if not self._sftp_servers:
             logger.warning(
                 "wspr-uploader-hs: WD_SFTP_SERVERS unset — skipping "
-                "wsprdaemon.org pipeline (legacy wd-upload-wsprdaemon "
-                "expected to handle SFTP path)"
+                "wsprdaemon.org pipeline"
             )
             return None
         from hs_uploader import Pipeline, RetryPolicy
-        from hs_uploader.sources.files import FileSpec, FileTreeSource
         from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
-        # FileSpec with no parser → Record.columns is None and
-        # Record.payload_path is set, matching what WsprdaemonTarSftp
-        # reads.  Pattern matches the extended-spots files wd-post
-        # drops into the per-band upload dirs.
-        source = FileTreeSource(
-            root=self._wsprdaemon_dir,
-            specs=[FileSpec(
-                pattern="*_wd_spots.txt",
-                parser=None,
-                table="wspr.spots",
-            )],
-            retention=FileTreeSource.DELETE_ON_ACK,
-            source_id=f"wsprdaemon-spool:{self._instance_name}",
-        )
+
+        # Prefer SqliteSource (sink.db wspr/spots) — this matches the
+        # post-Pipeline-v2 wspr-recorder world where decoded spots
+        # land directly in sink.db rather than the legacy spool dir.
+        # WsprdaemonTarSftp's SqliteSource branch rebuilds the v3
+        # wsprdaemon.org wire-format tar (byte-identical to v1) from
+        # row payloads — see hs-uploader commit f6aea7c.
+        source = self._build_wsprdaemon_source()
+        if source is None:
+            logger.info(
+                "wspr-uploader-hs: no usable wsprdaemon source — skipping "
+                "wsprdaemon.org pipeline"
+            )
+            return None
+
+        receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
         transport = WsprdaemonTarSftp(
             servers=[_server_host(s) for s in self._sftp_servers],
-            spool_root=self._wsprdaemon_dir,
+            spool_root=self._wsprdaemon_dir,   # legacy file path, optional
             sftp_user=self._sftp_user,
             version=self._version,
             upload_id=self._upload_id,
+            receiver=receiver,                  # required for SqliteSource path
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-tar-{self._instance_name}",
@@ -335,6 +330,56 @@ class WsprUploaderHs:
             batch_limit=10_000,
         )
         return (pipeline, transport)
+
+    def _build_wsprdaemon_source(self):
+        """Prefer SqliteSource (sink.db wspr/spots) over FileTreeSource.
+
+        The post-v2 wspr-recorder world writes spots only to sink.db;
+        the legacy spool dir stays drained.  Falls back to the file
+        path when no sink.db is present (offline / pre-migration hosts)
+        so this shim continues to work on installs that haven't cut
+        over yet.
+        """
+        try:
+            from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
+        except ImportError as exc:
+            logger.warning(
+                "wspr-uploader-hs: SqliteSource import failed for "
+                "wsprdaemon pipeline: %s", exc,
+            )
+            return self._build_wsprdaemon_file_source()
+        if self._sink_db.exists():
+            sqlite_source = SqliteSource.from_env(
+                database="wspr",
+                table="spots",
+                accepted_schema_versions=[1, 2],   # both pre/post v2 cutover
+                start_at="now",
+            )
+            if sqlite_source.health() != HEALTH_NOOP:
+                logger.info(
+                    "wspr-uploader-hs: using SqliteSource for "
+                    "wsprdaemon (sink at %s)", self._sink_db,
+                )
+                return sqlite_source
+        # Fallback: legacy file path.  Only useful on pre-cutover hosts
+        # where wd-post is still populating the spool dir.
+        return self._build_wsprdaemon_file_source()
+
+    def _build_wsprdaemon_file_source(self):
+        """Legacy spool-dir path: wd-post → _wd_spots.txt files."""
+        if self._wsprdaemon_dir is None:
+            return None
+        from hs_uploader.sources.files import FileSpec, FileTreeSource
+        return FileTreeSource(
+            root=self._wsprdaemon_dir,
+            specs=[FileSpec(
+                pattern="*_wd_spots.txt",
+                parser=None,
+                table="wspr.spots",
+            )],
+            retention=FileTreeSource.DELETE_ON_ACK,
+            source_id=f"wsprdaemon-spool:{self._instance_name}",
+        )
 
     def _build_wsprnet_pipeline(self, *, identity, watermark):
         # WsprNet reads record.columns — natural fit for SqliteSource
