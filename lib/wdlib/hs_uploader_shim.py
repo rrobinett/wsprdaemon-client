@@ -379,7 +379,7 @@ class WsprUploaderHs:
             sqlite_source = SqliteSource.from_env(
                 database="wspr",
                 table="spots",
-                accepted_schema_versions=[1],
+                accepted_schema_versions=[1, 2],  # v2 = 2026-05-14 wsprd-internal fields
                 start_at="now",
                 # FIRST-pump anchor — `start_at="now"` skips the existing
                 # backlog so a fresh deploy doesn't re-ship every
