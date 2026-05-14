@@ -23,11 +23,16 @@ WorkingDirectory=/var/spool/wsprdaemon/recording/%i
 
 Restart=always
 RestartSec=5
-# wspr-recorder accumulates memory over time (unprocessed ring buffer samples),
-# causing processing lag to grow until WAV files contain stale audio.
-# Force a periodic restart before drift becomes large enough to corrupt decodes.
-# At observed growth rates (~3s/min), 45 minutes keeps cumulative drift under 135s.
-RuntimeMaxSec=45min
+# Continuous runtime — no scheduled restart.  The historical
+# `RuntimeMaxSec=45min` was a safety net for memory growth /
+# processing-lag accumulation in pre-pipeline-v2 wspr-recorder
+# (observed ~3s/min drift, capped under 135s by a 45-min reset).
+# pipeline-v2 fixed those root causes (anchor-once timing + per-cycle
+# CycleBatcher; no decode queue building up), and every 45-min restart
+# was costing ~1 WSPR cycle of decodes (~30 missed spots × 32 restarts/day
+# = ~1k spots/day on B4-100).  Disabled 2026-05-14.  If memory growth
+# returns, prefer fixing the leak over reinstating this — see git blame
+# for the original rationale.
 
 StandardOutput=journal
 StandardError=journal
