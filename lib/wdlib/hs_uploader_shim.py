@@ -94,6 +94,7 @@ class WsprUploaderHs:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._uploader = None
+        self._verifier = None       # set in start() if WD_VERIFY_FLUSH=1
         self._transports: list = []
         # Per-pump per-pipeline tallies; the on_batch_outcome callback
         # populates these so the journal log line reflects what
@@ -183,10 +184,19 @@ class WsprUploaderHs:
             return
 
         watermark = SqliteWatermarkStore(default_path())
-        identity = StationIdentity(
-            call=self._call,
-            grid=self._grid,
-        )
+        # Pick up HS_UPLOADER_SSH_KEY_FILE (and any other identity env
+        # overrides) — without this, ssh_key_file defaults to
+        # /etc/hs-uploader/keys/id_ed25519 regardless of operator
+        # config, so the SFTP transport authenticates with the wrong
+        # key against gateways that already authorized a different key
+        # (e.g. /home/wsprdaemon/.ssh/id_ed25519 from a legacy install).
+        identity = StationIdentity.load()
+        # WD_RECEIVER_CALL / WD_RECEIVER_GRID are the canonical
+        # wsprdaemon-side env names; override the StationIdentity
+        # values (which read HS_UPLOADER_CALL / HS_UPLOADER_GRID) so
+        # the shim's existing env contract still wins.
+        identity.call = self._call
+        identity.grid = self._grid
         pipelines = []
 
         # --- pipeline 1: wsprdaemon.org via tar/SFTP (spots) ---
@@ -414,6 +424,44 @@ class WsprUploaderHs:
 
     # ----- pipeline construction -----
 
+    def _build_wsprdaemon_ftp_fallback(self, *, spool_root, receiver):
+        """Construct an optional ``WsprdaemonTarFtp`` for SFTP-failure
+        bootstrap, or return None to disable.
+
+        Disabled when ``WD_FTP_FALLBACK=0``.  Defaults mirror the legacy
+        ``wd-upload-wsprdaemon`` script: FTP listener lives on gw2 only,
+        anonymous-style ``noisegraphs`` login, ``upload`` remote path.
+        The transport rebuilds the tar with ``client_upload_info.txt``
+        so the gateway can auto-provision SFTP for this reporter on the
+        next cycle.
+        """
+        if os.environ.get("WD_FTP_FALLBACK", "1").strip() in ("0", "", "no", "off"):
+            return None
+        try:
+            from hs_uploader.transports.wsprdaemon import WsprdaemonTarFtp
+        except ImportError:
+            return None
+        ftp_servers_raw = (
+            os.environ.get("WD_FTP_SERVERS")
+            or os.environ.get("WD_FTP_SERVER")
+            or "gw2.wsprdaemon.org"
+        )
+        ftp_servers = [s.strip() for s in ftp_servers_raw.split(",") if s.strip()]
+        if not ftp_servers:
+            return None
+        ftp_password_file = os.environ.get("WD_FTP_PASSWORD_FILE") or None
+        return WsprdaemonTarFtp(
+            servers=ftp_servers,
+            spool_root=spool_root,
+            ftp_user=os.environ.get("WD_FTP_USER", "noisegraphs"),
+            ftp_password=os.environ.get("WD_FTP_PASSWORD", "xahFie6g"),
+            ftp_password_file=ftp_password_file,
+            remote_path=os.environ.get("WD_FTP_PATH", "upload"),
+            version=self._version,
+            upload_id=self._upload_id,
+            receiver=receiver,
+        )
+
     def _build_wsprdaemon_pipeline(self, *, identity, watermark):
         if not self._sftp_servers:
             logger.warning(
@@ -439,6 +487,9 @@ class WsprUploaderHs:
             return None
 
         receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
+        fallback_ftp = self._build_wsprdaemon_ftp_fallback(
+            spool_root=self._wsprdaemon_dir, receiver=receiver,
+        )
         transport = WsprdaemonTarSftp(
             servers=[_server_host(s) for s in self._sftp_servers],
             spool_root=self._wsprdaemon_dir,   # legacy file path, optional
@@ -446,6 +497,7 @@ class WsprUploaderHs:
             version=self._version,
             upload_id=self._upload_id,
             receiver=receiver,                  # required for SqliteSource path
+            fallback_ftp=fallback_ftp,
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-tar-{self._instance_name}",
@@ -526,6 +578,9 @@ class WsprUploaderHs:
             return None
 
         receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
+        fallback_ftp = self._build_wsprdaemon_ftp_fallback(
+            spool_root=None, receiver=receiver,
+        )
         transport = WsprdaemonTarSftp(
             servers=[_server_host(s) for s in self._sftp_servers],
             spool_root=None,
@@ -534,6 +589,7 @@ class WsprUploaderHs:
             upload_id=self._upload_id,
             receiver=receiver,
             name=f"wsprdaemon-tar-sftp-noise:{','.join(_server_host(s) for s in self._sftp_servers)}",
+            fallback_ftp=fallback_ftp,
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-noise-{self._instance_name}",
