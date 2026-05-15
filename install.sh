@@ -198,6 +198,13 @@ install -m 644 "${SCRIPT_DIR}/systemd/wd-post@.service" "${SYSTEMD_DIR}/"
 install -m 644 "${SCRIPT_DIR}/systemd/wd-upload-hs@.service" "${SYSTEMD_DIR}/"
 install -m 644 "${SCRIPT_DIR}/systemd/wsprdaemon.target" "${SYSTEMD_DIR}/"
 
+# Drop-in: turn on pipeline-v2 (in-process wsprd/jt9 → sink.db).  envgen
+# doesn't know about WD_DECODE_VIA_DB / WD_UPLOAD_NOTIFY / WD_VERIFY_FLUSH,
+# so they live in a systemd drop-in that survives `wd-ctl apply`.
+install -d "${SYSTEMD_DIR}/wd-ka9q-record@.service.d"
+install -m 644 "${SCRIPT_DIR}/systemd/wd-ka9q-record@.service.d/pipeline-v2.conf" \
+    "${SYSTEMD_DIR}/wd-ka9q-record@.service.d/pipeline-v2.conf"
+
 # Install tmpfiles.d cleanup rule for the legacy wsprnet upload spool.
 # After WSPR_USE_HS_UPLOADER=1 flips the upload path to wd-upload-hs,
 # wd-post still writes _spots.txt files into the wsprnet/ subdirectory
