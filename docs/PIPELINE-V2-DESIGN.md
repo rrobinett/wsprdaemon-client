@@ -1,11 +1,15 @@
 # wsprdaemon-client pipeline v2 — DB-direct decode + dedup-at-upload
 
-**Status:** in flight 2026-05-12.  Originally agreed in principle by
-Rob (architect) and Michael (author); since then Michael has shipped
-the upload-side of the design directly (commits `3c4fb76` /
-`a552b2b` / `05f8510` — `wd-upload-hs` via the hs_uploader package
-with `SqliteSource`).  This doc has been updated to reflect what's
-landed vs what's still proposed.
+**Status:** in flight 2026-05-12; v3 Phase A landed 2026-05-16
+(see "Phase A — wsprdaemon-client dissolution" memory note).
+Originally agreed in principle by Rob (architect) and Michael
+(author); since then Michael shipped the upload-side directly
+(commits `3c4fb76` / `a552b2b` / `05f8510` — `wd-upload-hs` via the
+hs_uploader package with `SqliteSource`).  As of v3 Phase A,
+`wd-upload-hs@.service` is retired and the uploader runs in-process
+inside `wspr-recorder`; this doc still describes the original
+service-based pipeline for historical context but the live path is
+wspr-recorder owning all decode + upload work.
 
 ## Background — what we have today
 

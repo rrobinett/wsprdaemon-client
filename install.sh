@@ -187,7 +187,8 @@ install -m 755 "${SCRIPT_DIR}/bin/wd-kiwi-record" "${SBIN_DIR}/wd-kiwi-record"
 install -m 755 "${SCRIPT_DIR}/bin/wd-kiwi-cleanup" "${SBIN_DIR}/wd-kiwi-cleanup"
 install -m 755 "${SCRIPT_DIR}/bin/wd-decode" "${SBIN_DIR}/wd-decode"
 install -m 755 "${SCRIPT_DIR}/bin/wd-post" "${SBIN_DIR}/wd-post"
-install -m 755 "${SCRIPT_DIR}/bin/wd-upload-hs" "${SBIN_DIR}/wd-upload-hs"
+# wd-upload-hs retired 2026-05-16 — wspr-recorder absorbed the in-process
+# uploader as part of v3 Phase A (wsprdaemon-client dissolution).
 
 # Install systemd unit files
 info "Installing systemd units to ${SYSTEMD_DIR}..."
@@ -195,7 +196,10 @@ install -m 644 "${SCRIPT_DIR}/systemd/wd-ka9q-record@.service" "${SYSTEMD_DIR}/"
 install -m 644 "${SCRIPT_DIR}/systemd/wd-kiwi-record@.service" "${SYSTEMD_DIR}/"
 install -m 644 "${SCRIPT_DIR}/systemd/wd-decode@.service" "${SYSTEMD_DIR}/"
 install -m 644 "${SCRIPT_DIR}/systemd/wd-post@.service" "${SYSTEMD_DIR}/"
-install -m 644 "${SCRIPT_DIR}/systemd/wd-upload-hs@.service" "${SYSTEMD_DIR}/"
+# wd-upload-hs@.service retired 2026-05-16 — uploads now happen in-process
+# inside wspr-recorder.  Operators upgrading from a host that previously
+# had wd-upload-hs@*.service enabled MUST disable the legacy unit to
+# avoid double-shipping; see release notes.
 install -m 644 "${SCRIPT_DIR}/systemd/wsprdaemon.target" "${SYSTEMD_DIR}/"
 
 # Drop-in: turn on pipeline-v2 (in-process wsprd/jt9 → sink.db).  envgen
@@ -206,12 +210,12 @@ install -m 644 "${SCRIPT_DIR}/systemd/wd-ka9q-record@.service.d/pipeline-v2.conf
     "${SYSTEMD_DIR}/wd-ka9q-record@.service.d/pipeline-v2.conf"
 
 # Install tmpfiles.d cleanup rule for the legacy wsprnet upload spool.
-# After WSPR_USE_HS_UPLOADER=1 flips the upload path to wd-upload-hs,
 # wd-post still writes _spots.txt files into the wsprnet/ subdirectory
-# (its behavior is unchanged), but nothing reads from there — the new
-# uploader pulls wspr.spots from sigmond's SQLite sink.  This entry
-# applies a 24-hour TTL on those stale files via the daily
-# systemd-tmpfiles-clean.timer.
+# (its behavior is unchanged), but nothing reads from there — wspr-
+# recorder's in-process uploader (v3 Phase A 2026-05-16) pulls
+# wspr.spots from sigmond's SQLite sink instead.  This entry applies a
+# 24-hour TTL on those stale files via the daily systemd-tmpfiles-
+# clean.timer.
 install -m 644 "${SCRIPT_DIR}/tmpfiles.d/wsprdaemon-wsprnet-spool-cleanup.conf" \
     /etc/tmpfiles.d/
 
@@ -236,15 +240,13 @@ else
     warn "Re-run manually with:  sudo wd-ctl install-deps"
 fi
 
-# --- hs-uploader system install + tmpfiles.d entry ------------------------
-# wd-upload-hs uses the system /usr/bin/python3 (via "#!/usr/bin/env
-# python3" shebang) and needs to import `hs_uploader`.  sigmond's own
-# install.sh installs sigmond at system level via an editable .pth in
-# /usr/local/lib/python3.*/dist-packages/; we mirror that pattern here
-# for hs-uploader so wsprdaemon-client deployments don't fail on a
-# missing module right after install.  --break-system-packages is
-# acceptable for an /opt/git/sigmond/ editable install (the package
-# isn't a debian apt-managed one).
+# --- /var/lib/hs-uploader shared watermark dir ----------------------------
+# Multiple HamSCI clients (psk-recorder, wspr-recorder, ...) share a
+# single watermark store under /var/lib/hs-uploader.  Each client owns
+# hs-uploader inside its own uv venv (the previous system-level
+# editable install was needed only for wd-upload-hs, retired
+# 2026-05-16 as part of v3 Phase A); we just ensure the shared
+# directory exists with the right group ownership.
 HS_UPLOADER_REPO=""
 for candidate in "/opt/git/sigmond/hs-uploader" "${SCRIPT_DIR}/../hs-uploader"; do
     if [[ -f "${candidate}/pyproject.toml" ]]; then
@@ -252,30 +254,10 @@ for candidate in "/opt/git/sigmond/hs-uploader" "${SCRIPT_DIR}/../hs-uploader"; 
         break
     fi
 done
-if [[ -n "${HS_UPLOADER_REPO}" ]]; then
-    info ""
-    info "=== Installing hs-uploader (system-level editable) ==="
-    info "    repo: ${HS_UPLOADER_REPO}"
-    if /usr/bin/pip install --quiet --break-system-packages -e "${HS_UPLOADER_REPO}"; then
-        info "hs-uploader installed; wd-upload-hs can now import it"
-    else
-        warn "pip install hs-uploader failed — wd-upload-hs will not start"
-        warn "until the operator runs:"
-        warn "  sudo pip install --break-system-packages -e ${HS_UPLOADER_REPO}"
-    fi
-    # Pre-create /var/lib/hs-uploader with group=sigmond + setgid so
-    # multiple HamSCI client users (pskrec, wsprdaemon, ...) can share
-    # the watermark store.  See tmpfiles.d/hs-uploader.conf in the
-    # hs-uploader repo for rationale.
-    if [[ -f "${HS_UPLOADER_REPO}/tmpfiles.d/hs-uploader.conf" ]]; then
-        install -m 644 "${HS_UPLOADER_REPO}/tmpfiles.d/hs-uploader.conf" \
-            /etc/tmpfiles.d/
-        systemd-tmpfiles --create /etc/tmpfiles.d/hs-uploader.conf 2>/dev/null || true
-    fi
-else
-    warn "hs-uploader repo not found at standard locations — wd-upload-hs"
-    warn "will fail with 'No module named hs_uploader' until the operator"
-    warn "installs it manually."
+if [[ -n "${HS_UPLOADER_REPO}" && -f "${HS_UPLOADER_REPO}/tmpfiles.d/hs-uploader.conf" ]]; then
+    install -m 644 "${HS_UPLOADER_REPO}/tmpfiles.d/hs-uploader.conf" \
+        /etc/tmpfiles.d/
+    systemd-tmpfiles --create /etc/tmpfiles.d/hs-uploader.conf 2>/dev/null || true
 fi
 
 # Create tmpfs fstab entry hint
