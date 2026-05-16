@@ -18,6 +18,11 @@ User=wsprdaemon
 Group=radio
 EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=/etc/wsprdaemon/env/wd-ka9q-record@%i.env
+# Per-instance recording subdir under the tmpfs spool — recreated on
+# every boot because /var/spool/wsprdaemon is tmpfs.  `%i` is only known
+# at unit-start time, so tmpfiles.d can't help here.  Runs as User=
+# (wsprdaemon), which has write perms on the tmpfs (mode 1775).
+ExecStartPre=/usr/bin/mkdir -p /var/spool/wsprdaemon/recording/%i
 ExecStart=/usr/local/sbin/wd-ka9q-record
 WorkingDirectory=/var/spool/wsprdaemon/recording/%i
 

@@ -219,9 +219,19 @@ install -m 644 "${SCRIPT_DIR}/systemd/wd-ka9q-record@.service.d/pipeline-v2.conf
 install -m 644 "${SCRIPT_DIR}/tmpfiles.d/wsprdaemon-wsprnet-spool-cleanup.conf" \
     /etc/tmpfiles.d/
 
+# Install tmpfiles.d runtime-dir rule.  Without this, /run/wsprdaemon
+# and /var/spool/wsprdaemon/recording/ are missing on every boot
+# (both are tmpfs paths that are empty after a power cycle), causing
+# wd-ka9q-record to fail at CHDIR and the hs-uploader shim to error
+# on pidfile creation.  Operator-observed B4-100 post-outage,
+# 2026-05-16: had to manually mkdir both paths.
+install -m 644 "${SCRIPT_DIR}/tmpfiles.d/wsprdaemon-runtime.conf" \
+    /etc/tmpfiles.d/
+
 # Reload systemd
 systemctl daemon-reload
 systemd-tmpfiles --create /etc/tmpfiles.d/wsprdaemon-wsprnet-spool-cleanup.conf 2>/dev/null || true
+systemd-tmpfiles --create /etc/tmpfiles.d/wsprdaemon-runtime.conf 2>/dev/null || true
 
 # --- Python venv + dependency installation ---------------------------------
 # wd-ctl install-deps creates /opt/wsprdaemon-client/venv and pip-installs
