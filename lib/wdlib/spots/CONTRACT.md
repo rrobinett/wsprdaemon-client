@@ -3,13 +3,12 @@
 Pipeline-v2 (see `docs/PIPELINE-V2-DESIGN.md`) defines this row shape
 as the contract between the decoders that wsprdaemon-client runs
 (`wsprd`, `jt9`, and `wsprd -FST4`) and the canonical local sink
-(`/var/lib/sigmond/sink.db`, table `wspr.spots`, written via
-`sigmond.hamsci_ch.Writer`).
+(`/var/lib/sigmond/sink.db`, table `wspr.spots`).
 
 The same shape is what `wd-upload-wsprnet` will query in Phase 3.
-Upstream wsprdaemon-server's ClickHouse `wspr.spots` table is a
-superset; the hs-uploader translates locally-written rows to that
-shape at sync time.
+Upstream wsprdaemon-server's `wspr.spots` table is a superset; the
+hs-uploader translates locally-written rows to that shape at sync
+time.
 
 ## Fields
 

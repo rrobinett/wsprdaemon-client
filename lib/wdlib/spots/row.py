@@ -1,12 +1,11 @@
 """Canonical `wspr.spots` row dataclass.
 
-Mirrors the upstream wsprdaemon-server ClickHouse schema for
-`wspr.spots`, with one local-only addition (`uploaded_at`, populated
-by wd-upload-wsprnet on successful POST).
+Mirrors the upstream wsprdaemon-server `wspr.spots` schema, with one
+local-only addition (`uploaded_at`, populated by wd-upload-wsprnet on
+successful POST).
 
-When hamsci_ch.Writer serializes a Row, it goes into pending_uploads
-as JSON; the hs-uploader translates JSON → columnar at sync time
-(see docs/PIPELINE-V2-DESIGN.md for the upload-side query).
+`row_to_dict` produces a JSON-serializable form of a Row for the
+upload path; see docs/PIPELINE-V2-DESIGN.md for the upload-side query.
 """
 from __future__ import annotations
 
@@ -59,7 +58,7 @@ class Row:
 
 
 def row_to_dict(row: Row) -> dict:
-    """JSON-serializable dict for hamsci_ch.Writer.
+    """JSON-serializable dict for the upload path.
 
     Datetimes are rendered as ISO8601 with explicit UTC offset.
     `None` for `uploaded_at` is kept as-is so the upload path can

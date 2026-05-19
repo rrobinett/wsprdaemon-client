@@ -259,15 +259,12 @@ def enumerate_instances(config: WdConfig) -> List[Dict[str, Any]]:
 
 
 def _data_sinks_for(receiver, band: str) -> List[Dict[str, Any]]:
-    """CONTRACT v0.6 §17: declare every output sink for this instance.
+    """CONTRACT §17: declare every output sink for this instance.
 
-    wsprdaemon-client always writes per-cycle spot files into the posting
-    directory.  When `SIGMOND_CLICKHOUSE_URL` is published into the
-    environment by sigmond's coordination.env, it ALSO writes the
-    parsed rows into the local CH staging tier (`wspr.spots`) so the
-    future `hs-uploader` library can ship them upstream from CH instead
-    of from filesystem tarballs.  The CH path is additive: the file
-    upload to wsprdaemon.org continues unchanged.
+    wsprdaemon-client writes per-cycle spot files into the posting
+    directory; `wd-post` uploads `_wd_spots.txt` rows to wsprdaemon.org
+    over SFTP.  Local-sink feeding is owned by wspr-recorder, not this
+    client, so it is not surfaced here.
     """
     sinks: List[Dict[str, Any]] = [
         {
@@ -278,15 +275,6 @@ def _data_sinks_for(receiver, band: str) -> List[Dict[str, Any]]:
             "mb_per_day":     2,                # rough; per-instance footprint is small
         },
     ]
-    if os.environ.get("SIGMOND_CLICKHOUSE_URL", "").strip():
-        sinks.append({
-            "kind":           "clickhouse",
-            "target":         "wspr.spots",
-            "schema_ref":     "wsprdaemon:1",   # vendored wspr DDL version (sigmond-clickhouse)
-            "retention_days": 90,
-            "mb_per_day":     6,                # per-instance write rate (rough)
-            "health":         "ok",
-        })
     return sinks
 
 

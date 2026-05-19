@@ -52,7 +52,7 @@ Costs of the current design:
   (recording → spool → posting) before they reach the uploader.
 - **No DB until the very end** — the uploader doesn't know about its
   upstream sibling psk-recorder, which already writes spots directly
-  to `psk.spots` via the canonical `hamsci_ch` Writer.
+  to the canonical `psk.spots` sink.
 - **Cross-band dedup absent** — same-callsign duplicates within a
   cycle pass through unreconciled; the WSPRnet API handles it
   server-side via near-frequency-cluster detection (visible as
@@ -76,8 +76,8 @@ Costs of the current design:
   catching up to it.
 - Change the WAV format, sample rate, or recording cadence.
 - Change the upload protocol to WSPRnet.
-- Migrate the upstream ClickHouse `wspr.spots` schema (already
-  defined; producer side is what's missing locally).
+- Migrate the upstream `wspr.spots` schema (already defined;
+  producer side is what's missing locally).
 - Touch Kiwi-source decoding paths.  The current bash `wd-decode`
   with polling stays for Kiwi-source rigs; the new model is
   KA9Q-source only.  (Long-term: Kiwi support follows.)
@@ -93,9 +93,8 @@ Costs of the current design:
    │     • spawn wsprd (W*) or jt9 (F*)       │  → /var/spool/.../recording/...wav
    │       in subprocess pool                 │     (kept for diagnostics)
    │     • parse decoder stdout               │
-   │     • write canonical row →              │
-   │       hamsci_ch.Writer(table="spots",    │
-   │                        mode="wspr")      │  → wspr.spots (SQLite or CH)
+   │     • write canonical row to the         │
+   │       wspr.spots sink                    │  → wspr.spots (SQLite)
    └──────────────────────────────────────────┘
                                                │
                                                ▼
@@ -121,9 +120,9 @@ Services that go away: `wd-decode@<host>-<band>` × 13,
 
 ## `wspr.spots` row shape
 
-Matches the columnar tier the upstream `wspr.spots` table in
-ClickHouse already defines (Phil's wsprdaemon-server schema), so a
-later hs-uploader sync is straightforward.
+Matches the columnar tier the upstream `wspr.spots` table already
+defines (Phil's wsprdaemon-server schema), so a later hs-uploader
+sync is straightforward.
 
 | field             | type      | source                                    |
 |-------------------|-----------|-------------------------------------------|
@@ -151,9 +150,9 @@ later hs-uploader sync is straightforward.
 The `uploaded_at` column is local-only (not in upstream schema);
 hs-uploader treats `NULL` as "ship me upstream."
 
-Local DB: `/var/lib/sigmond/sink.db`, table `wspr.spots` (SqliteWriter
-flattens the namespace to `wspr_spots`).  Schema is created on first
-insert via the existing `hamsci_ch` migration plumbing.
+Local DB: `/var/lib/sigmond/sink.db`, table `wspr.spots` (the SQLite
+sink flattens the namespace to `wspr_spots`).  Schema is created on
+first insert.
 
 ## Migration phases
 
@@ -190,7 +189,7 @@ existing bash `wd-decode@*` services.
     inherited from a config table — replaces sigmond's per-service
     drop-ins).
   - Spawn on WAV close; reap with timeout; parse stdout/ALL_WSPR.TXT;
-    write to `hamsci_ch.Writer`.
+    write to the `wspr.spots` sink.
 - Per-cycle metric: rows-written count, parse-fail count, decode
   timeout count.  Surface in `wd-ka9q-record`'s log so
   `smd watch wspr` (or a follow-on `smd watch wspr-decode`) can

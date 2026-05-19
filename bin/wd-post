@@ -76,28 +76,6 @@ while true; do
             # Extended W-mode spots → wsprdaemon SFTP queue (canonical path).
             [[ -n "${WSPRDAEMON_DIR}" ]] && cp "${f}" "${WSPRDAEMON_DIR}/"
 
-            # CONTRACT v0.6 §17 — local CH staging tier (additive).
-            # No-op when SIGMOND_CLICKHOUSE_URL is unset.  When the
-            # SFTP path is eventually retired in favor of hs-uploader,
-            # the cp above goes away and this call remains as the
-            # only sink for these rows.
-            #
-            # --callhash-path persists the cumulative compound-call
-            # cache across invocations under a per-station file in
-            # /var/lib/wsprdaemon-client/.  WSJT-X/wsprd brackets
-            # `<call>` when it resolved a hash from its session table
-            # — observe()ing the line means our cache grows even
-            # though wsprd starts empty every cycle.
-            if command -v wd-ch-write >/dev/null 2>&1; then
-                callhash_dir="/var/lib/wsprdaemon-client/callhash"
-                mkdir -p "${callhash_dir}" 2>/dev/null || true
-                wd-ch-write \
-                    --client-version "${WD_VERSION:-4.0}" \
-                    --callhash-path "${callhash_dir}/wspr-callhash.json" \
-                    "${f}" \
-                    || echo "wd-post: wd-ch-write failed for ${bn} (upload path unaffected)" >&2
-            fi
-
         elif [[ "${bn}" == *_noise.txt ]]; then
             # Noise measurement → wsprdaemon noise subdir only
             [[ -n "${WSPRDAEMON_NOISE_DIR}" ]] && cp "${f}" "${WSPRDAEMON_NOISE_DIR}/"
